@@ -1,3 +1,11 @@
+> **Downstream distribution.** This repository is a downstream of
+> [conocidotech/sccm-rc-viewer](https://github.com/conocidotech/sccm-rc-viewer)
+> with **macOS support**, maintained by Monads AG. It is not affiliated with
+> Conocido or Microsoft. Signed macOS builds are on this repository's
+> *Releases* page; for Windows releases see upstream. Report macOS issues here;
+> issues that also occur on Windows belong upstream. Changes made here are
+> offered back to upstream as pull requests.
+
 <h1 align="center">sccm-rc</h1>
 
 <p align="center">
