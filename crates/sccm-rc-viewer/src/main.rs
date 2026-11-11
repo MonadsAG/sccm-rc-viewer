@@ -231,6 +231,20 @@ fn edit_mod(m: ModifiersState) -> bool {
     m.control_key() || (cfg!(target_os = "macos") && m.super_key())
 }
 
+/// `SCCM_RC_CMD_AS_WIN=1`: on macOS send Cmd as the Windows key instead of
+/// Ctrl. Read once; it is consulted on every key event.
+fn cmd_as_win() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("SCCM_RC_CMD_AS_WIN").is_ok_and(|v| v == "1"))
+}
+
+/// Whether the remote sees Ctrl held: the Ctrl key itself, or (macOS, by
+/// default) Cmd, which `remote_scancode` forwards as Ctrl. Local shortcuts
+/// that watch for a remote Ctrl+V (the UAC paste fallback) must use this.
+fn remote_ctrl(m: ModifiersState) -> bool {
+    m.control_key() || (cfg!(target_os = "macos") && m.super_key() && !cmd_as_win())
+}
+
 /// User name to pre-fill in the logon overlay: `SCCM_USER`, else the last one used.
 fn initial_login_user() -> Option<String> {
     std::env::var("SCCM_USER")
@@ -280,8 +294,10 @@ enum UserEvent {
     Frame,
     /// The target rejected the explicit logon (wrong password, user not a
     /// Permitted Viewer, …). The session thread has stopped retrying; the UI
-    /// reopens the logon overlay with this message.
-    LoginFailed(String),
+    /// reopens the logon overlay with this message. Carries the `running`
+    /// flag of the reporting session so the UI can drop a report from a
+    /// session it has already stopped or replaced.
+    LoginFailed(String, Arc<AtomicBool>),
     #[allow(dead_code)] // retained for an alternate teardown path
     Closed(String),
 }
@@ -845,11 +861,16 @@ fn spawn_session(
                     Ok(()) => info!("session ended"),
                     Err(e) => {
                         warn!(error = %e, "session error");
-                        // A rejected explicit logon must NOT be retried: the
-                        // reconnect loop runs every second and would lock the
-                        // account within moments. Hand it back to the UI.
-                        if creds.is_some() && is_logon_failure(&e) {
-                            let _ = proxy.send_event(UserEvent::LoginFailed(e.to_string()));
+                        // A rejected explicit logon must NOT be retried: every
+                        // reconnect is another failed logon and would soon lock
+                        // the account. Hand it back to the UI, tagged with this
+                        // thread's `running` flag so a stale report from a
+                        // session the user already left is ignored there.
+                        if is_logon_failure(&e) {
+                            let _ = proxy.send_event(UserEvent::LoginFailed(
+                                e.to_string(),
+                                running_thread.clone(),
+                            ));
                             break;
                         }
                     }
@@ -877,11 +898,19 @@ fn spawn_session(
 /// a standard one. Those are drawn at logical size and pixel-doubled, so they
 /// keep their designed size; the remote desktop itself stays at full physical
 /// resolution. `SCCM_RC_UI_SCALE` overrides it (1–4).
+///
+/// The factor is rounded down, so a fractional Windows scale (125 %–175 %)
+/// keeps the 1× UI it always had instead of jumping to 200 %. Called on every
+/// pointer move and paint, so the override is read once.
 fn ui_scale_of(w: &Window) -> u32 {
-    if let Some(v) = std::env::var("SCCM_RC_UI_SCALE").ok().and_then(|v| v.parse::<u32>().ok()) {
-        return v.clamp(1, 4);
-    }
-    (w.scale_factor().round() as u32).clamp(1, 4)
+    static OVERRIDE: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    let forced = *OVERRIDE.get_or_init(|| {
+        std::env::var("SCCM_RC_UI_SCALE")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .map(|v| v.clamp(1, 4))
+    });
+    forced.unwrap_or_else(|| (w.scale_factor().floor() as u32).clamp(1, 4))
 }
 
 /// Nearest-neighbour upscale of a logical `lw × lh` buffer by `k` into a
@@ -913,13 +942,16 @@ fn remote_scancode(key: &PhysicalKey) -> Option<(u8, bool)> {
         let sc = key.to_scancode()?;
         return Some(((sc & 0xFF) as u8, sc & 0xE000 == 0xE000 || sc > 0xFF));
     }
+    #[cfg(target_os = "macos")]
+    if let Some(sc) = keymap::mac_iso_aware(key) {
+        return Some(sc);
+    }
     let PhysicalKey::Code(code) = key else {
         return None;
     };
     let code = *code;
     if cfg!(target_os = "macos") {
-        let cmd_as_win = std::env::var("SCCM_RC_CMD_AS_WIN").is_ok_and(|v| v == "1");
-        if !cmd_as_win {
+        if !cmd_as_win() {
             match code {
                 KeyCode::SuperLeft => return keymap::set1(KeyCode::ControlLeft),
                 KeyCode::SuperRight => return keymap::set1(KeyCode::ControlRight),
@@ -944,13 +976,26 @@ fn next_backoff(current: std::time::Duration, session_lasted: std::time::Duratio
     }
 }
 
-/// Errors that mean "these credentials (or this user) won't work here", as
-/// opposed to transient transport trouble worth retrying.
+/// A bring-up error with explicit credentials that means "these credentials
+/// (or this user) won't work here": the target refused the logon, or SSPI
+/// failed during the handshake. Raised only by `run_session`'s connect step,
+/// so the same error kinds later in a session (a sealed-stream desync is an
+/// `Error::Sspi` too) still go through the normal reconnect.
+#[derive(Debug)]
+struct LogonFailure(sccm_rc_core::Error);
+
+impl std::fmt::Display for LogonFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for LogonFailure {}
+
+/// Errors that must not be retried with the same credentials, as opposed to
+/// transient transport trouble worth a reconnect.
 fn is_logon_failure(e: &anyhow::Error) -> bool {
-    matches!(
-        e.downcast_ref::<sccm_rc_core::Error>(),
-        Some(sccm_rc_core::Error::LogonRejected(_)) | Some(sccm_rc_core::Error::Sspi(_))
-    )
+    e.downcast_ref::<LogonFailure>().is_some()
 }
 
 async fn run_session(
@@ -988,6 +1033,14 @@ async fn run_session(
                 shared.lock().unwrap().status =
                     t!("status.existing_session", target => target).to_string();
                 let _ = proxy.send_event(UserEvent::Frame);
+            }
+            if creds.is_some()
+                && matches!(
+                    e,
+                    sccm_rc_core::Error::LogonRejected(_) | sccm_rc_core::Error::Sspi(_)
+                )
+            {
+                return Err(LogonFailure(e).into());
             }
             return Err(e.into());
         }
@@ -1227,13 +1280,57 @@ impl App {
         info!("sent Windows-key tap to remote");
     }
 
-    /// Signal the session thread to stop and disconnect gracefully: clear
-    /// `running` and drop the input sender (unblocks run_active_session).
     /// Toolbar height in physical pixels (logical height × UI scale).
     fn bar_h_phys(&self) -> u32 {
         toolbar::TOOLBAR_H * self.window.as_deref().map(ui_scale_of).unwrap_or(1)
     }
 
+    /// Window size in logical (UI-scale) pixels plus the scale itself, for
+    /// hit-testing the overlays, which are drawn at logical size.
+    fn logical_size(&self) -> (u32, u32, f64) {
+        self.window
+            .as_ref()
+            .map(|w| {
+                let s = w.inner_size();
+                let k = ui_scale_of(w);
+                (s.width / k, s.height / k, k as f64)
+            })
+            .unwrap_or((1, 1, 1.0))
+    }
+
+    /// Release every modifier on the remote. macOS sends no key-up for keys
+    /// still held when the window loses focus, so Cmd+Tab (Cmd goes out as
+    /// Ctrl) would leave Ctrl stuck down on the remote. Windows and X11
+    /// synthesise those releases themselves. Extra releases are harmless.
+    #[cfg(not(windows))]
+    fn release_remote_modifiers(&self) {
+        const MODS: [(u8, bool); 8] = [
+            (0x1D, false), // Ctrl left
+            (0x1D, true),  // Ctrl right
+            (0x2A, false), // Shift left
+            (0x36, false), // Shift right
+            (0x38, false), // Alt left
+            (0x38, true),  // Alt right (AltGr)
+            (0x5B, true),  // Win left
+            (0x5C, true),  // Win right
+        ];
+        let events = MODS
+            .iter()
+            .map(|&(sc, ext)| {
+                let mut flags = KeyboardFlags::RELEASE;
+                if ext {
+                    flags |= KeyboardFlags::EXTENDED;
+                }
+                FastPathInputEvent::KeyboardEvent(flags, sc)
+            })
+            .collect();
+        if let Some(tx) = &self.input_tx {
+            let _ = tx.try_send(events);
+        }
+    }
+
+    /// Signal the session thread to stop and disconnect gracefully: clear
+    /// `running` and drop the input sender (unblocks run_active_session).
     fn begin_shutdown(&mut self) {
         self.running.store(false, Ordering::Relaxed);
         self.input_tx = None;
@@ -1582,11 +1679,20 @@ impl ApplicationHandler<UserEvent> for App {
                     w.request_redraw();
                 }
             }
-            UserEvent::LoginFailed(reason) => {
+            UserEvent::LoginFailed(reason, session) => {
+                // Only the session the UI still runs may reopen the logon
+                // overlay. One the user already left (host switch, Disconnect)
+                // must neither tear down its successor nor cover the picker.
+                if !Arc::ptr_eq(&session, &self.running) || !session.load(Ordering::Relaxed) {
+                    info!(%reason, "ignoring logon failure from a stopped session");
+                    return;
+                }
                 warn!(%reason, "logon failed; not retrying");
                 // The session thread already stopped; make sure nothing restarts it.
                 self.begin_shutdown();
-                self.creds = None;
+                // Re-offer the user who just failed (the typo is usually in the
+                // password), falling back to SCCM_USER / the last one used.
+                let failed_user = self.creds.take().map(|c| c.display_name());
                 {
                     let mut f = self.shared.lock().unwrap();
                     *f = SharedFrame::default();
@@ -1594,7 +1700,7 @@ impl ApplicationHandler<UserEvent> for App {
                 let msg = t!("login.rejected", reason => reason).to_string();
                 self.login_prompt = Some(login_prompt::LoginPromptOverlay::new(
                     self.host.clone(),
-                    initial_login_user(),
+                    failed_user.or_else(initial_login_user),
                     Some(msg),
                 ));
                 if let Some(w) = &self.window {
@@ -1812,17 +1918,11 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 // Host-prompt overlay owns the pointer while it's up: hover
                 // moves the recents-selection, and nothing goes to the remote.
-                if let Some(prompt) = self.host_prompt.as_mut() {
-                    let (w_w, w_h, k) = self
-                        .window
-                        .as_ref()
-                        .map(|w| {
-                            let s = w.inner_size();
-                            let k = ui_scale_of(w);
-                            (s.width / k, s.height / k, k as f64)
-                        })
-                        .unwrap_or((1, 1, 1.0));
-                    prompt.on_mouse_move(position.x / k, position.y / k, w_w, w_h);
+                if self.host_prompt.is_some() {
+                    let (w_w, w_h, k) = self.logical_size();
+                    if let Some(prompt) = self.host_prompt.as_mut() {
+                        prompt.on_mouse_move(position.x / k, position.y / k, w_w, w_h);
+                    }
                     if let Some(w) = &self.window {
                         w.set_cursor_visible(true);
                         w.request_redraw();
@@ -1883,57 +1983,25 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     return;
                 }
-                // Type-text overlay: left-click on Send/Cancel confirms/dismisses.
-                if let Some(prompt) = self.type_prompt.as_mut() {
+                // Modal overlays own the pointer; clicks are hit-tested in
+                // logical (UI-scale) pixels, the size they are drawn at.
+                //  * type-text: left-click on Send/Cancel confirms/dismisses;
+                //  * logon: left-click focuses the user / password field;
+                //  * host prompt: left-click on a recent row confirms it.
+                if self.type_prompt.is_some()
+                    || self.login_prompt.is_some()
+                    || self.host_prompt.is_some()
+                {
                     if state == ElementState::Pressed && button == MouseButton::Left {
-                        let (w_w, w_h, k) = self
-                            .window
-                            .as_ref()
-                            .map(|w| {
-                                let s = w.inner_size();
-                                let k = ui_scale_of(w);
-                                (s.width / k, s.height / k, k as f64)
-                            })
-                            .unwrap_or((1, 1, 1.0));
-                        prompt.on_click(self.mouse_win.0 / k, self.mouse_win.1 / k, w_w, w_h);
-                        if let Some(w) = &self.window {
-                            w.request_redraw();
+                        let (w_w, w_h, k) = self.logical_size();
+                        let (x, y) = (self.mouse_win.0 / k, self.mouse_win.1 / k);
+                        if let Some(prompt) = self.type_prompt.as_mut() {
+                            prompt.on_click(x, y, w_w, w_h);
+                        } else if let Some(prompt) = self.login_prompt.as_mut() {
+                            prompt.on_click(x, y, w_w, w_h);
+                        } else if let Some(prompt) = self.host_prompt.as_mut() {
+                            prompt.on_click(x, y, w_w, w_h);
                         }
-                    }
-                    return;
-                }
-                // Logon overlay: left-click focuses the user / password field.
-                if let Some(prompt) = self.login_prompt.as_mut() {
-                    if state == ElementState::Pressed && button == MouseButton::Left {
-                        let (w_w, w_h, k) = self
-                            .window
-                            .as_ref()
-                            .map(|w| {
-                                let s = w.inner_size();
-                                let k = ui_scale_of(w);
-                                (s.width / k, s.height / k, k as f64)
-                            })
-                            .unwrap_or((1, 1, 1.0));
-                        prompt.on_click(self.mouse_win.0 / k, self.mouse_win.1 / k, w_w, w_h);
-                        if let Some(w) = &self.window {
-                            w.request_redraw();
-                        }
-                    }
-                    return;
-                }
-                // Host-prompt overlay: left-click on a recent row confirms it.
-                if let Some(prompt) = self.host_prompt.as_mut() {
-                    if state == ElementState::Pressed && button == MouseButton::Left {
-                        let (w_w, w_h, k) = self
-                            .window
-                            .as_ref()
-                            .map(|w| {
-                                let s = w.inner_size();
-                                let k = ui_scale_of(w);
-                                (s.width / k, s.height / k, k as f64)
-                            })
-                            .unwrap_or((1, 1, 1.0));
-                        prompt.on_click(self.mouse_win.0 / k, self.mouse_win.1 / k, w_w, w_h);
                         if let Some(w) = &self.window {
                             w.request_redraw();
                         }
@@ -2034,6 +2102,10 @@ impl ApplicationHandler<UserEvent> for App {
                 // the OS shortcuts back to whichever window the user switched to.
                 #[cfg(windows)]
                 winhook::set_active(has_focus);
+                #[cfg(not(windows))]
+                if !has_focus {
+                    self.release_remote_modifiers();
+                }
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 // While the About overlay is open, swallow all keyboard input; Esc
@@ -2060,8 +2132,8 @@ impl ApplicationHandler<UserEvent> for App {
                         // manager → paste here → Enter → scancodes to UAC
                         // (which Windows blocks direct cliprdr paste into).
                         // Without this, the Type Text field is unusable for
-                        // the very case it was designed for.
-                        if self.modifiers.control_key()
+                        // the very case it was designed for. (Cmd+V on macOS.)
+                        if edit_mod(self.modifiers)
                             && matches!(
                                 event.physical_key,
                                 PhysicalKey::Code(KeyCode::KeyV)
@@ -2077,7 +2149,7 @@ impl ApplicationHandler<UserEvent> for App {
                             return;
                         }
                         // Ctrl+A / Ctrl+Delete → clear the field (see host_prompt).
-                        if self.modifiers.control_key()
+                        if edit_mod(self.modifiers)
                             && matches!(
                                 event.physical_key,
                                 PhysicalKey::Code(KeyCode::KeyA)
@@ -2158,7 +2230,8 @@ impl ApplicationHandler<UserEvent> for App {
                         // appended printable chars, so a paste otherwise leaked
                         // through as a literal "v". on_text() strips control
                         // chars, so any CR/LF from a copied line is dropped.
-                        if self.modifiers.control_key()
+                        // (Cmd+V on macOS.)
+                        if edit_mod(self.modifiers)
                             && matches!(
                                 event.physical_key,
                                 PhysicalKey::Code(KeyCode::KeyV)
@@ -2176,7 +2249,7 @@ impl ApplicationHandler<UserEvent> for App {
                         // Ctrl+A / Ctrl+Delete → clear the field. We don't
                         // render a visual selection, so "select all + type"
                         // and "clear" look the same to the operator.
-                        if self.modifiers.control_key()
+                        if edit_mod(self.modifiers)
                             && matches!(
                                 event.physical_key,
                                 PhysicalKey::Code(KeyCode::KeyA)
@@ -2304,8 +2377,9 @@ impl ApplicationHandler<UserEvent> for App {
                 // about_to_wait handler types the clipboard as scancodes
                 // when V is released (+ a 100 ms floor). Non-fatal if the
                 // clipboard is empty — we just don't stage a fallback.
+                // `remote_ctrl`: on macOS Cmd+V reaches the remote as Ctrl+V.
                 if event.state == ElementState::Pressed
-                    && self.modifiers.control_key()
+                    && remote_ctrl(self.modifiers)
                     && !self.modifiers.shift_key()
                     && !self.modifiers.alt_key()
                     && matches!(event.physical_key, PhysicalKey::Code(KeyCode::KeyV))
@@ -2429,13 +2503,13 @@ impl App {
             || self.login_prompt.is_some()
             || self.type_prompt.is_some()
             || !connected;
-        // Overlay is drawn at logical size (`ov_w × ov_h`) and pixel-scaled to
-        // the physical target (`phys_w × phys_h`) before upload.
+        // Overlay is drawn and uploaded at logical size (`ov_w × ov_h`); the GPU
+        // stretches it over `dest` with nearest sampling (crisp pixel-doubling).
         let (lw, lh) = ((win_w / k).max(1), (win_h / k).max(1));
-        let (ov_w, ov_h, phys_w, phys_h, dest) = if show_full_overlay {
-            (lw, lh, win_w, win_h, gpu::OverlayDest::Full)
+        let (ov_w, ov_h, dest) = if show_full_overlay {
+            (lw, lh, gpu::OverlayDest::Full)
         } else {
-            (lw, toolbar::TOOLBAR_H.min(lh), win_w, bar_h, gpu::OverlayDest::TopStrip(bar_h))
+            (lw, toolbar::TOOLBAR_H.min(lh), gpu::OverlayDest::TopStrip(bar_h))
         };
         let mut ov = vec![0u32; (ov_w * ov_h) as usize];
         if let Some(prompt) = self.login_prompt.as_ref() {
@@ -2536,13 +2610,6 @@ impl App {
                 toolbar::draw_text_centered(&mut ov, ov_w, ov_h, cy + 8, &msg, 0x00B0_C0D0, 2);
             }
         }
-        let (ov, ov_w, ov_h) = if k == 1 {
-            (ov, ov_w, ov_h)
-        } else {
-            let mut phys = vec![0u32; (phys_w * phys_h) as usize];
-            upscale_into(&ov, ov_w, ov_h, k, &mut phys, phys_w, phys_h);
-            (phys, phys_w, phys_h)
-        };
         // Pack 0x00RRGGBB -> RGBA bytes (opaque).
         let mut ov_rgba = vec![0u8; (ov_w * ov_h * 4) as usize];
         for (i, &px) in ov.iter().enumerate() {
@@ -2561,7 +2628,7 @@ impl App {
                 && cur.draw
                 && !cur.rgba.is_empty()
                 && self.cursor_inside
-                && self.mouse_win.1 >= (toolbar::TOOLBAR_H * ui_scale_of(&window)) as f64;
+                && self.mouse_win.1 >= bar_h as f64;
             window.set_cursor_visible(!show);
             if show {
                 let dx = self.mouse_win.0 as i32 - cur.hotspot_x as i32;
@@ -2643,17 +2710,24 @@ impl App {
             || self.type_prompt.is_some()
             || self.about_open;
         if full_overlay {
-            let mut lbuf = vec![0u32; (lw * lh) as usize];
-            if let Some(prompt) = self.login_prompt.as_ref() {
-                login_prompt::draw(&mut lbuf, lw, lh, self.font.as_ref(), prompt);
-            } else if let Some(prompt) = self.host_prompt.as_ref() {
-                host_prompt::draw(&mut lbuf, lw, lh, self.font.as_ref(), prompt);
-            } else if let Some(prompt) = self.type_prompt.as_ref() {
-                type_text::draw(&mut lbuf, lw, lh, self.font.as_ref(), prompt);
+            let paint = |buf: &mut [u32], w: u32, h: u32| {
+                if let Some(prompt) = self.login_prompt.as_ref() {
+                    login_prompt::draw(buf, w, h, self.font.as_ref(), prompt);
+                } else if let Some(prompt) = self.host_prompt.as_ref() {
+                    host_prompt::draw(buf, w, h, self.font.as_ref(), prompt);
+                } else if let Some(prompt) = self.type_prompt.as_ref() {
+                    type_text::draw(buf, w, h, self.font.as_ref(), prompt);
+                } else {
+                    draw_about(buf, w, h, self.font.as_ref());
+                }
+            };
+            if k == 1 {
+                paint(&mut buffer[..], win_w, win_h);
             } else {
-                draw_about(&mut lbuf, lw, lh, self.font.as_ref());
+                let mut lbuf = vec![0u32; (lw * lh) as usize];
+                paint(&mut lbuf, lw, lh);
+                upscale_into(&lbuf, lw, lh, k, &mut buffer[..], win_w, win_h);
             }
-            upscale_into(&lbuf, lw, lh, k, &mut buffer[..], win_w, win_h);
             let _ = buffer.present();
             return;
         }
@@ -2835,7 +2909,7 @@ impl App {
         let draw_remote = cur.draw
             && !cur.rgba.is_empty()
             && self.cursor_inside
-            && self.mouse_win.1 >= (toolbar::TOOLBAR_H * ui_scale_of(window)) as f64;
+            && self.mouse_win.1 >= bar_h as f64;
         window.set_cursor_visible(!draw_remote);
         if draw_remote {
             // The remote cursor arrives as a separate Pointer PDU (the host sends it

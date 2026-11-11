@@ -485,10 +485,13 @@ impl GpuRenderer {
         let mut draw_overlay = false;
         if let Some((ov_w, ov_h, rgba, dest)) = overlay {
             if ov_w > 0 && ov_h > 0 && rgba.len() >= (ov_w * ov_h * 4) as usize {
+                // Nearest sampling: the overlay arrives at logical (UI-scale)
+                // size and is stretched over `dest`, so on a 2× display every
+                // texel becomes a crisp 2×2 block. At 1× it maps texel-exact.
                 Self::ensure_layer(
                     &self.device,
                     &self.bind_layout,
-                    &self.sampler,
+                    &self.nearest_sampler,
                     &self.uniform_overlay,
                     &mut self.overlay,
                     ov_w,

@@ -590,7 +590,8 @@ pub struct CliprdrChannel {
     pending_files: Vec<std::path::PathBuf>,
     /// Snapshot of the last CF_HDROP list we saw on the local clipboard.
     /// Compared against a fresh read each poll to detect operator-side changes
-    /// without re-announcing every 700 ms.
+    /// without re-announcing every 700 ms. (CF_HDROP is Windows-only.)
+    #[cfg_attr(not(windows), allow(dead_code))]
     known_files: Vec<std::path::PathBuf>,
     /// True once the server sent CB_MONITOR_READY. Before that we must not send a
     /// FormatList (the periodic poll would otherwise announce out of sequence,

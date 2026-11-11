@@ -61,6 +61,27 @@ fn wipe(s: &mut String) {
     s.clear();
 }
 
+/// Room for any realistic password, reserved up front so typing never
+/// reallocates and leaves an unwiped copy behind in freed memory.
+const PASSWORD_CAP: usize = 256;
+
+/// `String::pop`, but the removed character's bytes are zeroed first, so a
+/// backspaced password character does not linger in the spare capacity.
+fn pop_wiped(s: &mut String) {
+    let Some((idx, _)) = s.char_indices().next_back() else {
+        return;
+    };
+    // SAFETY: `idx` is a char boundary; the zeroed tail is cut off before the
+    // String is used again, so it stays valid UTF-8.
+    unsafe {
+        let v = s.as_mut_vec();
+        for b in &mut v[idx..] {
+            std::ptr::write_volatile(b, 0);
+        }
+        v.truncate(idx);
+    }
+}
+
 impl LoginPromptOverlay {
     /// `user` pre-fills the user field (last used name); the password field
     /// gets focus when a user is already known.
@@ -74,7 +95,7 @@ impl LoginPromptOverlay {
         Self {
             target,
             user,
-            password: String::new(),
+            password: String::with_capacity(PASSWORD_CAP),
             focus,
             error,
             outcome: None,
@@ -102,7 +123,12 @@ impl LoginPromptOverlay {
     }
 
     pub fn on_backspace(&mut self) {
-        self.field_mut().pop();
+        match self.focus {
+            Field::User => {
+                self.user.pop();
+            }
+            Field::Password => pop_wiped(&mut self.password),
+        }
         self.bump();
     }
 
@@ -340,6 +366,17 @@ mod tests {
         o.on_enter();
         assert!(o.take_outcome().is_none());
         assert!(o.error.is_some());
+    }
+
+    #[test]
+    fn backspace_zeroes_the_removed_password_bytes() {
+        let mut o = LoginPromptOverlay::new("h".into(), Some("D\\u".into()), None);
+        o.on_text("ab\u{e9}");
+        o.on_backspace();
+        assert_eq!(o.password, "ab");
+        // The removed 'é' (2 bytes) sits in spare capacity: it must be zeroed.
+        let spare = unsafe { std::slice::from_raw_parts(o.password.as_ptr().add(2), 2) };
+        assert_eq!(spare, &[0, 0]);
     }
 
     #[test]

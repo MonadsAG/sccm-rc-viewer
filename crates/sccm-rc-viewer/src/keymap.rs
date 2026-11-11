@@ -8,6 +8,48 @@
 //! PC keyboard.
 
 use winit::keyboard::KeyCode;
+#[cfg(target_os = "macos")]
+use winit::keyboard::{NativeKeyCode, PhysicalKey};
+
+/// macOS names the two ISO-only key positions by legend, not by place: on an
+/// ISO keyboard the key left of `1` (`§`/`^`) sends `kVK_ISO_Section` (10),
+/// which winit 0.30 leaves unidentified, and the key between left Shift and
+/// `Z` (`<>`) sends `kVK_ANSI_Grave` (50, winit `Backquote`). Without this the
+/// `<>` key types the wrong character on the remote and `§` types nothing.
+/// Same swap as SDL/FreeRDP: on ISO hardware, 10 ↔ 50 before the lookup.
+#[cfg(target_os = "macos")]
+pub fn mac_iso_aware(key: &PhysicalKey) -> Option<(u8, bool)> {
+    let raw: u16 = match key {
+        PhysicalKey::Unidentified(NativeKeyCode::MacOS(10)) => 10,
+        PhysicalKey::Code(KeyCode::Backquote) => 50,
+        _ => return None,
+    };
+    let code = if mac_kbd::is_iso() { 60 - raw } else { raw };
+    Some(if code == 10 {
+        (0x56, false) // PC position of the ISO key left of Z
+    } else {
+        (0x29, false) // PC position of the key left of 1
+    })
+}
+
+#[cfg(target_os = "macos")]
+mod mac_kbd {
+    #[link(name = "Carbon", kind = "framework")]
+    extern "C" {
+        fn LMGetKbdType() -> u8;
+        fn KBGetLayoutType(i_keyboard_type: i16) -> u32;
+    }
+
+    /// `kKeyboardISO` ('ISO ') from HIToolbox.
+    const KEYBOARD_ISO: u32 = u32::from_be_bytes(*b"ISO ");
+
+    /// Physical layout of the keyboard that produced the last key event.
+    /// Queried per event, so plugging in another keyboard just works.
+    pub fn is_iso() -> bool {
+        // SAFETY: plain C getters without arguments or pointers.
+        unsafe { KBGetLayoutType(LMGetKbdType() as i16) == KEYBOARD_ISO }
+    }
+}
 
 /// `(scancode, extended)` for a physical key, or `None` if RDP has no
 /// equivalent (media keys, Fn, …).
@@ -152,6 +194,20 @@ mod tests {
         assert_eq!(set1(KeyCode::Delete), Some((0x53, true)));
         assert_eq!(set1(KeyCode::F12), Some((0x58, false)));
         assert_eq!(set1(KeyCode::IntlBackslash), Some((0x56, false)));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mac_iso_keys_get_distinct_pc_positions() {
+        use winit::keyboard::{NativeKeyCode, PhysicalKey};
+        let section = mac_iso_aware(&PhysicalKey::Unidentified(NativeKeyCode::MacOS(10)));
+        let grave = mac_iso_aware(&PhysicalKey::Code(KeyCode::Backquote));
+        let (section, grave) = (section.expect("mapped"), grave.expect("mapped"));
+        assert_ne!(section, grave);
+        for v in [section, grave] {
+            assert!(v == (0x29, false) || v == (0x56, false), "{v:?}");
+        }
+        assert_eq!(mac_iso_aware(&PhysicalKey::Code(KeyCode::KeyA)), None);
     }
 
     #[test]

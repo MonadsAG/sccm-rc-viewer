@@ -112,7 +112,11 @@ pub fn lookup_and_cache(host: &str) {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     }
-    let Ok(out) = cmd.args(["-a", &ip]).output() else {
+    // Windows: `arp -a <ip>` filters the table to that host. BSD/macOS `arp`
+    // rejects a host after `-a` (it prints usage), so ask for the one entry
+    // with `-n <ip>` there (`-n` = no reverse DNS lookup).
+    let flag = if cfg!(windows) { "-a" } else { "-n" };
+    let Ok(out) = cmd.args([flag, ip.as_str()]).output() else {
         return;
     };
     let s = String::from_utf8_lossy(&out.stdout);

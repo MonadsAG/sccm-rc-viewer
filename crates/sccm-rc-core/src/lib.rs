@@ -142,6 +142,15 @@ impl SccmSession {
             .recv_frame()
             .await?
             .ok_or_else(|| Error::Protocol("closed before grant".into()))?;
+        // With raw NTLM the handshake loop ends as soon as our AUTHENTICATE is
+        // sent, so the server's verdict on it arrives here. A refusal (wrong
+        // password, not a Permitted Viewer) comes as an unsealed control
+        // string: surface it as a logon rejection instead of failing to unseal
+        // it, so callers know not to retry the same credentials.
+        if grant_frame.msg_type == MSG_TYPE_CONTROL {
+            let s = framing::decode_control_string(&grant_frame.body).unwrap_or_default();
+            return Err(Error::LogonRejected(s));
+        }
         let grant_plain = sspi.unseal(&grant_frame.body)?;
         let grant_str = decode_control_utf16(&grant_plain)
             .ok_or_else(|| Error::Protocol("grant not a control string".into()))?;

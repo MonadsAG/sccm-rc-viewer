@@ -16,6 +16,7 @@ pub mod checks;
 #[cfg(not(windows))]
 #[path = "checks_portable.rs"]
 pub mod checks;
+mod reach;
 #[cfg(windows)]
 mod winutil;
 
