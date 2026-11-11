@@ -117,6 +117,28 @@ struct Cli {
 /// Load the embedded application icon for the live window (taskbar / title bar).
 /// The .exe also carries this icon as a Win32 resource (build.rs) so Explorer and
 /// the Properties tab show it, but winit needs the window icon set explicitly.
+/// Set the Dock icon on macOS. A bare binary has no `.app` bundle to take it
+/// from, and winit ignores the window icon there, so hand the embedded PNG to
+/// `NSApplication` directly. Must run on the main thread after the app exists.
+#[cfg(target_os = "macos")]
+fn set_dock_icon() {
+    use objc2::{AllocAnyThread, MainThreadMarker};
+    use objc2_app_kit::{NSApplication, NSImage};
+    use objc2_foundation::NSData;
+
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let data = NSData::with_bytes(include_bytes!("../assets/icon.png"));
+    let Some(image) = NSImage::initWithData(NSImage::alloc(), &data) else {
+        warn!("could not decode the embedded icon for the Dock");
+        return;
+    };
+    let app = NSApplication::sharedApplication(mtm);
+    // SAFETY: called on the main thread (MainThreadMarker) with a valid image.
+    unsafe { app.setApplicationIconImage(Some(&image)) };
+}
+
 fn load_window_icon() -> Option<winit::window::Icon> {
     let img = image::load_from_memory(include_bytes!("../assets/icon.png"))
         .ok()?
@@ -1672,6 +1694,8 @@ impl ApplicationHandler<UserEvent> for App {
             .with_window_icon(load_window_icon())
             .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0));
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
+        #[cfg(target_os = "macos")]
+        set_dock_icon();
         let context = softbuffer::Context::new(window.clone()).expect("softbuffer context");
         let surface =
             softbuffer::Surface::new(&context, window.clone()).expect("softbuffer surface");

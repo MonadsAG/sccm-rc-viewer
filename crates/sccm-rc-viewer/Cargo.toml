@@ -52,3 +52,11 @@ clipboard-win = "5"
 # OS clipboard text (paste into the connect / logon fields) on non-Windows.
 [target.'cfg(not(windows))'.dependencies]
 arboard = { version = "3", default-features = false }
+
+# Dock icon on macOS: a bare binary (no .app bundle) gets the generic icon,
+# and winit ignores the window icon there, so the viewer sets it through
+# NSApplication at startup. Same objc2 versions arboard already pulls in.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSImage", "NSResponder"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSData"] }
