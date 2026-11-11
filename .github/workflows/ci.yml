@@ -4,8 +4,9 @@ on:
   push:
     branches: [main]
     paths-ignore: ["**.md", "docs/**", "LICENSE-*", ".github/workflows/release-*.yml"]
+  # No paths-ignore for PRs: build-test and macos are required checks on
+  # main, and a skipped workflow never reports them, so the PR could not merge.
   pull_request:
-    paths-ignore: ["**.md", "docs/**", "LICENSE-*", ".github/workflows/release-*.yml"]
   workflow_dispatch:
 
 # A newer push to the same branch or PR cancels the older run (saves minutes).
