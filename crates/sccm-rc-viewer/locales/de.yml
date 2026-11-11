@@ -67,3 +67,4 @@ login:
   ntlm_note: "NTLM-Anmeldung: Die Identität des Servers kann nicht geprüft werden."
   hint: "Tab = Feld wechseln · Enter = anmelden · Esc = zurück"
   rejected: "Anmeldung abgelehnt: %{reason}"
+  save_password: "Passwort im Schlüsselbund sichern"
