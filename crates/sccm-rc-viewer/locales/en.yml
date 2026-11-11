@@ -67,3 +67,4 @@ login:
   ntlm_note: "NTLM logon: the server's identity cannot be verified."
   hint: "Tab = switch field · Enter = log on · Esc = back"
   rejected: "Logon rejected: %{reason}"
+  save_password: "Save password in Keychain"

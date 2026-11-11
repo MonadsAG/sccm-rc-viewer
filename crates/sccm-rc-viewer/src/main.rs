@@ -27,6 +27,7 @@ use winit::window::{Window, WindowId};
 mod audit;
 mod gpu;
 mod host_prompt;
+mod keychain;
 mod keymap;
 mod login_prompt;
 mod paths;
@@ -265,6 +266,24 @@ fn cmd_as_win() -> bool {
 /// that watch for a remote Ctrl+V (the UAC paste fallback) must use this.
 fn remote_ctrl(m: ModifiersState) -> bool {
     m.control_key() || (cfg!(target_os = "macos") && m.super_key() && !cmd_as_win())
+}
+
+/// The logon overlay, with the Keychain checkbox where the platform has one.
+/// `fill`: fill in a saved password for `user`; `remember`: initial state of
+/// the "save password" checkbox.
+fn login_overlay(
+    target: String,
+    user: Option<String>,
+    error: Option<String>,
+    fill: bool,
+    remember: bool,
+) -> login_prompt::LoginPromptOverlay {
+    let o = login_prompt::LoginPromptOverlay::new(target, user, error);
+    if keychain::AVAILABLE {
+        o.with_keychain(keychain::load, fill, remember)
+    } else {
+        o
+    }
 }
 
 /// User name to pre-fill in the logon overlay: `SCCM_USER`, else the last one used.
@@ -765,15 +784,13 @@ fn main() -> anyhow::Result<()> {
         },
         type_prompt: None,
         login_prompt: if login_first {
-            Some(login_prompt::LoginPromptOverlay::new(
-                target.clone(),
-                initial_login_user(),
-                None,
-            ))
+            Some(login_overlay(target.clone(), initial_login_user(), None, true, false))
         } else {
             None
         },
         creds: initial_creds,
+        keychain_save: false,
+        creds_from_keychain: false,
         cliprdr_req_counter,
         paste_pending: None,
         locks_sent: None,
@@ -1232,6 +1249,10 @@ struct App {
     /// Logon overlay (non-Windows): Some = collecting DOMAIN\user + password
     /// for the chosen host; no session is running yet.
     login_prompt: Option<login_prompt::LoginPromptOverlay>,
+    /// Save `creds` to the Keychain once the session is up (box ticked).
+    keychain_save: bool,
+    /// `creds` came unchanged from the Keychain (deleted if rejected).
+    creds_from_keychain: bool,
     /// Explicit logon credentials for the current host (non-Windows), held in
     /// memory only and reused by the auto-reconnect loop.
     creds: Option<LogonCredentials>,
@@ -1409,6 +1430,8 @@ impl App {
         self.host_prompt = Some(host_prompt::HostPromptOverlay::new());
         self.login_prompt = None;
         self.creds = None; // a new host asks for the password again
+        self.keychain_save = false;
+        self.creds_from_keychain = false;
         self.closed = None;
         if let Some(w) = &self.window {
             w.request_redraw();
@@ -1739,6 +1762,12 @@ impl ApplicationHandler<UserEvent> for App {
             }
             UserEvent::SessionActive => {
                 self.sync_locks(true);
+                // The logon worked: now the password is worth keeping.
+                if std::mem::take(&mut self.keychain_save) {
+                    if let Some(c) = &self.creds {
+                        keychain::save(&c.display_name(), &c.password);
+                    }
+                }
             }
             UserEvent::LoginFailed(reason, session) => {
                 // Only the session the UI still runs may reopen the logon
@@ -1755,15 +1784,25 @@ impl ApplicationHandler<UserEvent> for App {
                 // Re-offer the user who just failed (the typo is usually in the
                 // password), falling back to SCCM_USER / the last one used.
                 let failed_user = self.creds.take().map(|c| c.display_name());
+                // A saved password the server rejects is stale: drop it, so it
+                // can't cause another failed logon (lockout) next time.
+                if std::mem::take(&mut self.creds_from_keychain) {
+                    if let Some(u) = &failed_user {
+                        keychain::delete(u);
+                    }
+                }
+                let remember = std::mem::take(&mut self.keychain_save);
                 {
                     let mut f = self.shared.lock().unwrap();
                     *f = SharedFrame::default();
                 }
                 let msg = t!("login.rejected", reason => reason).to_string();
-                self.login_prompt = Some(login_prompt::LoginPromptOverlay::new(
+                self.login_prompt = Some(login_overlay(
                     self.host.clone(),
                     failed_user.or_else(initial_login_user),
                     Some(msg),
+                    false,
+                    remember,
                 ));
                 if let Some(w) = &self.window {
                     w.request_redraw();
@@ -1822,11 +1861,8 @@ impl ApplicationHandler<UserEvent> for App {
                 host_prompt::PromptOutcome::Confirmed(target) => {
                     if NEEDS_EXPLICIT_LOGON && self.creds.is_none() {
                         self.host_prompt = None;
-                        self.login_prompt = Some(login_prompt::LoginPromptOverlay::new(
-                            target,
-                            initial_login_user(),
-                            None,
-                        ));
+                        self.login_prompt =
+                            Some(login_overlay(target, initial_login_user(), None, true, false));
                         if let Some(w) = &self.window {
                             w.request_redraw();
                         }
@@ -1845,8 +1881,21 @@ impl ApplicationHandler<UserEvent> for App {
         if let Some(outcome) = self.login_prompt.as_mut().and_then(|p| p.take_outcome()) {
             self.login_prompt = None;
             match outcome {
-                login_prompt::LoginOutcome::Confirmed { target, creds } => {
+                login_prompt::LoginOutcome::Confirmed {
+                    target,
+                    creds,
+                    remember,
+                    from_keychain,
+                } => {
                     recent::set_last_user(&creds.display_name());
+                    // Unticked box: the user doesn't want it saved (any more).
+                    if keychain::AVAILABLE && !remember {
+                        keychain::delete(&creds.display_name());
+                    }
+                    // Save only after a successful logon (SessionActive), and
+                    // only if it is not already the saved one.
+                    self.keychain_save = remember && !from_keychain;
+                    self.creds_from_keychain = from_keychain;
                     self.creds = Some(creds);
                     self.start_session(target);
                 }

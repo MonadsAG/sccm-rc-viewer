@@ -157,6 +157,11 @@ verify the server's identity, so the toolbar shows an amber padlock
 ("NTLM · encrypted") instead of the green Kerberos one. The target must accept
 NTLM for remote control.
 
+Optionally, tick *Save password in Keychain* on the logon screen. The password
+is stored in your login Keychain (item "SCCM RC logon", one per `DOMAIN\user`)
+only after the logon succeeded, and filled in on the next logon. A logon the
+server rejects deletes the saved item; untick the box to remove it yourself.
+
 ```sh
 # One-time setup: Rust via https://rustup.rs (Xcode Command Line Tools for the linker)
 cargo run --release -p sccm-rc-viewer -- TARGET-HOST   # asks for user + password
