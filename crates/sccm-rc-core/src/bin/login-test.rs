@@ -16,7 +16,10 @@ use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
-#[command(name = "login-test", about = "One logon attempt + sealed round trip + clean disconnect")]
+#[command(
+    name = "login-test",
+    about = "One logon attempt + sealed round trip + clean disconnect"
+)]
 struct Cli {
     target: String,
     /// Seconds to wait for the whole bring-up, including a possible

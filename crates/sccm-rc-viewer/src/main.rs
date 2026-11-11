@@ -976,13 +976,11 @@ fn remote_scancode(key: &PhysicalKey) -> Option<(u8, bool)> {
         return None;
     };
     let code = *code;
-    if cfg!(target_os = "macos") {
-        if !cmd_as_win() {
-            match code {
-                KeyCode::SuperLeft => return keymap::set1(KeyCode::ControlLeft),
-                KeyCode::SuperRight => return keymap::set1(KeyCode::ControlRight),
-                _ => {}
-            }
+    if cfg!(target_os = "macos") && !cmd_as_win() {
+        match code {
+            KeyCode::SuperLeft => return keymap::set1(KeyCode::ControlLeft),
+            KeyCode::SuperRight => return keymap::set1(KeyCode::ControlRight),
+            _ => {}
         }
     }
     keymap::set1(code)
@@ -994,7 +992,10 @@ const RECONNECT_MAX: std::time::Duration = std::time::Duration::from_secs(30);
 /// Delay before the next reconnect: reset to the minimum after a session that
 /// stayed up for a while, otherwise double (capped). Without this a dead
 /// target or tunnel got hammered once a second indefinitely.
-fn next_backoff(current: std::time::Duration, session_lasted: std::time::Duration) -> std::time::Duration {
+fn next_backoff(
+    current: std::time::Duration,
+    session_lasted: std::time::Duration,
+) -> std::time::Duration {
     if session_lasted >= RECONNECT_MAX {
         RECONNECT_MIN
     } else {
@@ -1841,11 +1842,7 @@ impl ApplicationHandler<UserEvent> for App {
             }
         }
         // Drain any pending logon outcome (Enter → connect, Esc → host picker).
-        if let Some(outcome) = self
-            .login_prompt
-            .as_mut()
-            .and_then(|p| p.take_outcome())
-        {
+        if let Some(outcome) = self.login_prompt.as_mut().and_then(|p| p.take_outcome()) {
             self.login_prompt = None;
             match outcome {
                 login_prompt::LoginOutcome::Confirmed { target, creds } => {
@@ -2251,14 +2248,16 @@ impl ApplicationHandler<UserEvent> for App {
                     if event.state == ElementState::Pressed {
                         let m = self.modifiers;
                         match event.physical_key {
-                            PhysicalKey::Code(KeyCode::KeyV) | PhysicalKey::Code(KeyCode::Insert)
+                            PhysicalKey::Code(KeyCode::KeyV)
+                            | PhysicalKey::Code(KeyCode::Insert)
                                 if edit_mod(m) =>
                             {
                                 if let Some(clip) = read_clipboard_text() {
                                     prompt.on_text(&clip);
                                 }
                             }
-                            PhysicalKey::Code(KeyCode::KeyA) | PhysicalKey::Code(KeyCode::Delete)
+                            PhysicalKey::Code(KeyCode::KeyA)
+                            | PhysicalKey::Code(KeyCode::Delete)
                                 if edit_mod(m) =>
                             {
                                 prompt.on_clear()
@@ -2578,7 +2577,11 @@ impl App {
         let (ov_w, ov_h, dest) = if show_full_overlay {
             (lw, lh, gpu::OverlayDest::Full)
         } else {
-            (lw, toolbar::TOOLBAR_H.min(lh), gpu::OverlayDest::TopStrip(bar_h))
+            (
+                lw,
+                toolbar::TOOLBAR_H.min(lh),
+                gpu::OverlayDest::TopStrip(bar_h),
+            )
         };
         let mut ov = vec![0u32; (ov_w * ov_h) as usize];
         if let Some(prompt) = self.login_prompt.as_ref() {
@@ -3115,7 +3118,10 @@ mod backoff_tests {
 
     #[test]
     fn resets_after_a_long_session() {
-        assert_eq!(next_backoff(RECONNECT_MAX, Duration::from_secs(600)), RECONNECT_MIN);
+        assert_eq!(
+            next_backoff(RECONNECT_MAX, Duration::from_secs(600)),
+            RECONNECT_MIN
+        );
     }
 }
 

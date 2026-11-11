@@ -44,7 +44,11 @@ pub fn data_dir() -> PathBuf {
 
 /// Where session recordings go: `Videos` on Windows, `Movies` on macOS.
 pub fn recordings_dir() -> PathBuf {
-    let folder = if cfg!(target_os = "macos") { "Movies" } else { "Videos" };
+    let folder = if cfg!(target_os = "macos") {
+        "Movies"
+    } else {
+        "Videos"
+    };
     home_dir()
         .unwrap_or_else(std::env::temp_dir)
         .join(folder)

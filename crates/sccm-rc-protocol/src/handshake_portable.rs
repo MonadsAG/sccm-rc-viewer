@@ -25,12 +25,12 @@
 //!   module keeps one counter per direction, starting at 0.
 
 use crate::Error;
-use sspi::{
-    AuthIdentity, BufferType, ClientRequestFlags, CredentialUse,
-    DataRepresentation, DecryptionFlags, EncryptionFlags, Ntlm,
-    SecurityBuffer, SecurityBufferRef, SecurityStatus, Sspi, SspiImpl, Username,
-};
 use sspi::ntlm::NtlmConfig;
+use sspi::{
+    AuthIdentity, BufferType, ClientRequestFlags, CredentialUse, DataRepresentation,
+    DecryptionFlags, EncryptionFlags, Ntlm, SecurityBuffer, SecurityBufferRef, SecurityStatus,
+    Sspi, SspiImpl, Username,
+};
 use std::fmt;
 use tracing::{debug, trace};
 
@@ -99,8 +99,15 @@ impl SspiSession {
 
     /// Create a session with explicit credentials.
     pub fn new_with_credentials(target_host: &str, c: &LogonCredentials) -> crate::Result<Self> {
-        let username = Username::new(&c.user, if c.domain.is_empty() { None } else { Some(&c.domain) })
-            .map_err(|e| Error::Sspi(format!("invalid user name: {e}")))?;
+        let username = Username::new(
+            &c.user,
+            if c.domain.is_empty() {
+                None
+            } else {
+                Some(&c.domain)
+            },
+        )
+        .map_err(|e| Error::Sspi(format!("invalid user name: {e}")))?;
         let identity = AuthIdentity {
             username,
             password: c.password.clone().into(),
@@ -187,7 +194,10 @@ impl SspiSession {
                 .map_err(|e| sspi_err("complete_auth_token", e))?;
         }
 
-        let done = matches!(result.status, SecurityStatus::Ok | SecurityStatus::CompleteNeeded);
+        let done = matches!(
+            result.status,
+            SecurityStatus::Ok | SecurityStatus::CompleteNeeded
+        );
         self.done = done;
         if done {
             debug!(
@@ -356,7 +366,8 @@ fn sealing_negotiated(server: Option<u32>, client: Option<u32>) -> bool {
 }
 
 fn fmt_flags(f: Option<u32>) -> String {
-    f.map(|v| format!("{v:#010x}")).unwrap_or_else(|| "none".into())
+    f.map(|v| format!("{v:#010x}"))
+        .unwrap_or_else(|| "none".into())
 }
 
 #[cfg(test)]
@@ -365,7 +376,7 @@ mod tests {
 
     #[test]
     fn spn_format_matches_original() {
-        assert_eq!(build_spn("127.0.0.19"), "TERMSRV/127.0.0.19");
+        assert_eq!(build_spn("192.0.2.10"), "TERMSRV/192.0.2.10");
     }
 
     /// In-process NTLM server paired with `SspiSession`, used to
@@ -471,7 +482,7 @@ mod tests {
 
     fn connected_pair() -> (SspiSession, LoopbackServer) {
         let c = LogonCredentials::parse("CORP\\alice", None, "S3cret!pw").unwrap();
-        let mut client = SspiSession::new_with_credentials("127.0.0.19", &c).unwrap();
+        let mut client = SspiSession::new_with_credentials("192.0.2.10", &c).unwrap();
         let mut server = LoopbackServer::new(&c);
 
         let mut to_client: Vec<u8> = Vec::new();
@@ -507,8 +518,15 @@ mod tests {
             let msg = format!("frame {i} \u{e9}\u{4e16}").into_bytes();
             // client -> server
             let sealed = client.seal(&msg).unwrap();
-            assert_eq!(u16::from_le_bytes([sealed[0], sealed[1]]) as usize, msg.len());
-            assert_ne!(&sealed[2..2 + msg.len()], &msg[..], "data must be encrypted");
+            assert_eq!(
+                u16::from_le_bytes([sealed[0], sealed[1]]) as usize,
+                msg.len()
+            );
+            assert_ne!(
+                &sealed[2..2 + msg.len()],
+                &msg[..],
+                "data must be encrypted"
+            );
             assert_eq!(server.unseal(&sealed), msg);
             // server -> client
             let reply = format!("reply {i}").into_bytes();
@@ -551,18 +569,34 @@ mod tests {
 
     #[test]
     fn reads_flags_from_ntlm_messages() {
-        assert_eq!(ntlm_message_flags(&token(2, 20, 0xe2898215, 56)), Some((2, 0xe2898215)));
+        assert_eq!(
+            ntlm_message_flags(&token(2, 20, 0xe2898215, 56)),
+            Some((2, 0xe2898215))
+        );
         assert_eq!(ntlm_message_flags(&token(3, 60, 0x20, 88)), Some((3, 0x20)));
-        assert_eq!(ntlm_message_flags(&token(1, 12, 0xe20882b7, 40)), Some((1, 0xe20882b7)));
+        assert_eq!(
+            ntlm_message_flags(&token(1, 12, 0xe20882b7, 40)),
+            Some((1, 0xe20882b7))
+        );
         assert_eq!(ntlm_message_flags(b"not ntlm at all"), None);
-        assert_eq!(ntlm_message_flags(&token(3, 20, 0, 40)), None, "AUTHENTICATE too short");
+        assert_eq!(
+            ntlm_message_flags(&token(3, 20, 0, 40)),
+            None,
+            "AUTHENTICATE too short"
+        );
     }
 
     #[test]
     fn sealing_needs_both_sides() {
         assert!(sealing_negotiated(Some(0x20), Some(0x20)));
-        assert!(!sealing_negotiated(Some(0x00), Some(0x20)), "server did not offer SEAL");
-        assert!(!sealing_negotiated(Some(0x20), Some(0x00)), "client did not confirm SEAL");
+        assert!(
+            !sealing_negotiated(Some(0x00), Some(0x20)),
+            "server did not offer SEAL"
+        );
+        assert!(
+            !sealing_negotiated(Some(0x20), Some(0x00)),
+            "client did not confirm SEAL"
+        );
         assert!(!sealing_negotiated(None, Some(0x20)), "no challenge seen");
         assert!(!sealing_negotiated(Some(0x20), None));
     }
@@ -570,13 +604,13 @@ mod tests {
     #[test]
     fn not_confidential_before_handshake() {
         let c = LogonCredentials::parse("CORP\\alice", None, "pw").unwrap();
-        let s = SspiSession::new_with_credentials("127.0.0.19", &c).unwrap();
+        let s = SspiSession::new_with_credentials("192.0.2.10", &c).unwrap();
         assert!(!s.confidentiality());
     }
 
     #[test]
     fn can_create_session() {
         let c = LogonCredentials::parse("CORP\\alice", None, "pw").unwrap();
-        assert!(SspiSession::new_with_credentials("127.0.0.19", &c).is_ok());
+        assert!(SspiSession::new_with_credentials("192.0.2.10", &c).is_ok());
     }
 }

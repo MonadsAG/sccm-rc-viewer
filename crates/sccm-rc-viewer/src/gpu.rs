@@ -122,11 +122,17 @@ impl GpuRenderer {
     }
 
     fn backend_label(be: wgpu::Backends) -> &'static str {
-        if be.contains(wgpu::Backends::DX12) { "dx12" }
-        else if be.contains(wgpu::Backends::VULKAN) { "vulkan" }
-        else if be.contains(wgpu::Backends::GL) { "gl" }
-        else if be.contains(wgpu::Backends::METAL) { "metal" }
-        else { "unknown" }
+        if be.contains(wgpu::Backends::DX12) {
+            "dx12"
+        } else if be.contains(wgpu::Backends::VULKAN) {
+            "vulkan"
+        } else if be.contains(wgpu::Backends::GL) {
+            "gl"
+        } else if be.contains(wgpu::Backends::METAL) {
+            "metal"
+        } else {
+            "unknown"
+        }
     }
 
     fn new_with_backends(

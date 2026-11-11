@@ -7,9 +7,9 @@
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
+pub use sccm_rc_protocol::credentials::LogonCredentials;
 use sccm_rc_protocol::framing::{self, MSG_TYPE_CONTROL, MSG_TYPE_DATA};
 use sccm_rc_protocol::handshake::SspiSession;
-pub use sccm_rc_protocol::credentials::LogonCredentials;
 use sccm_rc_protocol::transport::RawConnection;
 pub use sccm_rc_protocol::{Error, Result};
 use tracing::{debug, info, warn};

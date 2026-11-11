@@ -363,7 +363,16 @@ pub(crate) fn draw_left(
     }
 }
 
-pub(crate) fn fill_rect(buf: &mut [u32], w: u32, h: u32, x: i32, y: i32, rw: u32, rh: u32, color: u32) {
+pub(crate) fn fill_rect(
+    buf: &mut [u32],
+    w: u32,
+    h: u32,
+    x: i32,
+    y: i32,
+    rw: u32,
+    rh: u32,
+    color: u32,
+) {
     let x0 = x.max(0) as u32;
     let y0 = y.max(0) as u32;
     let x1 = ((x + rw as i32).max(0) as u32).min(w);
@@ -376,7 +385,16 @@ pub(crate) fn fill_rect(buf: &mut [u32], w: u32, h: u32, x: i32, y: i32, rw: u32
     }
 }
 
-pub(crate) fn stroke_rect(buf: &mut [u32], w: u32, h: u32, x: i32, y: i32, rw: u32, rh: u32, color: u32) {
+pub(crate) fn stroke_rect(
+    buf: &mut [u32],
+    w: u32,
+    h: u32,
+    x: i32,
+    y: i32,
+    rw: u32,
+    rh: u32,
+    color: u32,
+) {
     let w_i = w as i32;
     let h_i = h as i32;
     for i in 0..rw as i32 {

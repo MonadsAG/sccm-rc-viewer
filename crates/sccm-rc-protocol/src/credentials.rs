@@ -71,8 +71,9 @@ impl LogonCredentials {
 
     /// Read `SCCM_USER` (+ optional `SCCM_DOMAIN`) and `SCCM_PASS`.
     pub fn from_env() -> crate::Result<Self> {
-        let user = std::env::var("SCCM_USER")
-            .map_err(|_| Error::Sspi("no credentials: SCCM_USER is not set (expected DOMAIN\\user)".into()))?;
+        let user = std::env::var("SCCM_USER").map_err(|_| {
+            Error::Sspi("no credentials: SCCM_USER is not set (expected DOMAIN\\user)".into())
+        })?;
         let pass = std::env::var("SCCM_PASS")
             .map_err(|_| Error::Sspi("no credentials: SCCM_PASS is not set".into()))?;
         let domain = std::env::var("SCCM_DOMAIN").ok();
@@ -90,7 +91,10 @@ mod tests {
         assert_eq!((c.domain.as_str(), c.user.as_str()), ("CORP", "alice"));
         assert_eq!(c.display_name(), "CORP\\alice");
         let c = LogonCredentials::parse("alice@corp.example", None, "pw").unwrap();
-        assert_eq!((c.domain.as_str(), c.user.as_str()), ("corp.example", "alice"));
+        assert_eq!(
+            (c.domain.as_str(), c.user.as_str()),
+            ("corp.example", "alice")
+        );
         let c = LogonCredentials::parse(" alice ", Some("CORP"), "pw").unwrap();
         assert_eq!((c.domain.as_str(), c.user.as_str()), ("CORP", "alice"));
         assert!(LogonCredentials::parse("CORP\\", None, "pw").is_err());

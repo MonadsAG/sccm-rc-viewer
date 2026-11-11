@@ -245,13 +245,7 @@ fn layout(win_w: u32, win_h: u32) -> Layout {
     }
 }
 
-pub fn draw(
-    buf: &mut [u32],
-    w: u32,
-    h: u32,
-    font: Option<&TextRenderer>,
-    o: &LoginPromptOverlay,
-) {
+pub fn draw(buf: &mut [u32], w: u32, h: u32, font: Option<&TextRenderer>, o: &LoginPromptOverlay) {
     for px in buf.iter_mut() {
         *px = 0x0020_2020;
     }
@@ -262,14 +256,38 @@ pub fn draw(
     let title = t!("login.title", target => o.target);
     match font {
         Some(f) => f.draw_centered(buf, w, h, (l.card_y + 40) as f32, &title, 0x00E4_EAF0, 22.0),
-        None => toolbar::draw_text_centered(buf, w, h, (l.card_y + 32) as u32, &title, 0x00E4_EAF0, 2),
+        None => {
+            toolbar::draw_text_centered(buf, w, h, (l.card_y + 32) as u32, &title, 0x00E4_EAF0, 2)
+        }
     }
 
     let label_col = 0x00A0_A8B0;
     let user_label = t!("login.user");
     let pass_label = t!("login.password");
-    draw_left(buf, w, h, l.user.x as f32, (l.user.y - 26) as f32, 22, &user_label, label_col, 15.0, font);
-    draw_left(buf, w, h, l.password.x as f32, (l.password.y - 26) as f32, 22, &pass_label, label_col, 15.0, font);
+    draw_left(
+        buf,
+        w,
+        h,
+        l.user.x as f32,
+        (l.user.y - 26) as f32,
+        22,
+        &user_label,
+        label_col,
+        15.0,
+        font,
+    );
+    draw_left(
+        buf,
+        w,
+        h,
+        l.password.x as f32,
+        (l.password.y - 26) as f32,
+        22,
+        &pass_label,
+        label_col,
+        15.0,
+        font,
+    );
 
     let masked: String = "*".repeat(o.password.chars().count());
     for (rect, text, field) in [
@@ -277,23 +295,58 @@ pub fn draw(
         (l.password, masked.as_str(), Field::Password),
     ] {
         fill_rect(buf, w, h, rect.x, rect.y, rect.w, rect.h, 0x001B_1E23);
-        let border = if o.focus == field { 0x0060_88B8 } else { 0x0045_4C55 };
+        let border = if o.focus == field {
+            0x0060_88B8
+        } else {
+            0x0045_4C55
+        };
         stroke_rect(buf, w, h, rect.x, rect.y, rect.w, rect.h, border);
         let tx = (rect.x + 10) as f32;
         if text.is_empty() && field == Field::User && o.focus != Field::User {
             let ph = t!("login.user_placeholder");
-            draw_left(buf, w, h, tx, (rect.y + 6) as f32, rect.h - 12, &ph, 0x0070_7880, 18.0, font);
+            draw_left(
+                buf,
+                w,
+                h,
+                tx,
+                (rect.y + 6) as f32,
+                rect.h - 12,
+                &ph,
+                0x0070_7880,
+                18.0,
+                font,
+            );
         } else {
-            draw_left(buf, w, h, tx, (rect.y + 6) as f32, rect.h - 12, text, 0x00E4_EAF0, 18.0, font);
+            draw_left(
+                buf,
+                w,
+                h,
+                tx,
+                (rect.y + 6) as f32,
+                rect.h - 12,
+                text,
+                0x00E4_EAF0,
+                18.0,
+                font,
+            );
         }
-        if o.focus == field && (o.caret_anchor.elapsed().as_millis() / 500) % 2 == 0 {
+        if o.focus == field && (o.caret_anchor.elapsed().as_millis() / 500).is_multiple_of(2) {
             let tw = if text.is_empty() {
                 0.0
             } else {
                 font.map(|f| f.width(text, 18.0))
                     .unwrap_or(text.chars().count() as f32 * 8.0)
             };
-            fill_rect(buf, w, h, (tx + tw) as i32, rect.y + 8, 2, (rect.h - 16).max(1), 0x00E4_EAF0);
+            fill_rect(
+                buf,
+                w,
+                h,
+                (tx + tw) as i32,
+                rect.y + 8,
+                2,
+                (rect.h - 16).max(1),
+                0x00E4_EAF0,
+            );
         }
     }
 
@@ -340,16 +393,22 @@ mod tests {
 
     #[test]
     fn enter_flow_user_then_password() {
-        let mut o = LoginPromptOverlay::new("127.0.0.19".into(), None, None);
+        let mut o = LoginPromptOverlay::new("192.0.2.10".into(), None, None);
         o.on_text("CORP\\alice");
         o.on_enter(); // moves to password
         assert!(o.take_outcome().is_none());
         o.on_text("pw");
         o.on_enter();
         let (target, c) = confirmed(&mut o).expect("confirmed");
-        assert_eq!(target, "127.0.0.19");
-        assert_eq!((c.domain.as_str(), c.user.as_str(), c.password.as_str()), ("CORP", "alice", "pw"));
-        assert!(o.password.is_empty(), "password must be wiped after confirm");
+        assert_eq!(target, "192.0.2.10");
+        assert_eq!(
+            (c.domain.as_str(), c.user.as_str(), c.password.as_str()),
+            ("CORP", "alice", "pw")
+        );
+        assert!(
+            o.password.is_empty(),
+            "password must be wiped after confirm"
+        );
     }
 
     #[test]

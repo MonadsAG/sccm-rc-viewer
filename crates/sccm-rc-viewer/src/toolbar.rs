@@ -382,7 +382,7 @@ mod fit_tests {
 
     fn status<'a>(security: &'a str, recording: bool) -> Status<'a> {
         Status {
-            host: "127.0.0.19",
+            host: "192.0.2.10",
             mode: "Control",
             state: "Connected",
             connected: true,
@@ -410,8 +410,12 @@ mod fit_tests {
         let s = status("NTLM · encrypted", false);
         let full = fit_status_text(&s, None, 2000);
         // Room for "host · mode · state" plus the padlock, not the full line.
-        let limit = 26 + 8 * ("127.0.0.19   ·   Control   ·   Connected".chars().count() as u32)
-            + 16 + 15 + 8 * 16 + 12;
+        let limit = 26
+            + 8 * ("192.0.2.10   ·   Control   ·   Connected".chars().count() as u32)
+            + 16
+            + 15
+            + 8 * 16
+            + 12;
         let t = fit_status_text(&s, None, limit);
         assert!(full.len() > t.len());
         assert!(t.contains("Connected") && !t.contains("fps"), "{t}");
@@ -420,12 +424,13 @@ mod fit_tests {
     #[test]
     fn falls_back_to_host_only() {
         let t = fit_status_text(&status("NTLM · encrypted", true), None, 50);
-        assert_eq!(t, "127.0.0.19");
+        assert_eq!(t, "192.0.2.10");
     }
 
     #[test]
     fn security_and_rec_take_room_from_the_text() {
-        let limit = 26 + 8 * ("127.0.0.19   ·   Control   ·   Connected".chars().count() as u32) + 16 + 12;
+        let limit =
+            26 + 8 * ("192.0.2.10   ·   Control   ·   Connected".chars().count() as u32) + 16 + 12;
         let without = fit_status_text(&status("", false), None, limit);
         let with = fit_status_text(&status("NTLM · encrypted", true), None, limit);
         assert!(with.len() < without.len(), "{with} vs {without}");

@@ -14,6 +14,9 @@ name: Release (macOS)
 #   MACOS_NOTARY_KEY_ID     its key ID
 #   MACOS_NOTARY_ISSUER     its issuer ID
 #
+# Repository variable (optional): MACOS_BUNDLE_ID, for distributions that ship
+# under their own bundle identifier.
+#
 # This workflow never runs for pull requests, so code from forks cannot reach
 # the secrets.
 
@@ -71,6 +74,10 @@ jobs:
 
       - name: Bundle, sign, notarize
         env:
+          # Repository variable; unset → the default upstream bundle ID.
+          # Downstream distributions set their own (e.g. ch.example.sccm-rc-viewer).
+          MACOS_BUNDLE_ID: ${{ vars.MACOS_BUNDLE_ID }}
+          MACOS_BUILD_NUMBER: ${{ github.run_number }}
           MACOS_SIGN_IDENTITY: ${{ env.HAS_CERT == 'true' && secrets.MACOS_SIGN_IDENTITY || '' }}
           MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
           MACOS_NOTARY_ISSUER: ${{ secrets.MACOS_NOTARY_ISSUER }}
