@@ -7,12 +7,7 @@ use std::io::Write;
 use std::time::SystemTime;
 
 fn audit_path() -> std::path::PathBuf {
-    let base = std::env::var("LOCALAPPDATA")
-        .ok()
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
-    let dir = base.join("sccm-rc");
-    let _ = std::fs::create_dir_all(&dir);
+    let dir = crate::paths::data_dir();
     dir.join("audit.jsonl")
 }
 

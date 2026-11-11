@@ -115,6 +115,8 @@ impl GpuRenderer {
             Ok(s) if s == "dx12" => vec![wgpu::Backends::DX12],
             Ok(s) if s == "vulkan" => vec![wgpu::Backends::VULKAN],
             Ok(s) if s == "gl" => vec![wgpu::Backends::GL],
+            Ok(s) if s == "metal" => vec![wgpu::Backends::METAL],
+            _ if cfg!(target_os = "macos") => vec![wgpu::Backends::METAL],
             _ => vec![wgpu::Backends::DX12, wgpu::Backends::VULKAN, wgpu::Backends::GL],
         }
     }
@@ -123,6 +125,7 @@ impl GpuRenderer {
         if be.contains(wgpu::Backends::DX12) { "dx12" }
         else if be.contains(wgpu::Backends::VULKAN) { "vulkan" }
         else if be.contains(wgpu::Backends::GL) { "gl" }
+        else if be.contains(wgpu::Backends::METAL) { "metal" }
         else { "unknown" }
     }
 

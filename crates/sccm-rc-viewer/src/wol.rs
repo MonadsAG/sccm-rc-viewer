@@ -17,6 +17,23 @@ pub fn parse_mac(s: &str) -> Option<[u8; 6]> {
     Some(mac)
 }
 
+/// Parse a MAC as printed by `arp -a`: Windows prints `aa-bb-cc-dd-ee-ff`,
+/// macOS prints `a:b:c:d:e:f` with leading zeros dropped.
+fn parse_arp_mac(tok: &str) -> Option<[u8; 6]> {
+    let parts: Vec<&str> = tok.split(['-', ':']).collect();
+    if parts.len() != 6 {
+        return None;
+    }
+    let mut mac = [0u8; 6];
+    for (b, p) in mac.iter_mut().zip(&parts) {
+        if p.is_empty() || p.len() > 2 {
+            return None;
+        }
+        *b = u8::from_str_radix(p, 16).ok()?;
+    }
+    Some(mac)
+}
+
 pub fn fmt_mac(mac: [u8; 6]) -> String {
     mac.iter()
         .map(|b| format!("{b:02X}"))
@@ -40,12 +57,7 @@ pub fn send(mac: [u8; 6]) -> std::io::Result<()> {
 }
 
 fn cache_path() -> std::path::PathBuf {
-    let base = std::env::var("LOCALAPPDATA")
-        .ok()
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
-    let dir = base.join("sccm-rc");
-    let _ = std::fs::create_dir_all(&dir);
+    let dir = crate::paths::data_dir();
     dir.join("macs.txt")
 }
 
@@ -94,12 +106,13 @@ pub fn lookup_and_cache(host: &str) {
         return;
     };
     let ip = addr.ip().to_string();
-    use std::os::windows::process::CommandExt;
-    let Ok(out) = std::process::Command::new("arp")
-        .creation_flags(0x0800_0000)
-        .args(["-a", &ip])
-        .output()
-    else {
+    let mut cmd = std::process::Command::new("arp");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let Ok(out) = cmd.args(["-a", &ip]).output() else {
         return;
     };
     let s = String::from_utf8_lossy(&out.stdout);
@@ -107,15 +120,39 @@ pub fn lookup_and_cache(host: &str) {
         if !line.contains(&ip) {
             continue;
         }
-        if let Some(mac) = line.split_whitespace().find_map(|t| {
-            if t.matches('-').count() == 5 {
-                parse_mac(t)
-            } else {
-                None
-            }
-        }) {
+        if let Some(mac) = line.split_whitespace().find_map(parse_arp_mac) {
             cache_mac(host, mac);
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod arp_tests {
+    use super::parse_arp_mac;
+
+    #[test]
+    fn windows_style() {
+        assert_eq!(
+            parse_arp_mac("aa-bb-cc-dd-ee-ff"),
+            Some([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff])
+        );
+    }
+
+    #[test]
+    fn macos_style_unpadded() {
+        assert_eq!(parse_arp_mac("a:b:c:d:e:f"), Some([10, 11, 12, 13, 14, 15]));
+        assert_eq!(
+            parse_arp_mac("0:1b:2c:3d:4e:5f"),
+            Some([0x00, 0x1b, 0x2c, 0x3d, 0x4e, 0x5f])
+        );
+    }
+
+    #[test]
+    fn rejects_non_macs() {
+        assert_eq!(parse_arp_mac("(10.0.0.1)"), None);
+        assert_eq!(parse_arp_mac("on"), None);
+        assert_eq!(parse_arp_mac("a:b:c:d:e"), None);
+        assert_eq!(parse_arp_mac("aaa:b:c:d:e:f"), None);
     }
 }

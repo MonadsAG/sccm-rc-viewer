@@ -1,5 +1,5 @@
-//! Anti-aliased proportional text via `ab_glyph`, using a Windows system font
-//! (Segoe UI) loaded at runtime. Falls back to the 8x8 bitmap font elsewhere if
+//! Anti-aliased proportional text via `ab_glyph`, using an OS system font
+//! (Segoe UI on Windows, Tahoma/Arial on macOS) loaded at runtime. Falls back to the 8x8 bitmap font elsewhere if
 //! no system TTF is available.
 
 use ab_glyph::{point, Font, FontVec, Glyph, PxScale, ScaleFont};
@@ -9,17 +9,34 @@ pub struct TextRenderer {
 }
 
 impl TextRenderer {
-    /// Load a clean UI font from the Windows fonts directory.
+    /// Load a clean UI font from the OS fonts directory (Segoe UI and friends
+    /// on Windows; Tahoma/Arial/Verdana, which macOS ships as plain TTFs).
     pub fn load() -> Option<Self> {
-        let dir = std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".into());
-        for name in ["segoeui.ttf", "tahoma.ttf", "arial.ttf", "verdana.ttf"] {
-            if let Ok(bytes) = std::fs::read(format!("{dir}\\Fonts\\{name}")) {
-                if let Ok(font) = FontVec::try_from_vec(bytes) {
-                    return Some(Self { font });
-                }
-            }
+        Self::candidates().into_iter().find_map(|path| {
+            let bytes = std::fs::read(&path).ok()?;
+            FontVec::try_from_vec(bytes).ok().map(|font| Self { font })
+        })
+    }
+
+    fn candidates() -> Vec<std::path::PathBuf> {
+        if cfg!(windows) {
+            let dir = std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".into());
+            ["segoeui.ttf", "tahoma.ttf", "arial.ttf", "verdana.ttf"]
+                .iter()
+                .map(|n| std::path::Path::new(&dir).join("Fonts").join(n))
+                .collect()
+        } else {
+            [
+                "/System/Library/Fonts/Supplemental/Tahoma.ttf",
+                "/System/Library/Fonts/Supplemental/Arial.ttf",
+                "/System/Library/Fonts/Supplemental/Verdana.ttf",
+                "/Library/Fonts/Arial.ttf",
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            ]
+            .iter()
+            .map(std::path::PathBuf::from)
+            .collect()
         }
-        None
     }
 
     /// Advance width (px) of `s` at pixel size `px`.

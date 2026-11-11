@@ -105,17 +105,13 @@ fn windows_version_line() -> String {
 }
 
 fn audit_path() -> Option<PathBuf> {
-    let local = std::env::var_os("LOCALAPPDATA")?;
-    Some(PathBuf::from(local).join("sccm-rc").join("audit.jsonl"))
+    Some(crate::paths::data_dir().join("audit.jsonl"))
 }
 
 /// Up to two most-recently-modified `viewer.*log` files from the log dir, so
 /// the bundle covers both today's session and the previous day's tail.
 fn viewer_log_files() -> Vec<PathBuf> {
-    let Some(local) = std::env::var_os("LOCALAPPDATA") else {
-        return Vec::new();
-    };
-    let dir = PathBuf::from(local).join("sccm-rc");
+    let dir = crate::paths::data_dir();
     let Ok(rd) = fs::read_dir(&dir) else {
         return Vec::new();
     };

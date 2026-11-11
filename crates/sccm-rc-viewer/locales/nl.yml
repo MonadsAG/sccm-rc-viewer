@@ -56,3 +56,14 @@ prompt:
   cancel: "Annuleren"
   placeholder: "Typ een hostnaam…"
   hint: "Enter of klik een recente = verbinden · Ctrl+V = plakken · Esc = afsluiten"
+
+login:
+  title: "Aanmelden bij %{target}"
+  user: "Gebruiker (DOMEIN\\gebruiker):"
+  user_placeholder: "DOMEIN\\gebruiker"
+  password: "Wachtwoord:"
+  need_user: "Voer een gebruikersnaam in."
+  need_password: "Voer het wachtwoord in."
+  ntlm_note: "NTLM-aanmelding: de identiteit van de server kan niet worden geverifieerd."
+  hint: "Tab = ander veld · Enter = aanmelden · Esc = terug"
+  rejected: "Aanmelding geweigerd: %{reason}"

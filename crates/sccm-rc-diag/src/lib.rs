@@ -9,7 +9,14 @@
 
 use std::time::Duration;
 
+#[cfg(windows)]
 pub mod checks;
+/// Non-Windows build: TCP reachability only; the Win32 remote checks are
+/// reported as skipped.
+#[cfg(not(windows))]
+#[path = "checks_portable.rs"]
+pub mod checks;
+#[cfg(windows)]
 mod winutil;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

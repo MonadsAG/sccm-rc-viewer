@@ -227,14 +227,14 @@ pub fn draw(buf: &mut [u32], win_w: u32, win_h: u32, status: &Status, font: Opti
         ACCENT_BUSY
     };
     fill_rect(buf, win_w, win_h, 10, TOOLBAR_H / 2 - 4, 8, 8, dot);
-    let text = format!(
-        "{}   \u{00b7}   {}   \u{00b7}   {}   \u{00b7}   {} fps   \u{00b7}   {}",
-        status.host,
-        status.mode,
-        status.state,
-        status.fps,
-        fmt_bw(status.bytes_per_sec)
-    );
+
+    // The buttons are laid out from the right edge; the status line must end
+    // before the leftmost one, or the buttons paint over it (and over the
+    // security padlock, the part that matters most). Drop detail by priority
+    // until it fits: bandwidth + fps first, then the state, then the mode.
+    let lay = layout(win_w, font, status.monitor);
+    let buttons_left = lay.iter().map(|b| b.2).min().unwrap_or(win_w);
+    let text = fit_status_text(status, font, buttons_left);
     put_text(buf, win_w, win_h, 26, &text, TEXT, font);
     let mut x_after = 26 + measure(font, &text) + 16;
     // Recording indicator: a red dot + "REC" after the status line.
@@ -261,7 +261,6 @@ pub fn draw(buf: &mut [u32], win_w: u32, win_h: u32, status: &Status, font: Opti
     }
 
     // Buttons (right). Active toggles are tinted; Record is red.
-    let lay = layout(win_w, font, status.monitor);
     for (action, _label, bx, by, bw, bh) in &lay {
         let active = (*action == ToolbarAction::ToggleCurtain && status.curtain)
             || (*action == ToolbarAction::ToggleViewOnly && status.view_only);
@@ -279,6 +278,37 @@ pub fn draw(buf: &mut [u32], win_w: u32, win_h: u32, status: &Status, font: Opti
         let tx = bx + (bw.saturating_sub(measure(font, label))) / 2;
         put_text(buf, win_w, win_h, tx, label, BTN_TEXT, font);
     }
+}
+
+/// The longest status line (most detail first) that, together with the REC
+/// marker and the security padlock, ends before `limit_x`. Falls back to the
+/// host name alone.
+fn fit_status_text(status: &Status, font: Option<&TextRenderer>, limit_x: u32) -> String {
+    let sep = "   \u{00b7}   ";
+    let bw = fmt_bw(status.bytes_per_sec);
+    let fps = format!("{} fps", status.fps);
+    let variants: [Vec<&str>; 4] = [
+        vec![status.host, status.mode, status.state, &fps, &bw],
+        vec![status.host, status.mode, status.state],
+        vec![status.host, status.mode],
+        vec![status.host],
+    ];
+    // Width of everything drawn after the text (see `draw`).
+    let mut tail = 16;
+    if status.recording {
+        tail += 14 + measure(font, "REC") + 18;
+    }
+    if !status.security.is_empty() {
+        tail += 15 + measure(font, status.security);
+    }
+    let gap = 12; // breathing room before the first button
+    for parts in &variants[..variants.len() - 1] {
+        let text = parts.join(sep);
+        if 26 + measure(font, &text) + tail + gap <= limit_x {
+            return text;
+        }
+    }
+    status.host.to_string()
 }
 
 fn fill_rect(buf: &mut [u32], win_w: u32, win_h: u32, x: u32, y: u32, w: u32, h: u32, color: u32) {
@@ -344,4 +374,60 @@ pub fn draw_text_centered(
     let w = s.chars().count() as u32 * 8 * scale;
     let x = win_w.saturating_sub(w) / 2;
     draw_text_scaled(buf, win_w, win_h, x, y, s, color, scale);
+}
+
+#[cfg(test)]
+mod fit_tests {
+    use super::{fit_status_text, Status};
+
+    fn status<'a>(security: &'a str, recording: bool) -> Status<'a> {
+        Status {
+            host: "127.0.0.19",
+            mode: "Control",
+            state: "Connected",
+            connected: true,
+            fps: 30,
+            bytes_per_sec: 2048,
+            recording,
+            curtain: false,
+            security,
+            secure: false,
+            view_only: false,
+            encrypted: true,
+            monitor: None,
+        }
+    }
+
+    // With no font the toolbar measures 8 px per character.
+    #[test]
+    fn full_detail_when_there_is_room() {
+        let t = fit_status_text(&status("NTLM · encrypted", false), None, 2000);
+        assert!(t.contains("fps"), "{t}");
+    }
+
+    #[test]
+    fn drops_fps_and_bandwidth_first() {
+        let s = status("NTLM · encrypted", false);
+        let full = fit_status_text(&s, None, 2000);
+        // Room for "host · mode · state" plus the padlock, not the full line.
+        let limit = 26 + 8 * ("127.0.0.19   ·   Control   ·   Connected".chars().count() as u32)
+            + 16 + 15 + 8 * 16 + 12;
+        let t = fit_status_text(&s, None, limit);
+        assert!(full.len() > t.len());
+        assert!(t.contains("Connected") && !t.contains("fps"), "{t}");
+    }
+
+    #[test]
+    fn falls_back_to_host_only() {
+        let t = fit_status_text(&status("NTLM · encrypted", true), None, 50);
+        assert_eq!(t, "127.0.0.19");
+    }
+
+    #[test]
+    fn security_and_rec_take_room_from_the_text() {
+        let limit = 26 + 8 * ("127.0.0.19   ·   Control   ·   Connected".chars().count() as u32) + 16 + 12;
+        let without = fit_status_text(&status("", false), None, limit);
+        let with = fit_status_text(&status("NTLM · encrypted", true), None, limit);
+        assert!(with.len() < without.len(), "{with} vs {without}");
+    }
 }

@@ -27,6 +27,7 @@ async fn main() -> anyhow::Result<()> {
     let viewer_user = cli
         .user
         .or_else(|| std::env::var("USERNAME").ok())
+        .or_else(|| std::env::var("USER").ok())
         .unwrap_or_default();
 
     let results = checks::run_all(&cli.target, &viewer_user).await;

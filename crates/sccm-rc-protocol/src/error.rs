@@ -11,6 +11,13 @@ pub enum Error {
     #[error("protocol: {0}")]
     Protocol(String),
 
+    /// The server refused this logon or this user (for example
+    /// `ERROR_LOGON_DENIED`: wrong password, or the user is not a Permitted
+    /// Viewer on the target). Retrying with the same credentials cannot help
+    /// and risks locking the account.
+    #[error("logon rejected by the target: {0}")]
+    LogonRejected(String),
+
     #[error("connection refused — target may not have CcmExec running, or TCP/2701 is blocked")]
     Refused,
 

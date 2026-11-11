@@ -56,3 +56,14 @@ prompt:
   cancel: "Cancel"
   placeholder: "Type a hostname…"
   hint: "Enter or click a recent = connect · Ctrl+V = paste · Esc = quit"
+
+login:
+  title: "Log on to %{target}"
+  user: "User (DOMAIN\\user):"
+  user_placeholder: "DOMAIN\\user"
+  password: "Password:"
+  need_user: "Enter a user name."
+  need_password: "Enter the password."
+  ntlm_note: "NTLM logon: the server's identity cannot be verified."
+  hint: "Tab = switch field · Enter = log on · Esc = back"
+  rejected: "Logon rejected: %{reason}"

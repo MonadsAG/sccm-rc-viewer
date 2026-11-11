@@ -32,8 +32,13 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 # Windows OS-clipboard access for clipboard sharing (cliprdr) — text path
 # uses the high-level helpers here; the file path (CF_HDROP) below uses the
 # `windows` crate directly since clipboard-win doesn't expose it cleanly.
-clipboard-win = "5"
 
-# Raw Win32 for CF_HDROP reading (paste-file-from-Explorer → remote).
+# Raw Win32 for CF_HDROP reading (paste-file-from-Explorer → remote), plus the
+# OS clipboard text path.
 [target.'cfg(windows)'.dependencies]
 windows.workspace = true
+clipboard-win = "5"
+
+# Text-only OS clipboard on non-Windows hosts (no image support needed).
+[target.'cfg(not(windows))'.dependencies]
+arboard = { version = "3", default-features = false }

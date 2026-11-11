@@ -14,7 +14,7 @@ use sccm_rc_core::rdp::{
     self, FastPathInputEvent, FrameView, InputSender, KeyboardFlags, MousePdu, PointerFlags,
     PointerUpdate, SessionSink, SessionStats, UpdateRegion,
 };
-use sccm_rc_core::SccmSession;
+use sccm_rc_core::{LogonCredentials, SccmSession};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 use winit::application::ApplicationHandler;
@@ -27,6 +27,9 @@ use winit::window::{Window, WindowId};
 mod audit;
 mod gpu;
 mod host_prompt;
+mod keymap;
+mod login_prompt;
+mod paths;
 mod recent;
 mod record;
 mod report;
@@ -205,7 +208,35 @@ fn read_clipboard_text() -> Option<String> {
 
 #[cfg(not(windows))]
 fn read_clipboard_text() -> Option<String> {
-    None
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let r = arboard::Clipboard::new()
+            .ok()
+            .and_then(|mut c| c.get_text().ok())
+            .filter(|s| !s.is_empty());
+        let _ = tx.send(r);
+    });
+    rx.recv_timeout(std::time::Duration::from_millis(1500))
+        .ok()
+        .flatten()
+}
+
+/// Without single sign-on (every OS but Windows) a session needs explicit
+/// NTLM credentials, collected by the logon overlay.
+const NEEDS_EXPLICIT_LOGON: bool = cfg!(not(windows));
+
+/// The "command" modifier for editing shortcuts in the overlays: Ctrl, plus
+/// Cmd on macOS (Cmd+V / Cmd+A are what Mac users press).
+fn edit_mod(m: ModifiersState) -> bool {
+    m.control_key() || (cfg!(target_os = "macos") && m.super_key())
+}
+
+/// User name to pre-fill in the logon overlay: `SCCM_USER`, else the last one used.
+fn initial_login_user() -> Option<String> {
+    std::env::var("SCCM_USER")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(recent::last_user)
 }
 
 /// Draw an animated "rotating dots" spinner centered at (cx, cy). A bright head
@@ -247,6 +278,10 @@ fn draw_spinner(
 #[derive(Debug, Clone)]
 enum UserEvent {
     Frame,
+    /// The target rejected the explicit logon (wrong password, user not a
+    /// Permitted Viewer, …). The session thread has stopped retrying; the UI
+    /// reopens the logon overlay with this message.
+    LoginFailed(String),
     #[allow(dead_code)] // retained for an alternate teardown path
     Closed(String),
 }
@@ -404,10 +439,7 @@ impl SessionSink for FrameSink {
 fn install_panic_hook() {
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let dir = std::env::var_os("LOCALAPPDATA")
-            .map(|p| std::path::PathBuf::from(p).join("sccm-rc"))
-            .unwrap_or_else(std::env::temp_dir);
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = paths::data_dir();
         let when = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -449,10 +481,7 @@ fn init_tracing() -> Option<tracing_appender::non_blocking::WorkerGuard> {
     });
     let console = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);
 
-    let log_dir = std::env::var_os("LOCALAPPDATA")
-        .map(|p| std::path::PathBuf::from(p).join("sccm-rc"))
-        .unwrap_or_else(std::env::temp_dir);
-    let _ = std::fs::create_dir_all(&log_dir);
+    let log_dir = paths::data_dir();
 
     let appender = tracing_appender::rolling::Builder::new()
         .rotation(tracing_appender::rolling::Rotation::DAILY)
@@ -604,7 +633,16 @@ fn main() -> anyhow::Result<()> {
     // every FormatDataRequest, sampled by the App at Ctrl+V key-down / V-up
     // to decide whether the paste reached a clipboard-accepting app.
     let cliprdr_req_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let no_initial_session = cli.demo || cli_target.is_none();
+    // Explicit credentials can come from SCCM_USER / SCCM_PASS (scripted use);
+    // otherwise, with a CLI target, the logon overlay asks for them first.
+    let initial_creds: Option<LogonCredentials> = if NEEDS_EXPLICIT_LOGON {
+        LogonCredentials::from_env().ok()
+    } else {
+        None
+    };
+    let login_first =
+        NEEDS_EXPLICIT_LOGON && cli_target.is_some() && !cli.demo && initial_creds.is_none();
+    let no_initial_session = cli.demo || cli_target.is_none() || login_first;
     let (running, input_tx, done_rx) = if no_initial_session {
         if cli.demo {
             demo_frame(&shared);
@@ -624,6 +662,7 @@ fn main() -> anyhow::Result<()> {
             file_offer.clone(),
             monitors.clone(),
             cliprdr_req_counter.clone(),
+            initial_creds.clone(),
         )
     };
 
@@ -684,6 +723,16 @@ fn main() -> anyhow::Result<()> {
             None
         },
         type_prompt: None,
+        login_prompt: if login_first {
+            Some(login_prompt::LoginPromptOverlay::new(
+                target.clone(),
+                initial_login_user(),
+                None,
+            ))
+        } else {
+            None
+        },
+        creds: initial_creds,
         cliprdr_req_counter,
         paste_pending: None,
     };
@@ -754,6 +803,7 @@ fn spawn_session(
     file_offer: Arc<Mutex<Option<std::path::PathBuf>>>,
     monitors: Vec<rdp::Monitor>,
     cliprdr_req_counter: Arc<std::sync::atomic::AtomicU64>,
+    creds: Option<LogonCredentials>,
 ) -> (Arc<AtomicBool>, InputSender, std::sync::mpsc::Receiver<()>) {
     let running = Arc::new(AtomicBool::new(true));
     let (input_tx, input_rx) = tokio::sync::mpsc::channel::<Vec<FastPathInputEvent>>(256);
@@ -773,7 +823,9 @@ fn spawn_session(
             // (detected via TCP keepalive) ends the session; rather than freezing
             // the window, reconnect and resume — the status overlay shows progress.
             let mut input_rx = input_rx;
+            let mut backoff = RECONNECT_MIN;
             while running_thread.load(Ordering::Relaxed) {
+                let started = std::time::Instant::now();
                 match run_session(
                     &target,
                     w,
@@ -786,16 +838,32 @@ fn spawn_session(
                     file_offer.clone(),
                     &monitors,
                     cliprdr_req_counter.clone(),
+                    creds.as_ref(),
                 )
                 .await
                 {
                     Ok(()) => info!("session ended"),
-                    Err(e) => warn!(error = %e, "session error"),
+                    Err(e) => {
+                        warn!(error = %e, "session error");
+                        // A rejected explicit logon must NOT be retried: the
+                        // reconnect loop runs every second and would lock the
+                        // account within moments. Hand it back to the UI.
+                        if creds.is_some() && is_logon_failure(&e) {
+                            let _ = proxy.send_event(UserEvent::LoginFailed(e.to_string()));
+                            break;
+                        }
+                    }
                 }
                 if !running_thread.load(Ordering::Relaxed) {
                     break;
                 }
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                backoff = next_backoff(backoff, started.elapsed());
+                // Sleep in short slices so Disconnect / window close still
+                // ends the thread promptly during a long back-off.
+                let until = std::time::Instant::now() + backoff;
+                while running_thread.load(Ordering::Relaxed) && std::time::Instant::now() < until {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
             }
         });
         // run_session() ran session.disconnect() before returning, so by here the
@@ -803,6 +871,86 @@ fn spawn_session(
         let _ = done_tx.send(());
     });
     (running, input_tx, done_rx)
+}
+
+/// Integer UI scale for the toolbar and overlays: 2 on a Retina display, 1 on
+/// a standard one. Those are drawn at logical size and pixel-doubled, so they
+/// keep their designed size; the remote desktop itself stays at full physical
+/// resolution. `SCCM_RC_UI_SCALE` overrides it (1–4).
+fn ui_scale_of(w: &Window) -> u32 {
+    if let Some(v) = std::env::var("SCCM_RC_UI_SCALE").ok().and_then(|v| v.parse::<u32>().ok()) {
+        return v.clamp(1, 4);
+    }
+    (w.scale_factor().round() as u32).clamp(1, 4)
+}
+
+/// Nearest-neighbour upscale of a logical `lw × lh` buffer by `k` into a
+/// `pw × ph` physical buffer. Rows/columns past `lw*k` / `lh*k` (when the
+/// physical size is not a multiple of `k`) repeat the last logical pixel.
+fn upscale_into(src: &[u32], lw: u32, lh: u32, k: u32, dst: &mut [u32], pw: u32, ph: u32) {
+    if lw == 0 || lh == 0 {
+        return;
+    }
+    for py in 0..ph {
+        let ly = (py / k).min(lh - 1);
+        let srow = &src[(ly * lw) as usize..((ly + 1) * lw) as usize];
+        let drow = &mut dst[(py * pw) as usize..((py + 1) * pw) as usize];
+        for (px, d) in drow.iter_mut().enumerate() {
+            *d = srow[((px as u32) / k).min(lw - 1) as usize];
+        }
+    }
+}
+
+/// PS/2 set-1 `(scancode, extended)` to send to the remote for a physical key.
+///
+/// Windows: winit's hardware scancode already is set 1 (0xE000 = extended).
+/// Elsewhere winit reports native keycodes (Apple kVK_* on macOS), so the key
+/// is mapped by position via `keymap`. On macOS Cmd is sent as Ctrl, so
+/// Cmd+C / Cmd+V / Cmd+A do what a Mac user expects on the remote; set
+/// `SCCM_RC_CMD_AS_WIN=1` to send Cmd as the Windows key instead.
+fn remote_scancode(key: &PhysicalKey) -> Option<(u8, bool)> {
+    if cfg!(windows) {
+        let sc = key.to_scancode()?;
+        return Some(((sc & 0xFF) as u8, sc & 0xE000 == 0xE000 || sc > 0xFF));
+    }
+    let PhysicalKey::Code(code) = key else {
+        return None;
+    };
+    let code = *code;
+    if cfg!(target_os = "macos") {
+        let cmd_as_win = std::env::var("SCCM_RC_CMD_AS_WIN").is_ok_and(|v| v == "1");
+        if !cmd_as_win {
+            match code {
+                KeyCode::SuperLeft => return keymap::set1(KeyCode::ControlLeft),
+                KeyCode::SuperRight => return keymap::set1(KeyCode::ControlRight),
+                _ => {}
+            }
+        }
+    }
+    keymap::set1(code)
+}
+
+const RECONNECT_MIN: std::time::Duration = std::time::Duration::from_secs(1);
+const RECONNECT_MAX: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Delay before the next reconnect: reset to the minimum after a session that
+/// stayed up for a while, otherwise double (capped). Without this a dead
+/// target or tunnel got hammered once a second indefinitely.
+fn next_backoff(current: std::time::Duration, session_lasted: std::time::Duration) -> std::time::Duration {
+    if session_lasted >= RECONNECT_MAX {
+        RECONNECT_MIN
+    } else {
+        (current * 2).min(RECONNECT_MAX)
+    }
+}
+
+/// Errors that mean "these credentials (or this user) won't work here", as
+/// opposed to transient transport trouble worth retrying.
+fn is_logon_failure(e: &anyhow::Error) -> bool {
+    matches!(
+        e.downcast_ref::<sccm_rc_core::Error>(),
+        Some(sccm_rc_core::Error::LogonRejected(_)) | Some(sccm_rc_core::Error::Sspi(_))
+    )
 }
 
 async fn run_session(
@@ -817,6 +965,7 @@ async fn run_session(
     file_offer: Arc<Mutex<Option<std::path::PathBuf>>>,
     monitors: &[rdp::Monitor],
     cliprdr_req_counter: Arc<std::sync::atomic::AtomicU64>,
+    creds: Option<&LogonCredentials>,
 ) -> anyhow::Result<()> {
     shared.lock().unwrap().status = t!("status.connecting_to", target => target).to_string();
     let _ = proxy.send_event(UserEvent::Frame);
@@ -826,7 +975,7 @@ async fn run_session(
     // leak it past a host-switch. 20 s is far above a healthy sub-second connect.
     let mut session = match tokio::time::timeout(
         std::time::Duration::from_secs(20),
-        SccmSession::connect(target),
+        SccmSession::connect_with(target, creds),
     )
     .await
     {
@@ -999,6 +1148,12 @@ struct App {
     /// will be replayed as scancodes on the remote (used to enter
     /// credentials into a UAC prompt where cliprdr is blocked).
     type_prompt: Option<type_text::TypeTextOverlay>,
+    /// Logon overlay (non-Windows): Some = collecting DOMAIN\user + password
+    /// for the chosen host; no session is running yet.
+    login_prompt: Option<login_prompt::LoginPromptOverlay>,
+    /// Explicit logon credentials for the current host (non-Windows), held in
+    /// memory only and reused by the auto-reconnect loop.
+    creds: Option<LogonCredentials>,
     /// Shared with the session thread's CliprdrChannel: bumped on every
     /// inbound FormatDataRequest. Zero-cost sampling from the UI thread.
     cliprdr_req_counter: Arc<std::sync::atomic::AtomicU64>,
@@ -1074,6 +1229,11 @@ impl App {
 
     /// Signal the session thread to stop and disconnect gracefully: clear
     /// `running` and drop the input sender (unblocks run_active_session).
+    /// Toolbar height in physical pixels (logical height × UI scale).
+    fn bar_h_phys(&self) -> u32 {
+        toolbar::TOOLBAR_H * self.window.as_deref().map(ui_scale_of).unwrap_or(1)
+    }
+
     fn begin_shutdown(&mut self) {
         self.running.store(false, Ordering::Relaxed);
         self.input_tx = None;
@@ -1095,6 +1255,8 @@ impl App {
             *f = SharedFrame::default();
         }
         self.host_prompt = Some(host_prompt::HostPromptOverlay::new());
+        self.login_prompt = None;
+        self.creds = None; // a new host asks for the password again
         self.closed = None;
         if let Some(w) = &self.window {
             w.request_redraw();
@@ -1129,6 +1291,7 @@ impl App {
             self.file_offer.clone(),
             self.monitors.clone(),
             self.cliprdr_req_counter.clone(),
+            self.creds.clone(),
         );
         self.running = running;
         #[cfg(windows)]
@@ -1244,7 +1407,7 @@ impl App {
             .unwrap_or((1, 1));
         // The desktop occupies the window below the toolbar strip and shows only
         // the crop sub-rect, so window space maps into [cx, cx+cw) × [cy, cy+ch).
-        let bar = toolbar::TOOLBAR_H as f64;
+        let bar = self.bar_h_phys() as f64;
         let usable_h = (win_h as f64 - bar).max(1.0);
         let yy = (y - bar).max(0.0);
         let dx = (cx as f64 + x * cw as f64 / win_w as f64).clamp(0.0, (fb_w - 1) as f64);
@@ -1402,9 +1565,38 @@ impl ApplicationHandler<UserEvent> for App {
         self.window = Some(window);
     }
 
+    /// Process is about to end — on macOS this is also Cmd+Q / "Quit" from the
+    /// app menu, which terminates without a CloseRequested. Run the same
+    /// graceful teardown so the SCCM host is released (no stale session).
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        if self.running.load(Ordering::Relaxed) || self.input_tx.is_some() {
+            self.begin_shutdown();
+            let _ = self.done_rx.recv_timeout(std::time::Duration::from_secs(3));
+        }
+    }
+
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::Frame => {
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
+            UserEvent::LoginFailed(reason) => {
+                warn!(%reason, "logon failed; not retrying");
+                // The session thread already stopped; make sure nothing restarts it.
+                self.begin_shutdown();
+                self.creds = None;
+                {
+                    let mut f = self.shared.lock().unwrap();
+                    *f = SharedFrame::default();
+                }
+                let msg = t!("login.rejected", reason => reason).to_string();
+                self.login_prompt = Some(login_prompt::LoginPromptOverlay::new(
+                    self.host.clone(),
+                    initial_login_user(),
+                    Some(msg),
+                ));
                 if let Some(w) = &self.window {
                     w.request_redraw();
                 }
@@ -1460,13 +1652,46 @@ impl ApplicationHandler<UserEvent> for App {
         {
             match outcome {
                 host_prompt::PromptOutcome::Confirmed(target) => {
-                    self.start_session(target);
+                    if NEEDS_EXPLICIT_LOGON && self.creds.is_none() {
+                        self.host_prompt = None;
+                        self.login_prompt = Some(login_prompt::LoginPromptOverlay::new(
+                            target,
+                            initial_login_user(),
+                            None,
+                        ));
+                        if let Some(w) = &self.window {
+                            w.request_redraw();
+                        }
+                    } else {
+                        self.start_session(target);
+                    }
                 }
                 host_prompt::PromptOutcome::Cancelled => {
                     self.closed = Some(t!("status.disconnected").to_string());
                     event_loop.exit();
                     return;
                 }
+            }
+        }
+        // Drain any pending logon outcome (Enter → connect, Esc → host picker).
+        if let Some(outcome) = self
+            .login_prompt
+            .as_mut()
+            .and_then(|p| p.take_outcome())
+        {
+            self.login_prompt = None;
+            match outcome {
+                login_prompt::LoginOutcome::Confirmed { target, creds } => {
+                    recent::set_last_user(&creds.display_name());
+                    self.creds = Some(creds);
+                    self.start_session(target);
+                }
+                login_prompt::LoginOutcome::Cancelled => {
+                    self.host_prompt = Some(host_prompt::HostPromptOverlay::new());
+                }
+            }
+            if let Some(w) = &self.window {
+                w.request_redraw();
             }
         }
         // Ctrl+V → UAC fallback: if V has been released AND at least
@@ -1514,7 +1739,7 @@ impl ApplicationHandler<UserEvent> for App {
         // While either overlay is up, tick the caret blink by scheduling a
         // repaint every ~500ms. Cheaper than the general connect-spinner
         // branch below (60ms) and gives the caret a proper on/off cadence.
-        if self.host_prompt.is_some() || self.type_prompt.is_some() {
+        if self.host_prompt.is_some() || self.type_prompt.is_some() || self.login_prompt.is_some() {
             if let Some(w) = &self.window {
                 w.request_redraw();
             }
@@ -1581,18 +1806,23 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     return;
                 }
+                // Logon overlay: the pointer only focuses fields on click.
+                if self.login_prompt.is_some() {
+                    return;
+                }
                 // Host-prompt overlay owns the pointer while it's up: hover
                 // moves the recents-selection, and nothing goes to the remote.
                 if let Some(prompt) = self.host_prompt.as_mut() {
-                    let (w_w, w_h) = self
+                    let (w_w, w_h, k) = self
                         .window
                         .as_ref()
                         .map(|w| {
                             let s = w.inner_size();
-                            (s.width, s.height)
+                            let k = ui_scale_of(w);
+                            (s.width / k, s.height / k, k as f64)
                         })
-                        .unwrap_or((1, 1));
-                    prompt.on_mouse_move(position.x, position.y, w_w, w_h);
+                        .unwrap_or((1, 1, 1.0));
+                    prompt.on_mouse_move(position.x / k, position.y / k, w_w, w_h);
                     if let Some(w) = &self.window {
                         w.set_cursor_visible(true);
                         w.request_redraw();
@@ -1601,7 +1831,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 // Over the toolbar: keep the OS cursor for clicking buttons and
                 // don't forward the move to the remote.
-                if position.y < toolbar::TOOLBAR_H as f64 {
+                if position.y < self.bar_h_phys() as f64 {
                     if let Some(w) = &self.window {
                         w.set_cursor_visible(true);
                         w.request_redraw();
@@ -1656,15 +1886,35 @@ impl ApplicationHandler<UserEvent> for App {
                 // Type-text overlay: left-click on Send/Cancel confirms/dismisses.
                 if let Some(prompt) = self.type_prompt.as_mut() {
                     if state == ElementState::Pressed && button == MouseButton::Left {
-                        let (w_w, w_h) = self
+                        let (w_w, w_h, k) = self
                             .window
                             .as_ref()
                             .map(|w| {
                                 let s = w.inner_size();
-                                (s.width, s.height)
+                                let k = ui_scale_of(w);
+                                (s.width / k, s.height / k, k as f64)
                             })
-                            .unwrap_or((1, 1));
-                        prompt.on_click(self.mouse_win.0, self.mouse_win.1, w_w, w_h);
+                            .unwrap_or((1, 1, 1.0));
+                        prompt.on_click(self.mouse_win.0 / k, self.mouse_win.1 / k, w_w, w_h);
+                        if let Some(w) = &self.window {
+                            w.request_redraw();
+                        }
+                    }
+                    return;
+                }
+                // Logon overlay: left-click focuses the user / password field.
+                if let Some(prompt) = self.login_prompt.as_mut() {
+                    if state == ElementState::Pressed && button == MouseButton::Left {
+                        let (w_w, w_h, k) = self
+                            .window
+                            .as_ref()
+                            .map(|w| {
+                                let s = w.inner_size();
+                                let k = ui_scale_of(w);
+                                (s.width / k, s.height / k, k as f64)
+                            })
+                            .unwrap_or((1, 1, 1.0));
+                        prompt.on_click(self.mouse_win.0 / k, self.mouse_win.1 / k, w_w, w_h);
                         if let Some(w) = &self.window {
                             w.request_redraw();
                         }
@@ -1674,15 +1924,16 @@ impl ApplicationHandler<UserEvent> for App {
                 // Host-prompt overlay: left-click on a recent row confirms it.
                 if let Some(prompt) = self.host_prompt.as_mut() {
                     if state == ElementState::Pressed && button == MouseButton::Left {
-                        let (w_w, w_h) = self
+                        let (w_w, w_h, k) = self
                             .window
                             .as_ref()
                             .map(|w| {
                                 let s = w.inner_size();
-                                (s.width, s.height)
+                                let k = ui_scale_of(w);
+                                (s.width / k, s.height / k, k as f64)
                             })
-                            .unwrap_or((1, 1));
-                        prompt.on_click(self.mouse_win.0, self.mouse_win.1, w_w, w_h);
+                            .unwrap_or((1, 1, 1.0));
+                        prompt.on_click(self.mouse_win.0 / k, self.mouse_win.1 / k, w_w, w_h);
                         if let Some(w) = &self.window {
                             w.request_redraw();
                         }
@@ -1690,18 +1941,18 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
                 // Clicks on the toolbar strip are handled locally, not forwarded.
-                if self.mouse_win.1 < toolbar::TOOLBAR_H as f64 {
+                if self.mouse_win.1 < self.bar_h_phys() as f64 {
                     if state == ElementState::Pressed && button == MouseButton::Left {
-                        let win_w = self
+                        let (win_w, k) = self
                             .window
                             .as_ref()
-                            .map(|w| w.inner_size().width.max(1))
-                            .unwrap_or(1);
+                            .map(|w| (w.inner_size().width.max(1), ui_scale_of(w)))
+                            .unwrap_or((1, 1));
                         let monitor = self.monitor_label();
                         if let Some(action) = toolbar::hit_test(
-                            self.mouse_win.0,
-                            self.mouse_win.1,
-                            win_w,
+                            self.mouse_win.0 / k as f64,
+                            self.mouse_win.1 / k as f64,
+                            (win_w / k).max(1),
                             self.font.as_ref(),
                             monitor.as_deref(),
                         ) {
@@ -1845,6 +2096,46 @@ impl ApplicationHandler<UserEvent> for App {
                             | PhysicalKey::Code(KeyCode::NumpadEnter) => prompt.on_enter(),
                             PhysicalKey::Code(KeyCode::Backspace)
                             | PhysicalKey::Code(KeyCode::Delete) => prompt.on_backspace(),
+                            _ => {
+                                if let Some(text) = event.text.as_deref() {
+                                    if !text.is_empty() {
+                                        prompt.on_text(text);
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(w) = &self.window {
+                            w.request_redraw();
+                        }
+                    }
+                    return;
+                }
+                // Logon overlay owns all keyboard input while it's up.
+                if let Some(prompt) = self.login_prompt.as_mut() {
+                    if event.state == ElementState::Pressed {
+                        let m = self.modifiers;
+                        match event.physical_key {
+                            PhysicalKey::Code(KeyCode::KeyV) | PhysicalKey::Code(KeyCode::Insert)
+                                if edit_mod(m) =>
+                            {
+                                if let Some(clip) = read_clipboard_text() {
+                                    prompt.on_text(&clip);
+                                }
+                            }
+                            PhysicalKey::Code(KeyCode::KeyA) | PhysicalKey::Code(KeyCode::Delete)
+                                if edit_mod(m) =>
+                            {
+                                prompt.on_clear()
+                            }
+                            PhysicalKey::Code(KeyCode::Escape) => prompt.on_esc(),
+                            PhysicalKey::Code(KeyCode::Tab)
+                            | PhysicalKey::Code(KeyCode::ArrowUp)
+                            | PhysicalKey::Code(KeyCode::ArrowDown) => prompt.on_tab(),
+                            PhysicalKey::Code(KeyCode::Enter)
+                            | PhysicalKey::Code(KeyCode::NumpadEnter) => prompt.on_enter(),
+                            PhysicalKey::Code(KeyCode::Backspace)
+                            | PhysicalKey::Code(KeyCode::Delete) => prompt.on_backspace(),
+                            _ if edit_mod(m) => {} // swallow other shortcuts (Cmd+Q is the OS's)
                             _ => {
                                 if let Some(text) = event.text.as_deref() {
                                     if !text.is_empty() {
@@ -2053,17 +2344,14 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     // Fall through — normal scancode forward still happens.
                 }
-                // winit gives us the OS hardware scancode, which on Windows is
-                // the PS/2 set-1 scancode RDP expects (0xE000 prefix = extended).
-                if let Some(sc) = event.physical_key.to_scancode() {
+                if let Some((code, extended)) = remote_scancode(&event.physical_key) {
                     let mut flags = KeyboardFlags::empty();
                     if event.state == ElementState::Released {
                         flags |= KeyboardFlags::RELEASE;
                     }
-                    if sc & 0xE000 == 0xE000 || sc > 0xFF {
+                    if extended {
                         flags |= KeyboardFlags::EXTENDED;
                     }
-                    let code = (sc & 0xFF) as u8;
                     self.send_input(FastPathInputEvent::KeyboardEvent(flags, code));
                 }
             }
@@ -2095,7 +2383,8 @@ impl App {
         };
         let size = window.inner_size();
         let (win_w, win_h) = (size.width.max(1), size.height.max(1));
-        let bar_h = toolbar::TOOLBAR_H.min(win_h);
+        let k = ui_scale_of(&window);
+        let bar_h = (toolbar::TOOLBAR_H * k).min(win_h);
         let mut frame = self.shared.lock().unwrap();
         let connected = frame.width != 0 && frame.height != 0 && !frame.rgba.is_empty();
         let (fb_w, fb_h) = (frame.width, frame.height);
@@ -2137,15 +2426,21 @@ impl App {
         // code: the toolbar strip when connected, else the full-window splash.
         let show_full_overlay = self.about_open
             || self.host_prompt.is_some()
+            || self.login_prompt.is_some()
             || self.type_prompt.is_some()
             || !connected;
-        let (ov_w, ov_h, dest) = if show_full_overlay {
-            (win_w, win_h, gpu::OverlayDest::Full)
+        // Overlay is drawn at logical size (`ov_w × ov_h`) and pixel-scaled to
+        // the physical target (`phys_w × phys_h`) before upload.
+        let (lw, lh) = ((win_w / k).max(1), (win_h / k).max(1));
+        let (ov_w, ov_h, phys_w, phys_h, dest) = if show_full_overlay {
+            (lw, lh, win_w, win_h, gpu::OverlayDest::Full)
         } else {
-            (win_w, bar_h, gpu::OverlayDest::TopStrip(bar_h))
+            (lw, toolbar::TOOLBAR_H.min(lh), win_w, bar_h, gpu::OverlayDest::TopStrip(bar_h))
         };
         let mut ov = vec![0u32; (ov_w * ov_h) as usize];
-        if let Some(prompt) = self.host_prompt.as_ref() {
+        if let Some(prompt) = self.login_prompt.as_ref() {
+            login_prompt::draw(&mut ov, ov_w, ov_h, self.font.as_ref(), prompt);
+        } else if let Some(prompt) = self.host_prompt.as_ref() {
             host_prompt::draw(&mut ov, ov_w, ov_h, self.font.as_ref(), prompt);
         } else if let Some(prompt) = self.type_prompt.as_ref() {
             type_text::draw(&mut ov, ov_w, ov_h, self.font.as_ref(), prompt);
@@ -2241,6 +2536,13 @@ impl App {
                 toolbar::draw_text_centered(&mut ov, ov_w, ov_h, cy + 8, &msg, 0x00B0_C0D0, 2);
             }
         }
+        let (ov, ov_w, ov_h) = if k == 1 {
+            (ov, ov_w, ov_h)
+        } else {
+            let mut phys = vec![0u32; (phys_w * phys_h) as usize];
+            upscale_into(&ov, ov_w, ov_h, k, &mut phys, phys_w, phys_h);
+            (phys, phys_w, phys_h)
+        };
         // Pack 0x00RRGGBB -> RGBA bytes (opaque).
         let mut ov_rgba = vec![0u8; (ov_w * ov_h * 4) as usize];
         for (i, &px) in ov.iter().enumerate() {
@@ -2259,7 +2561,7 @@ impl App {
                 && cur.draw
                 && !cur.rgba.is_empty()
                 && self.cursor_inside
-                && self.mouse_win.1 >= toolbar::TOOLBAR_H as f64;
+                && self.mouse_win.1 >= (toolbar::TOOLBAR_H * ui_scale_of(&window)) as f64;
             window.set_cursor_visible(!show);
             if show {
                 let dx = self.mouse_win.0 as i32 - cur.hotspot_x as i32;
@@ -2333,27 +2635,31 @@ impl App {
 
         // Host-prompt overlay owns the window while the user picks a target
         // — no desktop, no toolbar. Draw and present directly.
-        if let Some(prompt) = self.host_prompt.as_ref() {
-            host_prompt::draw(&mut buffer[..], win_w, win_h, self.font.as_ref(), prompt);
-            let _ = buffer.present();
-            return;
-        }
-        // Type-text overlay: same treatment — drawn on top, no session below.
-        if let Some(prompt) = self.type_prompt.as_ref() {
-            type_text::draw(&mut buffer[..], win_w, win_h, self.font.as_ref(), prompt);
-            let _ = buffer.present();
-            return;
-        }
-        // About overlay takes over the whole window (no desktop/toolbar), matching
-        // the GPU path. Drawn and presented directly, then we're done for this paint.
-        if self.about_open {
-            draw_about(&mut buffer[..], win_w, win_h, self.font.as_ref());
+        // Full-window overlays are drawn at logical size and pixel-scaled up.
+        let k = ui_scale_of(window);
+        let (lw, lh) = ((win_w / k).max(1), (win_h / k).max(1));
+        let full_overlay = self.login_prompt.is_some()
+            || self.host_prompt.is_some()
+            || self.type_prompt.is_some()
+            || self.about_open;
+        if full_overlay {
+            let mut lbuf = vec![0u32; (lw * lh) as usize];
+            if let Some(prompt) = self.login_prompt.as_ref() {
+                login_prompt::draw(&mut lbuf, lw, lh, self.font.as_ref(), prompt);
+            } else if let Some(prompt) = self.host_prompt.as_ref() {
+                host_prompt::draw(&mut lbuf, lw, lh, self.font.as_ref(), prompt);
+            } else if let Some(prompt) = self.type_prompt.as_ref() {
+                type_text::draw(&mut lbuf, lw, lh, self.font.as_ref(), prompt);
+            } else {
+                draw_about(&mut lbuf, lw, lh, self.font.as_ref());
+            }
+            upscale_into(&lbuf, lw, lh, k, &mut buffer[..], win_w, win_h);
             let _ = buffer.present();
             return;
         }
 
         // The remote desktop renders BELOW the toolbar strip (reserved at top).
-        let bar_h = toolbar::TOOLBAR_H.min(win_h);
+        let bar_h = (toolbar::TOOLBAR_H * k).min(win_h);
         let desk_h = win_h.saturating_sub(bar_h).max(1);
         let frame = self.shared.lock().unwrap();
         let frame_count = frame.frames;
@@ -2529,7 +2835,7 @@ impl App {
         let draw_remote = cur.draw
             && !cur.rgba.is_empty()
             && self.cursor_inside
-            && self.mouse_win.1 >= toolbar::TOOLBAR_H as f64;
+            && self.mouse_win.1 >= (toolbar::TOOLBAR_H * ui_scale_of(window)) as f64;
         window.set_cursor_visible(!draw_remote);
         if draw_remote {
             // The remote cursor arrives as a separate Pointer PDU (the host sends it
@@ -2615,7 +2921,15 @@ impl App {
             encrypted,
             monitor: monitor_label.as_deref(),
         };
-        toolbar::draw(&mut buffer[..], win_w, win_h, &status, self.font.as_ref());
+        if k == 1 {
+            toolbar::draw(&mut buffer[..], win_w, win_h, &status, self.font.as_ref());
+        } else {
+            let strip_h = toolbar::TOOLBAR_H.min(lh);
+            let mut lbuf = vec![0u32; (lw * strip_h) as usize];
+            toolbar::draw(&mut lbuf, lw, strip_h, &status, self.font.as_ref());
+            let rows = (bar_h as usize) * (win_w as usize);
+            upscale_into(&lbuf, lw, strip_h, k, &mut buffer[..rows], win_w, bar_h);
+        }
 
         // Viewer-side paint cost (scale + cursor + toolbar), excluding present.
         self.rprof_accum += rstart.elapsed();
@@ -2637,5 +2951,57 @@ impl App {
         }
 
         let _ = buffer.present();
+    }
+}
+
+#[cfg(test)]
+mod backoff_tests {
+    use super::{next_backoff, RECONNECT_MAX, RECONNECT_MIN};
+    use std::time::Duration;
+
+    #[test]
+    fn doubles_on_quick_failures_and_caps() {
+        let mut d = RECONNECT_MIN;
+        let mut seen = vec![];
+        for _ in 0..8 {
+            d = next_backoff(d, Duration::from_millis(5));
+            seen.push(d.as_secs());
+        }
+        assert_eq!(seen, vec![2, 4, 8, 16, 30, 30, 30, 30]);
+    }
+
+    #[test]
+    fn resets_after_a_long_session() {
+        assert_eq!(next_backoff(RECONNECT_MAX, Duration::from_secs(600)), RECONNECT_MIN);
+    }
+}
+
+#[cfg(test)]
+mod ui_scale_tests {
+    use super::upscale_into;
+
+    #[test]
+    fn doubles_each_pixel() {
+        let src = [1u32, 2, 3, 4]; // 2x2
+        let mut dst = vec![0u32; 16]; // 4x4
+        upscale_into(&src, 2, 2, 2, &mut dst, 4, 4);
+        assert_eq!(dst, vec![1, 1, 2, 2, 1, 1, 2, 2, 3, 3, 4, 4, 3, 3, 4, 4]);
+    }
+
+    #[test]
+    fn odd_physical_size_repeats_the_edge() {
+        let src = [1u32, 2]; // 2x1
+        let mut dst = vec![0u32; 5 * 3];
+        upscale_into(&src, 2, 1, 2, &mut dst, 5, 3);
+        assert_eq!(&dst[0..5], &[1, 1, 2, 2, 2]);
+        assert_eq!(&dst[10..15], &[1, 1, 2, 2, 2]);
+    }
+
+    #[test]
+    fn scale_one_is_identity() {
+        let src = [7u32, 8, 9];
+        let mut dst = vec![0u32; 3];
+        upscale_into(&src, 3, 1, 1, &mut dst, 3, 1);
+        assert_eq!(dst, src);
     }
 }

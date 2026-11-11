@@ -56,3 +56,14 @@ prompt:
   cancel: "Abbrechen"
   placeholder: "Hostnamen eingeben…"
   hint: "Enter oder Klick auf Eintrag = verbinden · Ctrl+V = einfügen · Esc = beenden"
+
+login:
+  title: "Anmelden bei %{target}"
+  user: "Benutzer (DOMÄNE\\benutzer):"
+  user_placeholder: "DOMÄNE\\benutzer"
+  password: "Passwort:"
+  need_user: "Benutzernamen eingeben."
+  need_password: "Passwort eingeben."
+  ntlm_note: "NTLM-Anmeldung: Die Identität des Servers kann nicht geprüft werden."
+  hint: "Tab = Feld wechseln · Enter = anmelden · Esc = zurück"
+  rejected: "Anmeldung abgelehnt: %{reason}"

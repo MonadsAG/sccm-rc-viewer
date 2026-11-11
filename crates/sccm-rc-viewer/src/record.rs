@@ -24,18 +24,11 @@ pub struct Recorder {
 impl Recorder {
     /// Begin a recording session. Returns None if the output dir can't be made.
     pub fn start() -> Option<Self> {
-        let base = std::env::var("USERPROFILE")
-            .ok()
-            .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir);
         let secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let dir = base
-            .join("Videos")
-            .join("sccm-rc-rec")
-            .join(format!("session-{secs}"));
+        let dir = crate::paths::recordings_dir().join(format!("session-{secs}"));
         std::fs::create_dir_all(&dir).ok()?;
 
         let (tx, rx) = mpsc::channel::<Frame>();

@@ -19,8 +19,14 @@
 #![warn(missing_debug_implementations)]
 
 pub mod cliprdr;
+pub mod credentials;
 pub mod error;
 pub mod framing;
+#[cfg(windows)]
+pub mod handshake;
+/// Non-Windows build: same `SspiSession` surface, implemented on `sspi` (sspi-rs).
+#[cfg(not(windows))]
+#[path = "handshake_portable.rs"]
 pub mod handshake;
 pub mod mppc;
 pub mod transport;

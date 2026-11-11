@@ -103,7 +103,36 @@ pub fn sccm_rdp_config(
 }
 
 fn whoami_user() -> String {
-    std::env::var("USERNAME").unwrap_or_else(|_| "user".to_string())
+    // `USERNAME` on Windows, `USER` on macOS/Linux.
+    std::env::var("USERNAME")
+        .or_else(|_| std::env::var("USER"))
+        .unwrap_or_else(|_| "user".to_string())
+}
+
+/// OS clipboard text access: `clipboard-win` on Windows, `arboard` elsewhere.
+/// (The CF_HDROP file path further down stays Windows-only.)
+mod os_clipboard {
+    #[cfg(windows)]
+    pub fn get_text() -> Option<String> {
+        clipboard_win::get_clipboard_string().ok()
+    }
+
+    #[cfg(windows)]
+    pub fn set_text(s: &str) -> Result<(), String> {
+        clipboard_win::set_clipboard_string(s).map_err(|e| e.to_string())
+    }
+
+    #[cfg(not(windows))]
+    pub fn get_text() -> Option<String> {
+        arboard::Clipboard::new().ok()?.get_text().ok()
+    }
+
+    #[cfg(not(windows))]
+    pub fn set_text(s: &str) -> Result<(), String> {
+        arboard::Clipboard::new()
+            .and_then(|mut c| c.set_text(s.to_string()))
+            .map_err(|e| e.to_string())
+    }
 }
 
 /// Re-exported so the viewer can build a monitor layout without taking a direct
@@ -602,9 +631,7 @@ impl CliprdrChannel {
     fn read_local() -> Option<String> {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let r = clipboard_win::get_clipboard_string()
-                .ok()
-                .filter(|s| !s.is_empty());
+            let r = os_clipboard::get_text().filter(|s| !s.is_empty());
             let _ = tx.send(r);
         });
         match rx.recv_timeout(CLIPBOARD_OP_TIMEOUT) {
@@ -621,7 +648,7 @@ impl CliprdrChannel {
         let (tx, rx) = std::sync::mpsc::channel();
         let payload = owned.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(clipboard_win::set_clipboard_string(&payload));
+            let _ = tx.send(os_clipboard::set_text(&payload));
         });
         match rx.recv_timeout(CLIPBOARD_OP_TIMEOUT) {
             Ok(Ok(())) => {

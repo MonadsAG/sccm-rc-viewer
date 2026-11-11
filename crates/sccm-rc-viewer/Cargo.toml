@@ -48,3 +48,7 @@ windows.workspace = true
 # Read the OS clipboard for paste-into-connect-field (same crate sccm-rc-core
 # uses for cliprdr). Windows-only, like the rest of the viewer's OS glue.
 clipboard-win = "5"
+
+# OS clipboard text (paste into the connect / logon fields) on non-Windows.
+[target.'cfg(not(windows))'.dependencies]
+arboard = { version = "3", default-features = false }

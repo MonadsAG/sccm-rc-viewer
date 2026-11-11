@@ -19,7 +19,15 @@ bytes.workspace = true
 byteorder.workspace = true
 socket2.workspace = true
 clap.workspace = true
+
+# Native SSPI on Windows (SSO via the current user's Kerberos/NTLM identity).
+[target.'cfg(windows)'.dependencies]
 windows.workspace = true
+
+# Pure-Rust Negotiate/NTLM everywhere else (explicit DOMAIN\user + password).
+# Same version the vendored ironrdp-connector already resolves.
+[target.'cfg(not(windows))'.dependencies]
+sspi = "0.18"
 
 [[bin]]
 name = "handshake-test"

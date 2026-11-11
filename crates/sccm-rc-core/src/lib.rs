@@ -9,11 +9,28 @@
 
 use sccm_rc_protocol::framing::{self, MSG_TYPE_CONTROL, MSG_TYPE_DATA};
 use sccm_rc_protocol::handshake::SspiSession;
+pub use sccm_rc_protocol::credentials::LogonCredentials;
 use sccm_rc_protocol::transport::RawConnection;
 pub use sccm_rc_protocol::{Error, Result};
 use tracing::{debug, info, warn};
 
 pub mod rdp;
+
+#[cfg(windows)]
+fn new_sspi_session(target: &str, creds: Option<&LogonCredentials>) -> Result<SspiSession> {
+    if let Some(c) = creds {
+        warn!(user = %c.display_name(), "explicit credentials are not supported on Windows yet; using single sign-on");
+    }
+    SspiSession::new_for_target(target)
+}
+
+#[cfg(not(windows))]
+fn new_sspi_session(target: &str, creds: Option<&LogonCredentials>) -> Result<SspiSession> {
+    match creds {
+        Some(c) => SspiSession::new_with_credentials(target, c),
+        None => SspiSession::new_for_target(target),
+    }
+}
 
 /// The access level the target granted for this session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,9 +63,21 @@ impl std::fmt::Debug for SccmSession {
 }
 
 impl SccmSession {
-    /// Connect, authenticate (SSO via current user), and read the access
-    /// grant. After this returns, RDP can flow via `send_rdp`/`recv_rdp`.
+    /// Connect, authenticate, and read the access grant. After this returns,
+    /// RDP can flow via `send_rdp`/`recv_rdp`.
+    ///
+    /// Windows: single sign-on with the current user. Elsewhere: explicit
+    /// NTLM credentials from `SCCM_USER` / `SCCM_PASS`. Use
+    /// [`connect_with`](Self::connect_with) to pass credentials directly.
     pub async fn connect(target: &str) -> Result<Self> {
+        Self::connect_with(target, None).await
+    }
+
+    /// Like [`connect`](Self::connect), with explicit logon credentials.
+    ///
+    /// On Windows, explicit credentials are not supported yet and the session
+    /// falls back to single sign-on (a warning is logged).
+    pub async fn connect_with(target: &str, creds: Option<&LogonCredentials>) -> Result<Self> {
         let mut conn = RawConnection::connect(target).await?;
         info!(%target, "TCP connected");
 
@@ -71,7 +100,7 @@ impl SccmSession {
         }
 
         // 2. SSPI Negotiate handshake
-        let mut sspi = SspiSession::new_for_target(target)?;
+        let mut sspi = new_sspi_session(target, creds)?;
         let mut peer: Vec<u8> = Vec::new();
         loop {
             let step = sspi.step(&peer)?;
@@ -87,7 +116,7 @@ impl SccmSession {
                 .ok_or_else(|| Error::Protocol("closed mid-handshake".into()))?;
             if f.msg_type == MSG_TYPE_CONTROL {
                 let s = framing::decode_control_string(&f.body).unwrap_or_default();
-                return Err(Error::Protocol(format!("server rejected handshake: {s}")));
+                return Err(Error::LogonRejected(s));
             }
             peer = framing::decode_handshake_body(&f.body)
                 .ok_or_else(|| Error::Protocol("malformed handshake token".into()))?
@@ -119,7 +148,7 @@ impl SccmSession {
         let grant = match grant_str.as_str() {
             "SUCCESS_FULL_CONTROL" => Grant::FullControl,
             "SUCCESS_VIEW_ONLY" => Grant::ViewOnly,
-            other => return Err(Error::Protocol(format!("access not granted: {other}"))),
+            other => return Err(Error::LogonRejected(other.to_string())),
         };
         info!(?grant, "remote control session granted");
 

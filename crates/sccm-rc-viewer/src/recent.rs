@@ -4,12 +4,7 @@
 const CAP: usize = 12;
 
 fn path() -> std::path::PathBuf {
-    let base = std::env::var("LOCALAPPDATA")
-        .ok()
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
-    let dir = base.join("sccm-rc");
-    let _ = std::fs::create_dir_all(&dir);
+    let dir = crate::paths::data_dir();
     dir.join("recent.txt")
 }
 
@@ -41,4 +36,22 @@ pub fn add(host: &str) {
     if std::fs::write(&tmp, list.join("\r\n").as_bytes()).is_ok() {
         let _ = std::fs::rename(&tmp, &p);
     }
+}
+
+fn last_user_path() -> std::path::PathBuf {
+    crate::paths::data_dir().join("last_user.txt")
+}
+
+/// The `DOMAIN\user` last used for an explicit (NTLM) logon. Never the password.
+#[cfg_attr(windows, allow(dead_code))]
+pub fn last_user() -> Option<String> {
+    std::fs::read_to_string(last_user_path())
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+#[cfg_attr(windows, allow(dead_code))]
+pub fn set_last_user(user: &str) {
+    let _ = std::fs::write(last_user_path(), user.trim());
 }

@@ -19,4 +19,7 @@ anyhow.workspace = true
 thiserror.workspace = true
 clap.workspace = true
 sccm-rc-protocol.workspace = true
+
+# Remote SCM / LSA / NetAPI checks are Win32 only.
+[target.'cfg(windows)'.dependencies]
 windows.workspace = true
