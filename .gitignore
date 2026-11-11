@@ -29,3 +29,6 @@ frida-frames.txt
 experiments/captures/*.txt
 # WLC desktop negotiation dumps — decrypted session content, never commit
 experiments/desktop-wlc-*.txt
+
+# macOS bundle output (packaging/macos/bundle.sh)
+/dist/

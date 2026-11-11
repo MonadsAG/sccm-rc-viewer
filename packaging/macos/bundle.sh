@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+# Build "SCCM RC.app" (and optionally a .dmg) from this workspace.
+#
+#   packaging/macos/bundle.sh [--universal] [--dmg]
+#
+#   --universal   build for Apple Silicon AND Intel and merge them with lipo
+#                 (default: the host architecture only)
+#   --dmg         also create dist/SCCM-RC-<version>-macos.dmg
+#
+# Signing (all optional, read from the environment):
+#   MACOS_SIGN_IDENTITY   "Developer ID Application: …" from the login/CI
+#                         keychain. Unset → ad-hoc signature (runs locally;
+#                         Gatekeeper blocks it after a download).
+#   MACOS_NOTARY_KEY      path to an App Store Connect API key (.p8)
+#   MACOS_NOTARY_KEY_ID   its key ID
+#   MACOS_NOTARY_ISSUER   its issuer ID
+#                         All three set (plus --dmg and a signing identity)
+#                         → the .dmg is notarized and the ticket stapled.
+#   MACOS_BUNDLE_ID       overrides the bundle identifier.
+set -euo pipefail
+
+UNIVERSAL=0
+DMG=0
+for arg in "$@"; do
+  case "$arg" in
+    --universal) UNIVERSAL=1 ;;
+    --dmg) DMG=1 ;;
+    -h|--help) sed -n '2,22p' "$0"; exit 0 ;;
+    *) echo "unknown option: $arg" >&2; exit 2 ;;
+  esac
+done
+
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+cd "$ROOT"
+
+APP_NAME="SCCM RC"
+BIN="sccm-rc-viewer"
+BUNDLE_ID="${MACOS_BUNDLE_ID:-io.github.conocidotech.sccm-rc-viewer}"
+PKGID="$(cargo pkgid -p sccm-rc-viewer)"
+VERSION="${PKGID##*[#@]}"
+DIST="$ROOT/dist"
+APP="$DIST/$APP_NAME.app"
+
+echo "==> $APP_NAME $VERSION ($BUNDLE_ID)"
+
+# --- build -------------------------------------------------------------------
+if [ "$UNIVERSAL" = 1 ]; then
+  TARGETS=(aarch64-apple-darwin x86_64-apple-darwin)
+  for t in "${TARGETS[@]}"; do
+    cargo build --release -p sccm-rc-viewer --target "$t"
+  done
+  BIN_PATHS=()
+  for t in "${TARGETS[@]}"; do BIN_PATHS+=("target/$t/release/$BIN"); done
+else
+  cargo build --release -p sccm-rc-viewer
+  BIN_PATHS=("target/release/$BIN")
+fi
+
+# --- assemble the bundle -----------------------------------------------------
+rm -rf "$APP"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+
+if [ "${#BIN_PATHS[@]}" -gt 1 ]; then
+  lipo -create -output "$APP/Contents/MacOS/$BIN" "${BIN_PATHS[@]}"
+else
+  cp "${BIN_PATHS[0]}" "$APP/Contents/MacOS/$BIN"
+fi
+
+sed -e "s/@VERSION@/$VERSION/g" -e "s/@BUNDLE_ID@/$BUNDLE_ID/g" \
+  packaging/macos/Info.plist > "$APP/Contents/Info.plist"
+plutil -lint "$APP/Contents/Info.plist" >/dev/null
+printf 'APPL????' > "$APP/Contents/PkgInfo"
+
+# Icon: build an .iconset from the 256 px PNG. Sizes above 256 px are left
+# out rather than upscaled; macOS scales the largest one it has.
+ICONSET="$(mktemp -d)/AppIcon.iconset"
+mkdir -p "$ICONSET"
+SRC_ICON="crates/sccm-rc-viewer/assets/icon.png"
+for spec in 16:icon_16x16 32:icon_16x16@2x 32:icon_32x32 64:icon_32x32@2x \
+            128:icon_128x128 256:icon_128x128@2x 256:icon_256x256; do
+  size="${spec%%:*}"; name="${spec#*:}"
+  sips -z "$size" "$size" "$SRC_ICON" --out "$ICONSET/$name.png" >/dev/null
+done
+iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
+rm -rf "$(dirname "$ICONSET")"
+
+# --- sign --------------------------------------------------------------------
+if [ -n "${MACOS_SIGN_IDENTITY:-}" ]; then
+  echo "==> signing with Developer ID (hardened runtime)"
+  codesign --force --timestamp --options runtime \
+    --sign "$MACOS_SIGN_IDENTITY" "$APP"
+else
+  echo "==> ad-hoc signing (no MACOS_SIGN_IDENTITY set)"
+  codesign --force --sign - "$APP"
+fi
+codesign --verify --strict --verbose=2 "$APP"
+
+# --- dmg + notarization ------------------------------------------------------
+if [ "$DMG" = 1 ]; then
+  ARCH_TAG=$([ "$UNIVERSAL" = 1 ] && echo universal || uname -m)
+  DMG_PATH="$DIST/SCCM-RC-$VERSION-macos-$ARCH_TAG.dmg"
+  STAGE="$(mktemp -d)"
+  cp -R "$APP" "$STAGE/"
+  ln -s /Applications "$STAGE/Applications"
+  rm -f "$DMG_PATH"
+  hdiutil create -volname "$APP_NAME $VERSION" -srcfolder "$STAGE" \
+    -fs HFS+ -format UDZO -ov "$DMG_PATH" >/dev/null
+  rm -rf "$STAGE"
+
+  if [ -n "${MACOS_SIGN_IDENTITY:-}" ]; then
+    codesign --force --timestamp --sign "$MACOS_SIGN_IDENTITY" "$DMG_PATH"
+    if [ -n "${MACOS_NOTARY_KEY:-}" ] && [ -n "${MACOS_NOTARY_KEY_ID:-}" ] \
+       && [ -n "${MACOS_NOTARY_ISSUER:-}" ]; then
+      echo "==> notarizing (this can take a few minutes)"
+      xcrun notarytool submit "$DMG_PATH" --key "$MACOS_NOTARY_KEY" \
+        --key-id "$MACOS_NOTARY_KEY_ID" --issuer "$MACOS_NOTARY_ISSUER" --wait
+      xcrun stapler staple "$DMG_PATH"
+    else
+      echo "==> not notarized (MACOS_NOTARY_* not set)"
+    fi
+  fi
+  echo "==> $DMG_PATH"
+fi
+
+echo "==> $APP"

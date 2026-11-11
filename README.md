@@ -10,7 +10,7 @@
   <a href="https://github.com/conocidotech/sccm-rc-viewer/actions/workflows/ci.yml"><img src="https://github.com/conocidotech/sccm-rc-viewer/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue" alt="License: MIT OR Apache-2.0">
   <img src="https://img.shields.io/badge/rust-1.96%2B-orange?logo=rust" alt="Rust 1.96+">
-  <img src="https://img.shields.io/badge/platform-Windows-0078D6?logo=windows" alt="Platform: Windows">
+  <img src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS-0078D6" alt="Platform: Windows | macOS">
   <a href="https://github.com/conocidotech/sccm-rc-viewer/releases/latest"><img src="https://img.shields.io/github/v/release/conocidotech/sccm-rc-viewer?label=release" alt="Latest release"></a>
 </p>
 
@@ -138,7 +138,38 @@ cargo run -p sccm-rc-diag -- TARGET-HOST --json
 ```
 
 CI (`.github/workflows/ci.yml`) builds and tests the workspace on `windows-latest`
-with the same gnu toolchain.
+with the same gnu toolchain, and on `macos-14` (see below).
+
+### macOS
+
+The viewer also runs on macOS (Apple Silicon and Intel). A Mac is normally not
+domain-joined, so there is no single sign-on: the viewer logs on with **NTLM**
+using `DOMAIN\user` and a password, entered in the viewer window. NTLM cannot
+verify the server's identity, so the toolbar shows an amber padlock
+("NTLM · encrypted") instead of the green Kerberos one. The target must accept
+NTLM for remote control.
+
+```sh
+# One-time setup: Rust via https://rustup.rs (Xcode Command Line Tools for the linker)
+cargo run --release -p sccm-rc-viewer -- TARGET-HOST   # asks for user + password
+
+# Build "SCCM RC.app" and a .dmg in dist/ (universal = Apple Silicon + Intel)
+packaging/macos/bundle.sh --universal --dmg
+```
+
+Keyboard: Cmd is sent to the remote as Ctrl (Cmd+C / Cmd+V work as expected);
+set `SCCM_RC_CMD_AS_WIN=1` to send it as the Windows key instead. Ctrl+Alt+End
+sends Ctrl+Alt+Del. Not available on macOS: copying *files* via the clipboard,
+and the Windows-only checks of `sccm-rc-diag` (it reports them as skipped).
+
+**Signing.** Apps you build yourself run without warnings. A downloaded `.dmg`
+that is not signed with an Apple Developer ID and notarized is blocked by
+Gatekeeper (macOS 15+: allow it once under *System Settings → Privacy &
+Security → Open Anyway*). `bundle.sh` signs and notarizes when
+`MACOS_SIGN_IDENTITY` and `MACOS_NOTARY_*` are set; `.github/workflows/release-macos.yml`
+does the same for tagged releases when the maintainers provide those secrets in
+the protected `release` environment. CI builds for pull requests are never
+signed.
 
 ## Vendored IronRDP
 

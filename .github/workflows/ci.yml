@@ -71,3 +71,35 @@ jobs:
       - name: Clippy (advisory)
         run: cargo clippy --workspace --all-targets
         continue-on-error: true
+
+  # macOS: build, test, and package an UNSIGNED universal .app/.dmg as a
+  # download. This job runs for pull requests from forks too, so it must never
+  # see signing secrets — signed releases live in release-macos.yml.
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust + both macOS targets
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          rustc -V
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --workspace
+
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Bundle (unsigned, universal)
+        run: packaging/macos/bundle.sh --universal --dmg
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sccm-rc-macos-unsigned
+          path: dist/*.dmg
+          if-no-files-found: error
