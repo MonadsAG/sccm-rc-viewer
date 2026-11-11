@@ -20,7 +20,7 @@ jobs:
   build-test:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # Match the local toolchain: x86_64-pc-windows-gnu + a recent MinGW-w64.
       # The `windows` crate's gnu target needs a working dlltool to generate
@@ -87,7 +87,7 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust
         run: |
