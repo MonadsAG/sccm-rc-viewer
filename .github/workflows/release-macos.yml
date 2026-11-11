@@ -17,6 +17,12 @@ name: Release (macOS)
 # Repository variable (optional): MACOS_BUNDLE_ID, for distributions that ship
 # under their own bundle identifier.
 #
+# Tags: v<crate version> (e.g. v0.9.13), or with a suffix for downstream
+# rebuilds of the same upstream version (e.g. v0.9.13-m1, v0.9.13-m2). The tag
+# must start with the version in Cargo.toml, otherwise the run fails. Tags
+# with a suffix are released as pre-releases. The release is created as a
+# draft; publish it by hand after checking the .dmg.
+#
 # This workflow never runs for pull requests, so code from forks cannot reach
 # the secrets.
 
@@ -27,6 +33,10 @@ on:
 
 permissions:
   contents: write # attach the .dmg to the release
+
+concurrency:
+  group: release-macos-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   macos:
@@ -43,6 +53,25 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
           rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Check the tag against the crate version
+        id: version
+        run: |
+          PKGID="$(cargo pkgid -p sccm-rc-viewer)"
+          VERSION="${PKGID##*[#@]}"
+          LABEL="$VERSION"
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            LABEL="${GITHUB_REF_NAME#v}"
+            case "$LABEL" in
+              "$VERSION"|"$VERSION"-*) ;;
+              *) echo "::error::tag $GITHUB_REF_NAME does not match crate version $VERSION"; exit 1 ;;
+            esac
+            case "$LABEL" in
+              *[!0-9A-Za-z.-]*) echo "::error::tag may only contain letters, digits, dots and dashes"; exit 1 ;;
+            esac
+          fi
+          echo "label=$LABEL" >> "$GITHUB_OUTPUT"
+          echo "Release label: $LABEL (crate version $VERSION)"
 
       - name: Import signing certificate into a temporary keychain
         if: env.HAS_CERT == 'true'
@@ -78,6 +107,7 @@ jobs:
           # Downstream distributions set their own (e.g. ch.example.sccm-rc-viewer).
           MACOS_BUNDLE_ID: ${{ vars.MACOS_BUNDLE_ID }}
           MACOS_BUILD_NUMBER: ${{ github.run_number }}
+          MACOS_DMG_LABEL: ${{ steps.version.outputs.label }}
           MACOS_SIGN_IDENTITY: ${{ env.HAS_CERT == 'true' && secrets.MACOS_SIGN_IDENTITY || '' }}
           MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
           MACOS_NOTARY_ISSUER: ${{ secrets.MACOS_NOTARY_ISSUER }}
@@ -94,8 +124,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          PRE=""
+          case "$GITHUB_REF_NAME" in *-*) PRE="--prerelease" ;; esac
           gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 \
-            || gh release create "$GITHUB_REF_NAME" --draft --title "$GITHUB_REF_NAME" --notes ""
+            || gh release create "$GITHUB_REF_NAME" --draft $PRE \
+                 --title "$GITHUB_REF_NAME" --generate-notes --verify-tag
           gh release upload "$GITHUB_REF_NAME" dist/*.dmg --clobber
 
       - name: Remove keychain and keys

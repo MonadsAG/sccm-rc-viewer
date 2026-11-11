@@ -169,7 +169,7 @@ Security → Open Anyway*). `bundle.sh` signs and notarizes when
 `MACOS_SIGN_IDENTITY` and `MACOS_NOTARY_*` are set; `.github/workflows/release-macos.yml`
 does the same for tagged releases when the maintainers provide those secrets in
 the protected `release` environment. CI builds for pull requests are never
-signed.
+signed. Tags, setup and checks: [`packaging/macos/RELEASING.md`](packaging/macos/RELEASING.md).
 
 ## Vendored IronRDP
 
