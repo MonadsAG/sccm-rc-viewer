@@ -146,7 +146,7 @@ cargo run -p sccm-rc-diag -- TARGET-HOST --json
 ```
 
 CI (`.github/workflows/ci.yml`) builds and tests the workspace on `windows-latest`
-with the same gnu toolchain, and on `macos-14` (see below).
+with the same gnu toolchain, and on `macos-26` (tests only; see below).
 
 ### macOS
 

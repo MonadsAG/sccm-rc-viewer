@@ -40,7 +40,8 @@ concurrency:
 
 jobs:
   macos:
-    runs-on: macos-14
+    runs-on: macos-26
+    timeout-minutes: 60
     environment: release
     env:
       HAS_CERT: ${{ secrets.MACOS_CERT_P12_BASE64 != '' }}

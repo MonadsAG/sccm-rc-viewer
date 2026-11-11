@@ -42,4 +42,7 @@ git push origin v0.9.13-m1
 3. Edit the generated notes and publish the draft.
 
 A dry run without a tag (Actions → Release (macOS) → Run workflow) builds
-the `.dmg` as a workflow artifact and creates no release.
+the `.dmg` as a workflow artifact and creates no release. macOS runner
+minutes count ten times, so build and check the `.dmg` locally first
+(`packaging/macos/bundle.sh --universal --dmg`) and use the workflow only for
+the actual release.
