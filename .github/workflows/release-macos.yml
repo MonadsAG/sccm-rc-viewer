@@ -47,7 +47,7 @@ jobs:
       HAS_CERT: ${{ secrets.MACOS_CERT_P12_BASE64 != '' }}
       HAS_NOTARY: ${{ secrets.MACOS_NOTARY_KEY_BASE64 != '' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust + both macOS targets
         run: |
@@ -114,7 +114,7 @@ jobs:
           MACOS_NOTARY_ISSUER: ${{ secrets.MACOS_NOTARY_ISSUER }}
         run: packaging/macos/bundle.sh --universal --dmg
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: sccm-rc-macos
           path: dist/*.dmg
