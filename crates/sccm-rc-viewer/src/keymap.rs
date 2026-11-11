@@ -7,6 +7,7 @@
 //! Layout handling (QWERTZ etc.) stays on the remote, exactly as with a real
 //! PC keyboard.
 
+use sccm_rc_core::rdp::SynchronizeFlags;
 use winit::keyboard::KeyCode;
 #[cfg(target_os = "macos")]
 use winit::keyboard::{NativeKeyCode, PhysicalKey};
@@ -43,11 +44,54 @@ mod mac_kbd {
     /// `kKeyboardISO` ('ISO ') from HIToolbox.
     const KEYBOARD_ISO: u32 = u32::from_be_bytes(*b"ISO ");
 
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGEventSourceFlagsState(state_id: i32) -> u64;
+    }
+
+    /// `kCGEventSourceStateCombinedSessionState`.
+    const COMBINED_SESSION_STATE: i32 = 0;
+    /// `kCGEventFlagMaskAlphaShift`: Caps Lock is on.
+    const FLAG_ALPHA_SHIFT: u64 = 0x0001_0000;
+
+    /// Whether Caps Lock is currently on for this login session.
+    pub fn caps_lock_on() -> bool {
+        // SAFETY: plain C getter; takes an integer, returns a bit mask.
+        unsafe { CGEventSourceFlagsState(COMBINED_SESSION_STATE) & FLAG_ALPHA_SHIFT != 0 }
+    }
+
     /// Physical layout of the keyboard that produced the last key event.
     /// Queried per event, so plugging in another keyboard just works.
     pub fn is_iso() -> bool {
         // SAFETY: plain C getters without arguments or pointers.
         unsafe { KBGetLayoutType(LMGetKbdType() as i16) == KEYBOARD_ISO }
+    }
+}
+
+/// Remote lock-key state for an RDP sync event: Caps Lock as given, Num Lock
+/// always on (a Mac numeric keypad always types digits), Scroll/Kana off.
+pub fn lock_flags(caps: bool) -> SynchronizeFlags {
+    let mut f = SynchronizeFlags::NUM_LOCK;
+    if caps {
+        f |= SynchronizeFlags::CAPS_LOCK;
+    }
+    f
+}
+
+/// The lock-key state to mirror onto the remote, or `None` where winit
+/// already forwards Caps Lock as a normal key (Windows, Linux).
+///
+/// macOS needs this because winit 0.30 never reports Caps Lock there: its
+/// `flagsChanged:` handler drops it and `ModifiersState` has no Caps bit. The
+/// viewer instead reads the state from macOS and sends an RDP sync event.
+pub fn local_lock_flags() -> Option<SynchronizeFlags> {
+    #[cfg(target_os = "macos")]
+    {
+        Some(lock_flags(mac_kbd::caps_lock_on()))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
     }
 }
 
@@ -208,6 +252,22 @@ mod tests {
             assert!(v == (0x29, false) || v == (0x56, false), "{v:?}");
         }
         assert_eq!(mac_iso_aware(&PhysicalKey::Code(KeyCode::KeyA)), None);
+    }
+
+    #[test]
+    fn lock_flags_mirror_caps_and_keep_num_lock_on() {
+        assert_eq!(lock_flags(true), SynchronizeFlags::CAPS_LOCK | SynchronizeFlags::NUM_LOCK);
+        assert_eq!(lock_flags(false), SynchronizeFlags::NUM_LOCK);
+        for caps in [true, false] {
+            let f = lock_flags(caps);
+            assert!(!f.contains(SynchronizeFlags::SCROLL_LOCK));
+            assert!(!f.contains(SynchronizeFlags::KANA_LOCK));
+        }
+    }
+
+    #[test]
+    fn local_lock_flags_only_on_macos() {
+        assert_eq!(local_lock_flags().is_some(), cfg!(target_os = "macos"));
     }
 
     #[test]

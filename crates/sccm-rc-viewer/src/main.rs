@@ -292,6 +292,9 @@ fn draw_spinner(
 #[derive(Debug, Clone)]
 enum UserEvent {
     Frame,
+    /// The RDP connection sequence finished (first connect or a reconnect):
+    /// time to mirror the local lock keys onto the remote session.
+    SessionActive,
     /// The target rejected the explicit logon (wrong password, user not a
     /// Permitted Viewer, …). The session thread has stopped retrying; the UI
     /// reopens the logon overlay with this message. Carries the `running`
@@ -751,6 +754,7 @@ fn main() -> anyhow::Result<()> {
         creds: initial_creds,
         cliprdr_req_counter,
         paste_pending: None,
+        locks_sent: None,
     };
     event_loop.run_app(&mut app)?;
     // Window closed: stop the session and close the input channel, which unblocks
@@ -1082,6 +1086,7 @@ async fn run_session(
         let (result, initial_buf, share_id) =
             rdp::connect_rdp(&mut session, w, h, monitors, cliprdr_req_counter.clone()).await?;
         info!("RDP active — streaming");
+        let _ = proxy.send_event(UserEvent::SessionActive);
         let mut sink = FrameSink {
             shared,
             cursor,
@@ -1216,6 +1221,9 @@ struct App {
     /// if the counter didn't tick we type the clipboard as scancodes —
     /// otherwise a normal cliprdr paste happened and we do nothing.
     paste_pending: Option<PastePending>,
+    /// Lock-key state last sent to the remote via an RDP sync event (macOS
+    /// only, see `keymap::local_lock_flags`). `None` = not synced yet.
+    locks_sent: Option<sccm_rc_core::rdp::SynchronizeFlags>,
 }
 
 struct PastePending {
@@ -1226,6 +1234,29 @@ struct PastePending {
 }
 
 impl App {
+    /// Mirror the local Caps Lock state onto the remote (Num Lock on) with an
+    /// RDP sync event. macOS only: winit never reports Caps Lock there. Sent
+    /// when the state differs from the last sync, or always when `force`.
+    fn sync_locks(&mut self, force: bool) {
+        if self.view_only || self.input_tx.is_none() {
+            return;
+        }
+        let Some(flags) = keymap::local_lock_flags() else {
+            return;
+        };
+        if !force && self.locks_sent == Some(flags) {
+            return;
+        }
+        self.send_input(FastPathInputEvent::SyncEvent(flags));
+        self.locks_sent = Some(flags);
+        tracing::debug!(
+            caps = flags.contains(sccm_rc_core::rdp::SynchronizeFlags::CAPS_LOCK),
+            num = flags.contains(sccm_rc_core::rdp::SynchronizeFlags::NUM_LOCK),
+            force,
+            "lock-key sync"
+        );
+    }
+
     fn send_input(&self, ev: FastPathInputEvent) {
         if self.view_only {
             return; // local view-only lock — don't control the remote
@@ -1340,6 +1371,7 @@ impl App {
     /// so the operator can pick another target. If the operator cancels the
     /// overlay (Esc) the app exits — matches the old prompt-cancelled path.
     fn switch_host(&mut self, _event_loop: &ActiveEventLoop) {
+        self.locks_sent = None;
         self.begin_shutdown();
         // Let the old session confirm teardown before we reconnect — otherwise
         // reconnecting (especially to the same host) trips "existing session".
@@ -1364,6 +1396,7 @@ impl App {
     /// `switch_host` so the initial-prompt path (main() with no CLI target)
     /// can also kick off a session from inside the event loop.
     fn start_session(&mut self, new_target: String) {
+        self.locks_sent = None;
         recent::add(&new_target);
         self.host = new_target.clone();
         self.title = format!("SCCM RC {} — {new_target}", env!("CARGO_PKG_VERSION"));
@@ -1679,6 +1712,9 @@ impl ApplicationHandler<UserEvent> for App {
                     w.request_redraw();
                 }
             }
+            UserEvent::SessionActive => {
+                self.sync_locks(true);
+            }
             UserEvent::LoginFailed(reason, session) => {
                 // Only the session the UI still runs may reopen the logon
                 // overlay. One the user already left (host switch, Disconnect)
@@ -1688,6 +1724,7 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
                 warn!(%reason, "logon failed; not retrying");
+                self.locks_sent = None;
                 // The session thread already stopped; make sure nothing restarts it.
                 self.begin_shutdown();
                 // Re-offer the user who just failed (the typo is usually in the
@@ -2105,6 +2142,9 @@ impl ApplicationHandler<UserEvent> for App {
                 #[cfg(not(windows))]
                 if !has_focus {
                     self.release_remote_modifiers();
+                } else {
+                    // Caps Lock may have been toggled in another app.
+                    self.sync_locks(true);
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
@@ -2417,6 +2457,11 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                     }
                     // Fall through — normal scancode forward still happens.
+                }
+                // Caps Lock toggles produce no event on macOS, so check the
+                // local state before each key press reaches the remote.
+                if event.state == ElementState::Pressed {
+                    self.sync_locks(false);
                 }
                 if let Some((code, extended)) = remote_scancode(&event.physical_key) {
                     let mut flags = KeyboardFlags::empty();

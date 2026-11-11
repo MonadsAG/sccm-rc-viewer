@@ -31,7 +31,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use tracing::{debug, info, warn};
 
 // Re-export the input event types so the UI can construct them.
-pub use ironrdp_pdu::input::fast_path::{FastPathInputEvent, KeyboardFlags};
+pub use ironrdp_pdu::input::fast_path::{FastPathInputEvent, KeyboardFlags, SynchronizeFlags};
 pub use ironrdp_pdu::input::mouse::PointerFlags;
 pub use ironrdp_pdu::input::MousePdu;
 
