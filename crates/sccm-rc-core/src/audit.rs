@@ -6,8 +6,7 @@
 use std::io::Write;
 use std::time::SystemTime;
 
-fn audit_path() -> std::path::PathBuf {
-    let dir = crate::paths::data_dir();
+fn audit_path_in(dir: &std::path::Path) -> std::path::PathBuf {
     dir.join("audit.jsonl")
 }
 
@@ -76,7 +75,32 @@ pub fn log_event(target: &str, grant: &str, event: &str, duration_s: Option<u64>
         esc(grant),
         dur
     );
-    let path = audit_path();
+    append_line(&crate::paths::data_dir(), &line);
+}
+
+/// Append an `"event":"agent"` line: an action taken through the script
+/// interface. Callers pass already-redacted text.
+pub fn log_agent(target: &str, action: &str) {
+    log_agent_to(&crate::paths::data_dir(), target, action);
+}
+
+pub(crate) fn log_agent_to(dir: &std::path::Path, target: &str, action: &str) {
+    let user = std::env::var("USERNAME").unwrap_or_default();
+    let from = std::env::var("COMPUTERNAME").unwrap_or_default();
+    let now = epoch_secs();
+    let line = format!(
+        "{{\"ts\":{now},\"time\":\"{}\",\"event\":\"agent\",\"target\":\"{}\",\"by\":\"{}\",\"from\":\"{}\",\"action\":\"{}\"}}\n",
+        utc_string(now),
+        esc(target),
+        esc(&user),
+        esc(&from),
+        esc(action)
+    );
+    append_line(dir, &line);
+}
+
+fn append_line(dir: &std::path::Path, line: &str) {
+    let path = audit_path_in(dir);
     rotate_if_large(&path);
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
@@ -84,5 +108,23 @@ pub fn log_event(target: &str, grant: &str, event: &str, duration_s: Option<u64>
         .open(&path)
     {
         let _ = f.write_all(line.as_bytes());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn log_agent_writes_action() {
+        let dir = std::env::temp_dir().join(format!("sccm-rc-audit-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        log_agent_to(&dir, "till-01", "click \"OK\"");
+        let text = std::fs::read_to_string(dir.join("audit.jsonl")).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(text.contains("\"event\":\"agent\""), "{text}");
+        assert!(text.contains("\"target\":\"till-01\""), "{text}");
+        assert!(text.contains("\"action\":\"click \\\"OK\\\"\""), "{text}");
     }
 }

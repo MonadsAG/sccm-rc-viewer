@@ -42,3 +42,7 @@ clipboard-win = "5"
 # Text-only OS clipboard on non-Windows hosts (no image support needed).
 [target.'cfg(not(windows))'.dependencies]
 arboard = { version = "3", default-features = false }
+
+# Login Keychain access (saved logon passwords) on macOS.
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3.7"

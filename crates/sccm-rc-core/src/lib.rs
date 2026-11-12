@@ -14,6 +14,9 @@ use sccm_rc_protocol::transport::RawConnection;
 pub use sccm_rc_protocol::{Error, Result};
 use tracing::{debug, info, warn};
 
+pub mod audit;
+pub mod keychain;
+pub mod paths;
 pub mod rdp;
 
 #[cfg(windows)]

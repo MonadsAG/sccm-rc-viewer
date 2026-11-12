@@ -24,10 +24,10 @@ use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::platform::scancode::PhysicalKeyExtScancode;
 use winit::window::{Window, WindowId};
 
-mod audit;
+use sccm_rc_core::{audit, keychain, paths};
+
 mod gpu;
 mod host_prompt;
-mod keychain;
 mod keymap;
 mod login_prompt;
 #[cfg(target_os = "macos")]
@@ -35,7 +35,6 @@ mod mac_ui;
 #[cfg(not(target_os = "macos"))]
 #[path = "mac_ui_stub.rs"]
 mod mac_ui;
-mod paths;
 mod recent;
 mod record;
 mod report;
