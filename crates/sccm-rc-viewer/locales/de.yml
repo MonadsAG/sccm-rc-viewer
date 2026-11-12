@@ -51,6 +51,8 @@ about:
   dismiss: "Klicken oder Esc drücken zum Schließen"
 
 prompt:
+  name_taken_native: "Name schon für %{host} vergeben. Nochmals «Speichern» ersetzt diesen Eintrag."
+  name_taken: "Name schon für %{host} vergeben. Nochmals Enter ersetzt diesen Eintrag."
   native_title: "Mit Computer verbinden"
   save_dots: "Speichern…"
   rename_dots: "Umbenennen…"

@@ -6,9 +6,10 @@
 //!
 //! Keyboard:
 //!   - printable char / Backspace → edit the field (filters the list)
-//!   - ↑ / ↓ → highlight a row (the field keeps what was typed)
-//!   - Enter → connect the highlighted row, else the typed text (a saved
-//!     name is resolved to its host)
+//!   - ↑ / ↓ → select a row (the field keeps what was typed)
+//!   - Enter → connect the selected row, else the typed text (a saved name
+//!     is resolved to its host). Mouse hover only highlights a row; it never
+//!     changes what Enter connects to.
 //!   - Cmd/Ctrl+S → save the highlighted row or the typed host under a name
 //!     (rename when it is saved already); Enter saves, Esc cancels
 //!   - Cmd/Ctrl+Backspace → delete the highlighted saved target (press twice);
@@ -67,8 +68,17 @@ pub struct HostPromptOverlay {
     servers: Vec<Server>,
     recents: Vec<String>,
     rows: Vec<Row>,
-    /// Index into `visible()`; None = the text field is active.
+    /// Index into `visible()`, chosen with the arrow keys or a click;
+    /// None = the text field is active.
     selected: Option<usize>,
+    /// Row under the mouse: highlighted and shows its links, but Enter
+    /// ignores it.
+    hover: Option<usize>,
+    /// Naming: the name the user was already warned about (taken by
+    /// another host); saving it again replaces that entry.
+    warned_name: Option<String>,
+    /// Naming: the "name is taken" warning shown instead of the hint.
+    notice: Option<String>,
     /// First visible row of `visible()`.
     scroll: usize,
     mode: Mode,
@@ -92,6 +102,9 @@ impl HostPromptOverlay {
             recents,
             rows: Vec::new(),
             selected: None,
+            hover: None,
+            warned_name: None,
+            notice: None,
             scroll: 0,
             mode: Mode::Normal,
             persist,
@@ -142,7 +155,12 @@ impl HostPromptOverlay {
     fn input_changed(&mut self) {
         if self.mode == Mode::Normal {
             self.selected = None;
+            self.hover = None;
             self.scroll = 0;
+        } else {
+            // A different name: warn again if that one is taken too.
+            self.warned_name = None;
+            self.notice = None;
         }
         self.bump_caret();
     }
@@ -264,6 +282,8 @@ impl HostPromptOverlay {
             .unwrap_or_default();
         self.parked_input = std::mem::replace(&mut self.input, current);
         self.mode = Mode::Naming { host };
+        self.warned_name = None;
+        self.notice = None;
         self.bump_caret();
     }
 
@@ -272,6 +292,17 @@ impl HostPromptOverlay {
         if name.is_empty() {
             return; // keep naming; Esc cancels
         }
+        // A name used by another host: warn first, replace on the second Enter.
+        if let Some(other) = servers::name_taken_by(&self.servers, &name, host) {
+            let key = name.to_lowercase();
+            if self.warned_name.as_deref() != Some(key.as_str()) {
+                self.warned_name = Some(key);
+                self.notice = Some(t!("prompt.name_taken", host => other).to_string());
+                return;
+            }
+        }
+        self.warned_name = None;
+        self.notice = None;
         if servers::upsert_in(&mut self.servers, &name, host) && self.persist {
             servers::upsert(&name, host);
         }
@@ -319,6 +350,7 @@ impl HostPromptOverlay {
             servers::remove(host);
         }
         self.mode = Mode::Normal;
+        self.hover = None;
         self.rebuild();
         // Keep the highlight on the same place, within the shorter list.
         let n = self.visible().len();
@@ -345,7 +377,14 @@ impl HostPromptOverlay {
             return; // naming: clicks on the list do nothing
         }
         let row = self.rows[self.visible()[vis_idx]].clone();
-        match action_at(&row, rect, x, y) {
+        // Links only count on the row that shows them (selected or hovered).
+        let links_shown = self.selected == Some(vis_idx) || self.hover == Some(vis_idx);
+        let action = if links_shown {
+            action_at(&row, rect, x, y)
+        } else {
+            None
+        };
+        match action {
             Some(Action::Save) => {
                 self.leave_confirm();
                 self.select(Some(vis_idx));
@@ -382,13 +421,7 @@ impl HostPromptOverlay {
             return;
         }
         let l = layout(win_w, win_h);
-        if let Some((idx, _)) = self.row_at(&l, x, y) {
-            if self.selected != Some(idx) {
-                self.selected = Some(idx);
-            }
-        } else if self.selected.is_some() && l.text_field.contains(x, y) {
-            self.select(None);
-        }
+        self.hover = self.row_at(&l, x, y).map(|(idx, _)| idx);
     }
 
     pub fn take_outcome(&mut self) -> Option<PromptOutcome> {
@@ -609,7 +642,7 @@ pub fn draw(
         let idx = overlay.scroll + slot;
         let r = l.rows[slot];
         let row = &overlay.rows[ri];
-        let highlighted = overlay.selected == Some(idx);
+        let highlighted = overlay.selected == Some(idx) || overlay.hover == Some(idx);
         let marked = matches!(&overlay.mode, Mode::ConfirmDelete { host } if host == row.host());
         if marked {
             fill_rect(buf, w, h, r.x, r.y, r.w, r.h, 0x005A_2A2E);
@@ -694,6 +727,9 @@ pub fn draw(
 
     // Hint.
     let hint = match &overlay.mode {
+        Mode::Naming { .. } if overlay.notice.is_some() => {
+            overlay.notice.clone().unwrap_or_default().into()
+        }
         Mode::Naming { .. } => t!("prompt.hint_naming"),
         Mode::ConfirmDelete { .. } => {
             t!("prompt.hint_confirm", cmd => mod_label(), del => del_label())
@@ -981,7 +1017,8 @@ mod tests {
         let r = l.rows[0];
         let (x, y) = ((r.x + 20) as f64, (r.y + 5) as f64);
         o.on_mouse_move(x, y, 800, 700);
-        assert_eq!(o.selected, Some(0));
+        assert_eq!(o.hover, Some(0));
+        assert_eq!(o.selected, None, "hover does not select");
         // Delete link twice.
         let (_, d) = action_rects(&o.rows[0], r)[1];
         let (dx, dy) = ((d.x + 5) as f64, (d.y + 5) as f64);
@@ -992,6 +1029,60 @@ mod tests {
         // Clicking the row body connects.
         o.on_click(x, y, 800, 700);
         assert!(confirmed(&mut o).is_some());
+    }
+
+    #[test]
+    fn hover_never_changes_what_enter_connects() {
+        let mut o = overlay();
+        let r = layout(800, 700).rows[0];
+        o.on_text("pc-new");
+        o.on_mouse_move((r.x + 20) as f64, (r.y + 5) as f64, 800, 700);
+        o.on_enter();
+        assert_eq!(confirmed(&mut o).as_deref(), Some("pc-new"));
+    }
+
+    #[test]
+    fn hidden_links_are_not_clickable() {
+        let mut o = overlay();
+        let r = layout(800, 700).rows[1];
+        let (_, d) = action_rects(&o.rows[1], r)[1];
+        // Mouse never hovered row 1: a click on its right end connects.
+        o.on_click((d.x + 5) as f64, (d.y + 5) as f64, 800, 700);
+        assert_eq!(confirmed(&mut o).as_deref(), Some("192.0.2.20"));
+        assert_eq!(o.servers.len(), 2);
+    }
+
+    #[test]
+    fn taken_name_warns_then_replaces() {
+        let mut o = overlay();
+        o.on_text("pc-new");
+        o.on_save();
+        o.on_text("lab");
+        o.on_enter();
+        assert!(
+            matches!(o.mode, Mode::Naming { .. }),
+            "first Enter only warns"
+        );
+        assert!(o.notice.is_some());
+        o.on_enter();
+        assert_eq!(o.mode, Mode::Normal);
+        assert!(o.servers.contains(&srv("lab", "pc-new")));
+        assert!(
+            !o.servers.iter().any(|s| s.host == "192.0.2.20"),
+            "old Lab replaced"
+        );
+
+        // Changing the name after the warning warns again for the new name.
+        let mut o = overlay();
+        o.on_text("pc-new");
+        o.on_save();
+        o.on_text("Lab");
+        o.on_enter();
+        o.on_backspace();
+        o.on_text("b");
+        assert!(o.notice.is_none());
+        o.on_enter();
+        assert!(matches!(o.mode, Mode::Naming { .. }));
     }
 
     #[test]

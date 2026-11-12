@@ -51,6 +51,8 @@ about:
   dismiss: "Click anywhere or press Esc to close"
 
 prompt:
+  name_taken_native: "Name already used for %{host}. Save again to replace that entry."
+  name_taken: "Name already used for %{host}. Enter again replaces that entry."
   native_title: "Connect to a computer"
   save_dots: "Save…"
   rename_dots: "Rename…"

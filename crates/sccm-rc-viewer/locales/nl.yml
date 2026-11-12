@@ -51,6 +51,8 @@ about:
   dismiss: "Klik ergens of druk op Esc om te sluiten"
 
 prompt:
+  name_taken_native: "Naam al gebruikt voor %{host}. Nogmaals Opslaan vervangt die vermelding."
+  name_taken: "Naam al gebruikt voor %{host}. Nogmaals Enter vervangt die vermelding."
   native_title: "Verbinden met computer"
   save_dots: "Opslaan…"
   rename_dots: "Hernoemen…"

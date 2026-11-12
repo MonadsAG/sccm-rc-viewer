@@ -250,7 +250,7 @@ impl Ctl {
             .find(|s| s.host.eq_ignore_ascii_case(&host))
             .map(|s| s.name.clone())
             .unwrap_or_default();
-        let (w, h) = (420.0, 150.0);
+        let (w, h) = (420.0, 186.0);
         let win = sheet::sheet_window(mtm, w, h);
         let view = win.contentView().expect("content view");
         let label = sheet::label(
@@ -261,6 +261,8 @@ impl Ctl {
         let field = sheet::text_field(mtm, rect(20.0, h - 74.0, w - 40.0, 24.0));
         sheet::set_text(&field, &current);
         field.setPlaceholderString(Some(&NSString::from_str(&t!("prompt.name_placeholder"))));
+        // "Name already used for …" warning; a second Save replaces.
+        let warning = sheet::error_label(mtm, rect(20.0, 54.0, w - 40.0, 34.0));
         let cancel = sheet::push_button(
             mtm,
             &t!("prompt.cancel"),
@@ -273,7 +275,7 @@ impl Ctl {
             rect(w - 130.0, 12.0, 110.0, 32.0),
             "\r",
         );
-        for v in [&*label as &NSView, &field, &cancel, &ok] {
+        for v in [&*label as &NSView, &field, &warning, &cancel, &ok] {
             sheet::add(&view, v);
         }
         let target = SheetTarget::new(mtm);
@@ -288,6 +290,7 @@ impl Ctl {
         );
         let me = Rc::downgrade(self);
         let f = field.clone();
+        let warned: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
         target.on_click(
             &ok,
             Box::new(move || {
@@ -295,6 +298,17 @@ impl Ctl {
                 let name = sheet::text_of(&f).trim().to_string();
                 if name.is_empty() {
                     return;
+                }
+                // A name used by another host: warn first, replace on the
+                // second Save (unless the name was changed in between).
+                let taken = servers::name_taken_by(&c.servers.borrow(), &name, &host);
+                if let Some(other) = taken {
+                    let key = name.to_lowercase();
+                    if warned.borrow().as_deref() != Some(key.as_str()) {
+                        *warned.borrow_mut() = Some(key);
+                        sheet::set_text(&warning, &t!("prompt.name_taken_native", host => other));
+                        return;
+                    }
                 }
                 if servers::upsert_in(&mut c.servers.borrow_mut(), &name, &host) {
                     servers::upsert(&name, &host);

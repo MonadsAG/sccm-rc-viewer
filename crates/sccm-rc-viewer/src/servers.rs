@@ -3,8 +3,10 @@
 //!
 //! Persisted next to `recent.txt` in the per-user data dir as `servers.txt`,
 //! one `name<TAB>host` per line. The user never edits it; the start screen
-//! adds, renames and removes entries. One entry per host (case-insensitive),
-//! so renaming is simply saving the same host under a new name.
+//! adds, renames and removes entries. One entry per host and one per name
+//! (both case-insensitive): renaming is saving the same host under a new
+//! name, and saving a name that is taken replaces that entry (the start
+//! screens ask first, see [`name_taken_by`]).
 
 const FILE: &str = "servers.txt";
 
@@ -147,14 +149,24 @@ pub(crate) fn serialize(list: &[Server]) -> String {
         .collect()
 }
 
-/// Insert or rename; keeps the list sorted by name. Returns false for an
-/// empty name/host (nothing changed).
+/// The host that already uses `name`, if it is not `host` itself. The start
+/// screens warn before saving over it.
+pub(crate) fn name_taken_by(list: &[Server], name: &str, host: &str) -> Option<String> {
+    let (name, host) = (clean(name), clean(host));
+    list.iter()
+        .find(|s| s.name.eq_ignore_ascii_case(&name) && !s.host.eq_ignore_ascii_case(&host))
+        .map(|s| s.host.clone())
+}
+
+/// Insert or rename; keeps the list sorted by name. An entry for the same
+/// host, or with the same name, is replaced. Returns false for an empty
+/// name/host (nothing changed).
 pub(crate) fn upsert_in(list: &mut Vec<Server>, name: &str, host: &str) -> bool {
     let (name, host) = (clean(name), clean(host));
     if name.is_empty() || host.is_empty() {
         return false;
     }
-    list.retain(|s| !s.host.eq_ignore_ascii_case(&host));
+    list.retain(|s| !s.host.eq_ignore_ascii_case(&host) && !s.name.eq_ignore_ascii_case(&name));
     list.push(Server { name, host });
     list.sort_by_key(|s| s.name.to_lowercase());
     true
@@ -202,6 +214,28 @@ mod tests {
         upsert_in(&mut list, "Till", "host-a");
         upsert_in(&mut list, "Till renamed", "HOST-A");
         assert_eq!(list, vec![srv("Till renamed", "HOST-A")]);
+    }
+
+    #[test]
+    fn names_are_unique_and_taken_names_are_reported() {
+        let mut list = vec![srv("Till", "host-a")];
+        assert_eq!(
+            name_taken_by(&list, " till ", "host-b").as_deref(),
+            Some("host-a")
+        );
+        assert_eq!(
+            name_taken_by(&list, "Till", "HOST-A"),
+            None,
+            "own entry is fine"
+        );
+        assert_eq!(name_taken_by(&list, "Other", "host-b"), None);
+        upsert_in(&mut list, "Till", "host-b");
+        assert_eq!(
+            list,
+            vec![srv("Till", "host-b")],
+            "replaced, not duplicated"
+        );
+        assert_eq!(resolve_in(&list, "till").as_deref(), Some("host-b"));
     }
 
     #[test]
