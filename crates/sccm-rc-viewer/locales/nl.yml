@@ -1,4 +1,7 @@
 status:
+  attaching_session: "Sessie koppelen…"
+  display_recovered: "Beeld hersteld — opnieuw verbinden…"
+  loading_desktop: "Bureaublad laden…"
   connecting_to: "Verbinden met %{target}…"
   connecting: "Verbinden…"
   existing_session: "Er is al een actieve sessie op %{target} (mogelijk je vorige sessie). Opnieuw proberen…"

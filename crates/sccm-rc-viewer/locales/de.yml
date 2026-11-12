@@ -1,4 +1,7 @@
 status:
+  attaching_session: "Sitzung wird verbunden…"
+  display_recovered: "Bild wiederhergestellt – verbinde neu…"
+  loading_desktop: "Desktop wird geladen…"
   connecting_to: "Verbinde mit %{target}…"
   connecting: "Verbinde…"
   existing_session: "Auf %{target} ist bereits eine Remotesteuerungssitzung aktiv (möglicherweise deine vorherige Sitzung). Erneuter Versuch…"

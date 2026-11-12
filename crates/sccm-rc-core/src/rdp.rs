@@ -1272,10 +1272,23 @@ pub trait SessionSink: Send {
     fn on_pointer(&mut self, _update: PointerUpdate) {}
     /// Called ~once per second with live session statistics. Default: ignore.
     fn on_stats(&mut self, _stats: SessionStats) {}
-    /// Connection-progress phase (shown until the first frame paints). Default: ignore.
-    fn on_status(&mut self, _status: &str) {}
+    /// Connection-progress phase (shown until the first frame paints). The
+    /// UI turns it into text in its own language. Default: ignore.
+    fn on_status(&mut self, _phase: StatusPhase) {}
     /// Called when the session ends.
     fn on_terminate(&mut self, reason: String);
+}
+
+/// Connection-progress phases reported through [`FrameSink::on_status`].
+/// The core stays language-neutral; the viewer localizes them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusPhase {
+    /// Attaching to the remote-control session (before the first frame).
+    AttachingSession,
+    /// The display was recovered after a desync; the session reconnects.
+    DisplayRecovered,
+    /// Waiting for the desktop image.
+    LoadingDesktop,
 }
 
 /// Run the active RDP session loop: read PDUs from the sealed channel, feed
@@ -1406,7 +1419,7 @@ pub async fn run_active_session(
     // "sessarb" channel so the server attaches the shadow. Event type is
     // configurable (SCCM_RC_ARB_EVENT, default 1) while we determine which one
     // the real client sends to initiate.
-    sink.on_status("Sessie koppelen...");
+    sink.on_status(StatusPhase::AttachingSession);
     // SCCM_RC_ARB_EVENT=0 → send nothing and just wait for the server's own
     // HostInUse/HostAllowed (the real CmRcViewer sends no initial event).
     if std::env::var("SCCM_RC_ARB").as_deref() == Ok("1")
@@ -1768,7 +1781,7 @@ pub async fn run_active_session(
                                     streak = order_fail_streak,
                                     "order stream desynced — forcing reconnect to reset decoder state"
                                 );
-                                sink.on_status("Beeld hersteld — opnieuw verbinden...");
+                                sink.on_status(StatusPhase::DisplayRecovered);
                                 return Err(Error::Protocol(
                                     "order stream desync — reconnecting to reset MPPC/order state"
                                         .into(),
@@ -1897,7 +1910,7 @@ pub async fn run_active_session(
                     order_fail_streak = 0;
                     order_ok_streak = 0;
                     stage = ActiveStage::new(new_result);
-                    sink.on_status("Bureaublad laden...");
+                    sink.on_status(StatusPhase::LoadingDesktop);
                     info!(
                         width,
                         height, share_id, "reactivation complete — active session resumed"

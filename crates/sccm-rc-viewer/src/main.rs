@@ -522,7 +522,12 @@ impl SessionSink for FrameSink {
         self.shared.lock().unwrap().bytes_per_sec = stats.bytes_per_sec;
         let _ = self.proxy.send_event(UserEvent::Frame);
     }
-    fn on_status(&mut self, status: &str) {
+    fn on_status(&mut self, phase: rdp::StatusPhase) {
+        let status = match phase {
+            rdp::StatusPhase::AttachingSession => t!("status.attaching_session"),
+            rdp::StatusPhase::DisplayRecovered => t!("status.display_recovered"),
+            rdp::StatusPhase::LoadingDesktop => t!("status.loading_desktop"),
+        };
         self.shared.lock().unwrap().status = status.to_string();
         let _ = self.proxy.send_event(UserEvent::Frame);
     }

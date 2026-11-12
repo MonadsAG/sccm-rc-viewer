@@ -1,4 +1,7 @@
 status:
+  attaching_session: "Attaching session…"
+  display_recovered: "Display recovered — reconnecting…"
+  loading_desktop: "Loading desktop…"
   connecting_to: "Connecting to %{target}…"
   connecting: "Connecting…"
   existing_session: "A remote-control session is already active on %{target} (possibly your previous session). Retrying…"
