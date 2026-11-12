@@ -382,6 +382,8 @@ pub(crate) enum NativeEvent {
     Action(ToolbarAction),
     /// The native logon sheet was confirmed or cancelled.
     Logon(login_prompt::LoginOutcome),
+    /// The native start sheet picked a target or asked to quit.
+    Start(host_prompt::PromptOutcome),
 }
 
 /// Shared framebuffer written by the RDP task, read by the renderer.
@@ -1446,9 +1448,48 @@ impl App {
                 self.creds = Some(creds);
                 self.start_session(target);
             }
-            login_prompt::LoginOutcome::Cancelled => {
-                self.host_prompt = Some(host_prompt::HostPromptOverlay::new());
+            login_prompt::LoginOutcome::Cancelled => self.open_start(),
+        }
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
+    }
+
+    /// A target picked (or quit) on the start screen, from the drawn overlay
+    /// or the native sheet. Returns false when the app is exiting.
+    fn on_host_outcome(
+        &mut self,
+        outcome: host_prompt::PromptOutcome,
+        event_loop: &ActiveEventLoop,
+    ) -> bool {
+        match outcome {
+            host_prompt::PromptOutcome::Confirmed(target) => {
+                self.host_prompt = None;
+                if NEEDS_EXPLICIT_LOGON && self.creds.is_none() {
+                    self.open_logon(target, initial_login_user(), None, true, None);
+                } else {
+                    self.start_session(target);
+                }
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+                true
             }
+            host_prompt::PromptOutcome::Cancelled => {
+                self.closed = Some(t!("status.disconnected").to_string());
+                event_loop.exit();
+                false
+            }
+        }
+    }
+
+    /// Show the start screen: the native sheet on macOS, else the overlay.
+    fn open_start(&mut self) {
+        if let Some(native) = self.native.as_ref() {
+            self.host_prompt = None;
+            native.show_start();
+        } else {
+            self.host_prompt = Some(host_prompt::HostPromptOverlay::new());
         }
         if let Some(w) = &self.window {
             w.request_redraw();
@@ -1596,7 +1637,7 @@ impl App {
             let mut f = self.shared.lock().unwrap();
             *f = SharedFrame::default();
         }
-        self.host_prompt = Some(host_prompt::HostPromptOverlay::new());
+        self.open_start();
         self.login_prompt = None;
         self.creds = None; // a new host asks for the password again
         self.keychain_save = false;
@@ -1900,11 +1941,14 @@ impl ApplicationHandler<UserEvent> for App {
         );
         if self.native.is_some() {
             info!("native macOS chrome active (menu bar + title-bar toolbar)");
-            // Started with a target: the logon overlay was set up before the
-            // window existed; show the native sheet instead.
+            // The first overlay was set up before the window existed; show
+            // the matching native sheet instead.
             if self.login_prompt.take().is_some() {
                 self.window = Some(window.clone());
                 self.open_logon(self.host.clone(), initial_login_user(), None, true, None);
+            } else if self.host_prompt.take().is_some() {
+                self.window = Some(window.clone());
+                self.open_start();
             }
         }
         let context = softbuffer::Context::new(window.clone()).expect("softbuffer context");
@@ -2002,6 +2046,12 @@ impl ApplicationHandler<UserEvent> for App {
                     w.request_redraw();
                 }
             }
+            UserEvent::Native(NativeEvent::Start(outcome)) => {
+                if let Some(native) = self.native.as_ref() {
+                    native.close_sheet();
+                }
+                self.on_host_outcome(outcome, event_loop);
+            }
             UserEvent::Native(NativeEvent::Logon(outcome)) => {
                 if let Some(native) = self.native.as_ref() {
                     native.close_sheet();
@@ -2065,23 +2115,8 @@ impl ApplicationHandler<UserEvent> for App {
             .as_mut()
             .and_then(|p| p.take_outcome())
         {
-            match outcome {
-                host_prompt::PromptOutcome::Confirmed(target) => {
-                    if NEEDS_EXPLICIT_LOGON && self.creds.is_none() {
-                        self.host_prompt = None;
-                        self.open_logon(target, initial_login_user(), None, true, None);
-                        if let Some(w) = &self.window {
-                            w.request_redraw();
-                        }
-                    } else {
-                        self.start_session(target);
-                    }
-                }
-                host_prompt::PromptOutcome::Cancelled => {
-                    self.closed = Some(t!("status.disconnected").to_string());
-                    event_loop.exit();
-                    return;
-                }
+            if !self.on_host_outcome(outcome, event_loop) {
+                return;
             }
         }
         // Drain any pending logon outcome (Enter → connect, Esc → host picker).

@@ -51,6 +51,11 @@ about:
   dismiss: "Klicken oder Esc drücken zum Schließen"
 
 prompt:
+  native_title: "Mit Computer verbinden"
+  save_dots: "Speichern…"
+  rename_dots: "Umbenennen…"
+  quit: "Beenden"
+  empty_native: "Noch keine Ziele. Oben Namen oder IP-Adresse eingeben."
   label: "Computername oder IP-Adresse:"
   connect: "Verbinden"
   cancel: "Abbrechen"

@@ -58,6 +58,6 @@ arboard = { version = "3", default-features = false }
 # NSApplication at startup. Same objc2 versions arboard already pulls in.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSImage", "NSResponder", "NSView", "NSWindow", "NSToolbar", "NSToolbarItem", "NSMenu", "NSMenuItem", "NSEvent", "NSControl", "NSCell", "NSUserInterfaceItemIdentification", "NSUserInterfaceValidation", "NSGraphics", "NSButton", "NSTextField", "NSSecureTextField", "NSFont", "NSColor", "NSText", "NSTextContent", "NSButtonCell", "NSActionCell", "NSTextFieldCell", "block2", "objc2-core-foundation"] }
-objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSData", "NSString", "NSArray", "NSObject", "NSGeometry", "NSNotification"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSImage", "NSResponder", "NSView", "NSWindow", "NSToolbar", "NSToolbarItem", "NSMenu", "NSMenuItem", "NSEvent", "NSControl", "NSCell", "NSUserInterfaceItemIdentification", "NSUserInterfaceValidation", "NSGraphics", "NSButton", "NSTextField", "NSSecureTextField", "NSFont", "NSColor", "NSText", "NSTextContent", "NSButtonCell", "NSActionCell", "NSTextFieldCell", "block2", "objc2-core-foundation", "NSTableView", "NSTableColumn", "NSScrollView", "NSSearchField", "NSClipView", "NSTextView", "NSSearchFieldCell", "NSTableHeaderView"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSData", "NSString", "NSArray", "NSObject", "NSGeometry", "NSNotification", "NSIndexSet"] }
 security-framework = "3.7"

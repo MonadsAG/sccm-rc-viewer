@@ -22,6 +22,7 @@ use std::rc::Rc;
 
 mod logon;
 mod sheet;
+mod start;
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, Sel};
@@ -333,8 +334,16 @@ pub struct NativeUi {
     edit_items: Vec<(Retained<NSMenuItem>, &'static str)>,
     last: RefCell<Option<Chrome>>,
     emit: Rc<dyn Fn(NativeEvent)>,
-    /// The open sheet (window + its target, which owns the closures).
-    sheet: RefCell<Option<(Retained<NSWindow>, Retained<sheet::SheetTarget>)>>,
+    /// The open sheet.
+    sheet: RefCell<Option<OpenSheet>>,
+}
+
+/// An open sheet: its window, plus whatever must live as long as it (the
+/// target owning the closures, the start sheet's controller).
+struct OpenSheet {
+    window: Retained<NSWindow>,
+    _target: Retained<sheet::SheetTarget>,
+    start: Option<Rc<start::Ctl>>,
 }
 
 impl NativeUi {
@@ -410,14 +419,42 @@ impl NativeUi {
         let s = logon::build(mtm, target, user, error, fill, remember, self.emit.clone());
         self.window.beginSheet_completionHandler(&s.window, None);
         s.window.makeFirstResponder(Some(&s.focus));
-        *self.sheet.borrow_mut() = Some((s.window, s.target));
+        *self.sheet.borrow_mut() = Some(OpenSheet {
+            window: s.window,
+            _target: s.target,
+            start: None,
+        });
+        self.edit_shortcuts(true);
+    }
+
+    /// Show the start sheet (saved and recent targets). The result arrives
+    /// as `NativeEvent::Start`; the App then calls [`close_sheet`](Self::close_sheet).
+    pub fn show_start(&self) {
+        self.close_sheet();
+        let Some(mtm) = MainThreadMarker::new() else {
+            return;
+        };
+        let s = start::build(mtm, self.emit.clone());
+        self.window.beginSheet_completionHandler(&s.window, None);
+        s.window.makeFirstResponder(Some(&s.focus));
+        *self.sheet.borrow_mut() = Some(OpenSheet {
+            window: s.window,
+            _target: s.target,
+            start: Some(s.ctl),
+        });
         self.edit_shortcuts(true);
     }
 
     pub fn close_sheet(&self) {
-        if let Some((w, _target)) = self.sheet.borrow_mut().take() {
-            self.window.endSheet(&w);
-            w.orderOut(None);
+        // Take it out first: endSheet may re-enter AppKit, which must not
+        // find the RefCell still borrowed.
+        let open = self.sheet.borrow_mut().take();
+        if let Some(open) = open {
+            if let Some(ctl) = &open.start {
+                ctl.close_subs();
+            }
+            self.window.endSheet(&open.window);
+            open.window.orderOut(None);
         }
         self.edit_shortcuts(false);
     }

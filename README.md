@@ -150,6 +150,8 @@ listing saved targets (by name) and recent ones; typing filters the list.
 Ctrl+S (Cmd+S on macOS) saves the highlighted or typed host under a name, or
 renames it; Ctrl+Del (Cmd+Delete) twice removes it. A saved name also works
 as the host argument. The list is personal, stored in the viewer's data folder.
+On macOS the start screen and the logon are native sheets (search field, list,
+Save…/Rename…/Delete buttons, double-click to connect).
 
 CI (`.github/workflows/ci.yml`) builds and tests the workspace on `windows-latest`
 with the same gnu toolchain, and on `macos-15` (tests only; see below).

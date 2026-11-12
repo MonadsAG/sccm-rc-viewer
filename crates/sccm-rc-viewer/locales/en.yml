@@ -51,6 +51,11 @@ about:
   dismiss: "Click anywhere or press Esc to close"
 
 prompt:
+  native_title: "Connect to a computer"
+  save_dots: "Save…"
+  rename_dots: "Rename…"
+  quit: "Quit"
+  empty_native: "No targets yet. Type a name or IP address above."
   label: "Computer name or IP address:"
   connect: "Connect"
   cancel: "Cancel"

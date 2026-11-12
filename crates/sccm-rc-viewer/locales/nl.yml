@@ -51,6 +51,11 @@ about:
   dismiss: "Klik ergens of druk op Esc om te sluiten"
 
 prompt:
+  native_title: "Verbinden met computer"
+  save_dots: "Opslaan…"
+  rename_dots: "Hernoemen…"
+  quit: "Stop"
+  empty_native: "Nog geen doelen. Typ hierboven een naam of IP-adres."
   label: "Computernaam of IP-adres:"
   connect: "Verbinden"
   cancel: "Annuleren"

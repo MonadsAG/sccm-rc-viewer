@@ -19,7 +19,7 @@
 //! buffer; the App polls `take_outcome()` in `about_to_wait`.
 
 use crate::recent;
-use crate::servers::{self, Server};
+use crate::servers::{self, Row, Server};
 use crate::text::TextRenderer;
 use crate::toolbar;
 use rust_i18n::t;
@@ -33,31 +33,10 @@ const CARD_H: u32 = 68 + FIELD_H + 18 + MAX_ROWS_SHOWN as u32 * ROW_H + 14 + 44;
 /// Width of one action link ("Rename", "Delete", "Save") at the row's right.
 const ACTION_W: u32 = 96;
 
+#[derive(Debug, Clone)]
 pub enum PromptOutcome {
     Confirmed(String),
     Cancelled,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum Row {
-    Saved { name: String, host: String },
-    Recent { host: String },
-}
-
-impl Row {
-    fn host(&self) -> &str {
-        match self {
-            Row::Saved { host, .. } | Row::Recent { host } => host,
-        }
-    }
-
-    fn matches(&self, q: &str) -> bool {
-        let hit = |s: &str| s.to_lowercase().contains(q);
-        match self {
-            Row::Saved { name, host } => hit(name) || hit(host),
-            Row::Recent { host } => hit(host),
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -125,37 +104,20 @@ impl HostPromptOverlay {
 
     /// Saved targets first, then recents that are not saved.
     fn rebuild(&mut self) {
-        let mut rows: Vec<Row> = self
-            .servers
-            .iter()
-            .map(|s| Row::Saved {
-                name: s.name.clone(),
-                host: s.host.clone(),
-            })
-            .collect();
-        for h in &self.recents {
-            if !self.servers.iter().any(|s| s.host.eq_ignore_ascii_case(h)) {
-                rows.push(Row::Recent { host: h.clone() });
-            }
-        }
-        self.rows = rows;
+        self.rows = servers::rows(&self.servers, &self.recents);
     }
 
     /// The filter text: what was typed in Normal mode.
-    fn filter(&self) -> String {
-        let text = match self.mode {
+    fn filter(&self) -> &str {
+        match self.mode {
             Mode::Naming { .. } => &self.parked_input,
             _ => &self.input,
-        };
-        text.trim().to_lowercase()
+        }
     }
 
     /// Indices into `rows` that match the filter.
     fn visible(&self) -> Vec<usize> {
-        let q = self.filter();
-        (0..self.rows.len())
-            .filter(|&i| q.is_empty() || self.rows[i].matches(&q))
-            .collect()
+        servers::filter(&self.rows, self.filter())
     }
 
     fn selected_row(&self) -> Option<&Row> {

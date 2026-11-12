@@ -9,11 +9,11 @@
 use std::cell::RefCell;
 
 use objc2::rc::Retained;
-use objc2::runtime::{AnyObject, ProtocolObject};
+use objc2::runtime::{AnyObject, ProtocolObject, Sel};
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSBackingStoreType, NSButton, NSColor, NSControlTextEditingDelegate, NSFont, NSTextField,
-    NSTextFieldDelegate, NSView, NSWindow, NSWindowStyleMask,
+    NSBackingStoreType, NSButton, NSColor, NSControl, NSControlTextEditingDelegate, NSFont,
+    NSTableView, NSTextField, NSTextFieldDelegate, NSTextView, NSView, NSWindow, NSWindowStyleMask,
 };
 use objc2_foundation::{
     NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
@@ -22,9 +22,13 @@ use objc2_foundation::{
 /// `(changed control, editing ended)`.
 type TextHandler = Box<dyn Fn(&AnyObject, bool)>;
 
+/// Editing command in a text field (e.g. "moveUp:"); true = handled.
+type CommandHandler = Box<dyn Fn(&str) -> bool>;
+
 pub struct SheetIvars {
     buttons: RefCell<Vec<Box<dyn Fn()>>>,
     on_text: RefCell<Option<TextHandler>>,
+    on_command: RefCell<Option<CommandHandler>>,
 }
 
 define_class!(
@@ -59,6 +63,14 @@ define_class!(
         fn text_did_end(&self, n: &NSNotification) {
             self.text_event(n, true);
         }
+
+        #[unsafe(method(control:textView:doCommandBySelector:))]
+        fn do_command(&self, _control: &NSControl, _tv: &NSTextView, cmd: Sel) -> bool {
+            match self.ivars().on_command.borrow().as_ref() {
+                Some(f) => f(cmd.name().to_str().unwrap_or("")),
+                None => false,
+            }
+        }
     }
 
     unsafe impl NSTextFieldDelegate for SheetTarget {}
@@ -69,6 +81,7 @@ impl SheetTarget {
         let this = Self::alloc(mtm).set_ivars(SheetIvars {
             buttons: RefCell::new(Vec::new()),
             on_text: RefCell::new(None),
+            on_command: RefCell::new(None),
         });
         // SAFETY: NSObject's init.
         unsafe { msg_send![super(this), init] }
@@ -94,6 +107,23 @@ impl SheetTarget {
             button.setTarget(Some(self));
             button.setAction(Some(sel!(fire:)));
         }
+    }
+
+    /// Double-click on a table row runs `f`.
+    pub fn on_double_click(&self, table: &NSTableView, f: Box<dyn Fn()>) {
+        let mut buttons = self.ivars().buttons.borrow_mut();
+        table.setTag(buttons.len() as isize);
+        buttons.push(f);
+        // SAFETY: the target outlives the table (the sheet keeps both).
+        unsafe {
+            table.setTarget(Some(self));
+            table.setDoubleAction(Some(sel!(fire:)));
+        }
+    }
+
+    /// Editing commands (arrow keys, …) in fields whose delegate is this target.
+    pub fn on_command(&self, f: CommandHandler) {
+        *self.ivars().on_command.borrow_mut() = Some(f);
     }
 
     /// Text edits of every field whose delegate is this target.

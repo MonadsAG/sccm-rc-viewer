@@ -58,6 +58,56 @@ pub fn display(host: &str) -> String {
     }
 }
 
+/// One entry of the start screen list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Row {
+    Saved { name: String, host: String },
+    Recent { host: String },
+}
+
+impl Row {
+    pub(crate) fn host(&self) -> &str {
+        match self {
+            Row::Saved { host, .. } | Row::Recent { host } => host,
+        }
+    }
+
+    /// `q` is lower-case.
+    fn matches(&self, q: &str) -> bool {
+        let hit = |s: &str| s.to_lowercase().contains(q);
+        match self {
+            Row::Saved { name, host } => hit(name) || hit(host),
+            Row::Recent { host } => hit(host),
+        }
+    }
+}
+
+/// The start screen list: saved targets (by name), then recents that are
+/// not saved.
+pub(crate) fn rows(saved: &[Server], recents: &[String]) -> Vec<Row> {
+    let mut rows: Vec<Row> = saved
+        .iter()
+        .map(|s| Row::Saved {
+            name: s.name.clone(),
+            host: s.host.clone(),
+        })
+        .collect();
+    for h in recents {
+        if !saved.iter().any(|s| s.host.eq_ignore_ascii_case(h)) {
+            rows.push(Row::Recent { host: h.clone() });
+        }
+    }
+    rows
+}
+
+/// Indices of `rows` matching `text` (name or host, case-insensitive).
+pub(crate) fn filter(rows: &[Row], text: &str) -> Vec<usize> {
+    let q = text.trim().to_lowercase();
+    (0..rows.len())
+        .filter(|&i| q.is_empty() || rows[i].matches(&q))
+        .collect()
+}
+
 /// Atomic write (temp file + rename), like `recent::add`.
 fn store(list: &[Server]) {
     let p = path();

@@ -37,6 +37,8 @@ impl NativeUi {
     ) {
     }
 
+    pub fn show_start(&self) {}
+
     pub fn close_sheet(&self) {}
 
     pub fn sheet_open(&self) -> bool {
