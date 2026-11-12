@@ -61,6 +61,10 @@ pub struct LoginPromptOverlay {
     /// Keychain lookup; `None` hides the checkbox.
     lookup: Option<keychain::Lookup>,
     remember: bool,
+    /// `remember` is the user's own choice (toggled, or carried over from a
+    /// rejected attempt). Otherwise it just mirrors "this account has a
+    /// saved password" and follows the user name.
+    remember_explicit: bool,
     /// `password` holds the saved password from the Keychain.
     from_keychain: bool,
     /// User name the Keychain was last asked about (asked once per name).
@@ -71,6 +75,14 @@ impl Drop for LoginPromptOverlay {
     fn drop(&mut self) {
         wipe(&mut self.password);
     }
+}
+
+/// Keychain account for the text in the user field: the same
+/// `DOMAIN\user` form the App saves under (`user@domain` is converted).
+fn account_key(user: &str) -> Option<String> {
+    LogonCredentials::parse(user, None, "")
+        .ok()
+        .map(|c| c.display_name())
 }
 
 fn wipe(s: &mut String) {
@@ -124,6 +136,7 @@ impl LoginPromptOverlay {
             caret_anchor: std::time::Instant::now(),
             lookup: None,
             remember: false,
+            remember_explicit: false,
             from_keychain: false,
             looked_up: String::new(),
         }
@@ -131,16 +144,25 @@ impl LoginPromptOverlay {
 
     /// Offer the "save password" checkbox, backed by `lookup`. With `fill`,
     /// a saved password for the pre-filled user is filled in right away
-    /// (off after a rejected logon, so the user types it again). `remember`
-    /// is the initial state of the checkbox.
-    pub fn with_keychain(mut self, lookup: keychain::Lookup, fill: bool, remember: bool) -> Self {
+    /// (off after a rejected logon, so the user types it again).
+    /// `remember`: the user's earlier choice, kept as is (after a rejected
+    /// logon); `None` lets the box follow whether a password is saved.
+    pub fn with_keychain(
+        mut self,
+        lookup: keychain::Lookup,
+        fill: bool,
+        remember: Option<bool>,
+    ) -> Self {
         self.lookup = Some(lookup);
-        self.remember = remember;
+        if let Some(r) = remember {
+            self.remember = r;
+            self.remember_explicit = true;
+        }
         if fill {
             self.fill_from_keychain();
         } else {
             // Don't ask again for this user until the name changes.
-            self.looked_up = self.user.trim().to_string();
+            self.looked_up = account_key(&self.user).unwrap_or_default();
         }
         self
     }
@@ -149,27 +171,51 @@ impl LoginPromptOverlay {
     /// field is empty and the Keychain was not asked about this name yet.
     fn fill_from_keychain(&mut self) {
         let Some(lookup) = self.lookup else { return };
-        let user = self.user.trim().to_string();
-        if user.is_empty() || !self.password.is_empty() || user == self.looked_up {
+        let Some(account) = account_key(&self.user) else {
+            return;
+        };
+        if !self.password.is_empty() || account == self.looked_up {
             return;
         }
-        self.looked_up = user;
+        self.looked_up = account;
         if let Some(mut saved) = lookup(&self.looked_up) {
+            // The field is empty here; make room first so pushing the saved
+            // password can't reallocate and leave a copy in freed memory.
+            if self.password.capacity() < saved.len() {
+                self.password = String::with_capacity(saved.len().max(PASSWORD_CAP));
+            }
             self.password.push_str(&saved);
             wipe(&mut saved);
             self.from_keychain = true;
-            self.remember = true;
+            if !self.remember_explicit {
+                self.remember = true;
+            }
         }
     }
 
     /// The user name changed: a filled-in password belongs to the old name,
-    /// and the new name is worth asking the Keychain about.
+    /// and the new name is worth asking the Keychain about. An automatic
+    /// tick (from the old name's saved password) goes with it.
     fn user_edited(&mut self) {
         self.looked_up.clear();
         if self.from_keychain {
             wipe(&mut self.password);
             self.from_keychain = false;
         }
+        if !self.remember_explicit {
+            self.remember = false;
+        }
+    }
+
+    fn toggle_remember(&mut self) {
+        self.remember = !self.remember;
+        self.remember_explicit = true;
+    }
+
+    /// Whether a held-down key may repeat: not on the checkbox, where every
+    /// repeat would toggle it again.
+    pub fn key_repeat_ok(&self) -> bool {
+        self.focus != Field::Save
     }
 
     /// The user starts editing a filled-in password: replace it, don't append.
@@ -203,7 +249,7 @@ impl LoginPromptOverlay {
             }
             Field::Save => {
                 if s == " " {
-                    self.remember = !self.remember;
+                    self.toggle_remember();
                 }
             }
         }
@@ -300,8 +346,11 @@ impl LoginPromptOverlay {
         } else if l.password.contains(x, y) {
             self.set_focus(Field::Password);
         } else if self.has_save() && l.save.contains(x, y) {
+            // Toggle what the user sees *before* moving focus: leaving the
+            // user field may fill in a saved password, and that must not
+            // flip the box under the click.
+            self.toggle_remember();
             self.set_focus(Field::Save);
-            self.remember = !self.remember;
         }
     }
 
@@ -578,7 +627,7 @@ mod tests {
     #[test]
     fn saved_password_is_filled_in_and_enter_logs_on() {
         let mut o = LoginPromptOverlay::new("h".into(), Some("CORP\\alice".into()), None)
-            .with_keychain(fake_store, true, false);
+            .with_keychain(fake_store, true, None);
         assert!(o.remember, "a saved password ticks the box");
         o.on_enter();
         let (_, c, remember, from_kc) = confirmed_full(&mut o).expect("confirmed");
@@ -589,7 +638,7 @@ mod tests {
     #[test]
     fn no_fill_after_rejection() {
         let mut o = LoginPromptOverlay::new("h".into(), Some("CORP\\alice".into()), None)
-            .with_keychain(fake_store, false, true);
+            .with_keychain(fake_store, false, Some(true));
         assert!(o.password.is_empty());
         assert!(o.remember, "box keeps the user's earlier choice");
         // Tabbing around must not fill it in behind the user's back either.
@@ -602,7 +651,7 @@ mod tests {
     #[test]
     fn typing_replaces_a_filled_in_password() {
         let mut o = LoginPromptOverlay::new("h".into(), Some("CORP\\alice".into()), None)
-            .with_keychain(fake_store, true, false);
+            .with_keychain(fake_store, true, None);
         o.on_text("new");
         o.on_enter();
         let (_, c, remember, from_kc) = confirmed_full(&mut o).unwrap();
@@ -613,7 +662,7 @@ mod tests {
     #[test]
     fn changing_the_user_drops_the_filled_in_password() {
         let mut o = LoginPromptOverlay::new("h".into(), Some("CORP\\alice".into()), None)
-            .with_keychain(fake_store, true, false);
+            .with_keychain(fake_store, true, None);
         o.on_tab(); // password -> save
         o.on_tab(); // save -> user
         o.on_backspace();
@@ -626,7 +675,7 @@ mod tests {
     #[test]
     fn user_typed_then_tab_fills_in() {
         let mut o =
-            LoginPromptOverlay::new("h".into(), None, None).with_keychain(fake_store, true, false);
+            LoginPromptOverlay::new("h".into(), None, None).with_keychain(fake_store, true, None);
         o.on_text("corp\\ALICE");
         o.on_enter();
         assert_eq!(o.password, "saved-pw");
@@ -636,7 +685,7 @@ mod tests {
     #[test]
     fn space_toggles_the_checkbox_and_backspace_clears_filled_password() {
         let mut o = LoginPromptOverlay::new("h".into(), Some("CORP\\bob".into()), None)
-            .with_keychain(fake_store, true, false);
+            .with_keychain(fake_store, true, None);
         assert!(!o.remember);
         o.on_text("pw");
         o.on_tab(); // -> save
@@ -649,12 +698,85 @@ mod tests {
         assert!(remember && !from_kc);
 
         let mut o = LoginPromptOverlay::new("h".into(), Some("CORP\\alice".into()), None)
-            .with_keychain(fake_store, true, false);
+            .with_keychain(fake_store, true, None);
         o.on_backspace();
         assert!(
             o.password.is_empty(),
             "one backspace clears the whole saved password"
         );
+    }
+
+    #[test]
+    fn clicking_the_box_from_the_user_field_ticks_it() {
+        // Review finding: leaving the user field filled in alice's password
+        // and auto-ticked the box, then the click unticked it again.
+        let mut o =
+            LoginPromptOverlay::new("h".into(), None, None).with_keychain(fake_store, true, None);
+        o.on_text("CORP\\alice");
+        let r = layout(800, 600, true).save;
+        o.on_click((r.x + 2) as f64, (r.y + 2) as f64, 800, 600);
+        assert_eq!(o.password, "saved-pw");
+        assert!(o.remember, "the click must leave the box ticked");
+        assert_eq!(o.focus, Field::Save);
+    }
+
+    #[test]
+    fn auto_tick_follows_the_user_but_an_explicit_choice_stays() {
+        let mut o = LoginPromptOverlay::new("h".into(), Some("CORP\\alice".into()), None)
+            .with_keychain(fake_store, true, None);
+        assert!(o.remember);
+        o.on_tab(); // -> save
+        o.on_tab(); // -> user
+        o.on_clear();
+        o.on_text("CORP\\bob");
+        assert!(!o.remember, "bob never opted in");
+        o.on_tab();
+        o.on_text("bobs-pw");
+        o.on_enter();
+        let (_, _, remember, _) = confirmed_full(&mut o).unwrap();
+        assert!(!remember);
+
+        // Explicitly unticked: a later fill-in must not tick it again.
+        let mut o =
+            LoginPromptOverlay::new("h".into(), None, None).with_keychain(fake_store, true, None);
+        o.on_tab(); // -> password
+        o.on_tab(); // -> save
+        o.on_text(" "); // tick
+        o.on_text(" "); // untick again
+        o.on_tab(); // -> user
+        o.on_text("CORP\\alice");
+        o.on_tab(); // fills in
+        assert_eq!(o.password, "saved-pw");
+        assert!(!o.remember);
+    }
+
+    #[test]
+    fn upn_form_finds_the_saved_password() {
+        let mut o =
+            LoginPromptOverlay::new("h".into(), None, None).with_keychain(fake_store, true, None);
+        o.on_text("alice@corp");
+        o.on_enter();
+        assert_eq!(o.password, "saved-pw");
+    }
+
+    #[test]
+    fn long_saved_password_fits_without_reallocating_into_a_copy() {
+        fn long_store(_: &str) -> Option<String> {
+            Some("x".repeat(PASSWORD_CAP + 10))
+        }
+        let o = LoginPromptOverlay::new("h".into(), Some("D\\u".into()), None)
+            .with_keychain(long_store, true, None);
+        assert_eq!(o.password.len(), PASSWORD_CAP + 10);
+        assert!(o.from_keychain);
+    }
+
+    #[test]
+    fn key_repeat_is_ignored_only_on_the_checkbox() {
+        let mut o = LoginPromptOverlay::new("h".into(), Some("D\\u".into()), None)
+            .with_keychain(fake_store, true, None);
+        assert!(o.key_repeat_ok()); // password field
+        o.on_tab();
+        assert!(!o.key_repeat_ok()); // checkbox
     }
 
     #[test]
