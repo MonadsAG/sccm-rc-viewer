@@ -40,6 +40,9 @@ done
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
 
+# Oldest macOS the app runs on; must match LSMinimumSystemVersion in Info.plist.
+export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-15.0}"
+
 APP_NAME="SCCM RC"
 BIN="sccm-rc-viewer"
 BUNDLE_ID="${MACOS_BUNDLE_ID:-io.github.conocidotech.sccm-rc-viewer}"

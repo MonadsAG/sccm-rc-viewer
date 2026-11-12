@@ -156,7 +156,9 @@ with the same gnu toolchain, and on `macos-15` (tests only; see below).
 
 ### macOS
 
-The viewer also runs on macOS (Apple Silicon and Intel). A Mac is normally not
+The viewer also runs on macOS 15 or later (Apple Silicon and Intel), with a
+native menu bar and the session controls in the title-bar toolbar
+(`SCCM_RC_NATIVE_UI=0` brings back the drawn toolbar). A Mac is normally not
 domain-joined, so there is no single sign-on: the viewer logs on with **NTLM**
 using `DOMAIN\user` and a password, entered in the viewer window. NTLM cannot
 verify the server's identity, so the toolbar shows an amber padlock

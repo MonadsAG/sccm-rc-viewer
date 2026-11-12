@@ -30,6 +30,11 @@ mod host_prompt;
 mod keychain;
 mod keymap;
 mod login_prompt;
+#[cfg(target_os = "macos")]
+mod mac_ui;
+#[cfg(not(target_os = "macos"))]
+#[path = "mac_ui_stub.rs"]
+mod mac_ui;
 mod paths;
 mod recent;
 mod record;
@@ -287,6 +292,24 @@ fn login_overlay(
     }
 }
 
+/// Window title for `target` (empty: no target yet). macOS shows just the
+/// target, as Mac apps do (the version is in the About panel); elsewhere
+/// "SCCM RC <version> — <target>".
+fn window_title(target: &str) -> String {
+    let shown = servers::display(target);
+    if cfg!(target_os = "macos") {
+        if target.is_empty() {
+            "SCCM RC".to_string()
+        } else {
+            shown
+        }
+    } else if target.is_empty() {
+        format!("SCCM RC {}", env!("CARGO_PKG_VERSION"))
+    } else {
+        format!("SCCM RC {} — {shown}", env!("CARGO_PKG_VERSION"))
+    }
+}
+
 /// User name to pre-fill in the logon overlay: `SCCM_USER`, else the last one used.
 fn initial_login_user() -> Option<String> {
     std::env::var("SCCM_USER")
@@ -346,6 +369,17 @@ enum UserEvent {
     LoginFailed(String, Arc<AtomicBool>),
     #[allow(dead_code)] // retained for an alternate teardown path
     Closed(String),
+    /// From the native macOS chrome (menu bar / title-bar toolbar).
+    Native(NativeEvent),
+}
+
+/// What the native macOS UI (`mac_ui`) asks the App to do. Built on the main
+/// thread inside AppKit callbacks and posted through the event loop, so no
+/// App state is touched from inside AppKit.
+#[derive(Debug, Clone)]
+pub(crate) enum NativeEvent {
+    /// A menu or toolbar command; runs exactly like a click on the drawn toolbar.
+    Action(ToolbarAction),
 }
 
 /// Shared framebuffer written by the RDP task, read by the renderer.
@@ -755,11 +789,7 @@ fn main() -> anyhow::Result<()> {
         surface: None,
         gpu: None,
         gpu_dump: std::env::var("SCCM_RC_GPU_DUMP").ok(),
-        title: format!(
-            "SCCM RC {} — {}",
-            env!("CARGO_PKG_VERSION"),
-            servers::display(&target)
-        ),
+        title: window_title(&target),
         last_cursor: (0, 0),
         last_move: std::time::Instant::now(),
         cursor,
@@ -805,6 +835,7 @@ fn main() -> anyhow::Result<()> {
         cliprdr_req_counter,
         paste_pending: None,
         locks_sent: None,
+        native: None,
     };
     event_loop.run_app(&mut app)?;
     // Window closed: stop the session and close the input channel, which unblocks
@@ -1285,6 +1316,9 @@ struct App {
     /// Lock-key state last sent to the remote via an RDP sync event (macOS
     /// only, see `keymap::local_lock_flags`). `None` = not synced yet.
     locks_sent: Option<sccm_rc_core::rdp::SynchronizeFlags>,
+    /// Native macOS chrome (menu bar + title-bar toolbar); `None` elsewhere or
+    /// with `SCCM_RC_NATIVE_UI=0`, where the drawn toolbar strip is used.
+    native: Option<mac_ui::NativeUi>,
 }
 
 struct PastePending {
@@ -1374,7 +1408,65 @@ impl App {
 
     /// Toolbar height in physical pixels (logical height × UI scale).
     fn bar_h_phys(&self) -> u32 {
-        toolbar::TOOLBAR_H * self.window.as_deref().map(ui_scale_of).unwrap_or(1)
+        self.bar_h_logical() * self.window.as_deref().map(ui_scale_of).unwrap_or(1)
+    }
+
+    /// Height of the drawn toolbar strip in logical pixels: 0 when the native
+    /// macOS toolbar replaces it (the desktop then uses the full height).
+    fn bar_h_logical(&self) -> u32 {
+        if self.native.is_some() {
+            0
+        } else {
+            toolbar::TOOLBAR_H
+        }
+    }
+
+    /// Push the session state into the native chrome (no-op without it).
+    fn update_native_chrome(&self) {
+        let Some(native) = self.native.as_ref() else {
+            return;
+        };
+        let (connected, status_msg, security) = {
+            let f = self.shared.lock().unwrap();
+            (
+                f.width != 0 && f.height != 0 && !f.rgba.is_empty(),
+                f.status.clone(),
+                f.security.clone(),
+            )
+        };
+        let has_session = self.input_tx.is_some() && self.running.load(Ordering::Relaxed);
+        let subtitle = if let Some(reason) = &self.closed {
+            t!("status.disconnected_reason", reason => reason).to_string()
+        } else if connected {
+            let mode = if self.view_only {
+                t!("mode.view_only")
+            } else {
+                t!("mode.control")
+            };
+            if security.is_empty() {
+                mode.to_string()
+            } else {
+                format!("{security} \u{00b7} {mode}")
+            }
+        } else if has_session {
+            if status_msg.is_empty() {
+                t!("status.connecting").to_string()
+            } else {
+                status_msg
+            }
+        } else {
+            String::new()
+        };
+        native.update(&mac_ui::Chrome {
+            subtitle,
+            connected,
+            has_session,
+            view_only: self.view_only,
+            curtain: self.curtain.load(Ordering::Relaxed),
+            recording: self.recorder.is_some(),
+            fullscreen: self.fullscreen,
+            monitor: if connected { self.monitor_label() } else { None },
+        });
     }
 
     /// Window size in logical (UI-scale) pixels plus the scale itself, for
@@ -1464,7 +1556,7 @@ impl App {
         recent::add(&new_target);
         self.host = new_target.clone();
         let shown = servers::display(&new_target);
-        self.title = format!("SCCM RC {} — {shown}", env!("CARGO_PKG_VERSION"));
+        self.title = window_title(&new_target);
         if let Some(w) = &self.window {
             w.set_title(&self.title);
         }
@@ -1739,6 +1831,16 @@ impl ApplicationHandler<UserEvent> for App {
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
         #[cfg(target_os = "macos")]
         set_dock_icon();
+        let proxy = self.proxy.clone();
+        self.native = mac_ui::NativeUi::install(
+            &window,
+            Box::new(move |ev| {
+                let _ = proxy.send_event(UserEvent::Native(ev));
+            }),
+        );
+        if self.native.is_some() {
+            info!("native macOS chrome active (menu bar + title-bar toolbar)");
+        }
         let context = softbuffer::Context::new(window.clone()).expect("softbuffer context");
         let surface =
             softbuffer::Surface::new(&context, window.clone()).expect("softbuffer surface");
@@ -1834,6 +1936,12 @@ impl ApplicationHandler<UserEvent> for App {
                     w.request_redraw();
                 }
             }
+            UserEvent::Native(NativeEvent::Action(action)) => {
+                self.run_toolbar_action(action, event_loop);
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
             UserEvent::Closed(reason) => {
                 warn!(%reason, "session closed");
                 self.closed = Some(reason);
@@ -1846,6 +1954,8 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // Native macOS chrome mirrors the session state (cheap when unchanged).
+        self.update_native_chrome();
         // UI-thread heartbeat: write a log line every ~5s. If a hang
         // happens, the last heartbeat timestamp is the moment the main
         // thread last responded — the window between it and the Watson
@@ -2623,7 +2733,7 @@ impl App {
         let size = window.inner_size();
         let (win_w, win_h) = (size.width.max(1), size.height.max(1));
         let k = ui_scale_of(&window);
-        let bar_h = (toolbar::TOOLBAR_H * k).min(win_h);
+        let bar_h = (self.bar_h_logical() * k).min(win_h);
         let mut frame = self.shared.lock().unwrap();
         let connected = frame.width != 0 && frame.height != 0 && !frame.rgba.is_empty();
         let (fb_w, fb_h) = (frame.width, frame.height);
@@ -2853,6 +2963,7 @@ impl App {
         // Capture the monitor view before borrowing the surface `&mut self.surface`
         // (which then precludes any `&self` method call for the rest of render).
         let view = self.view;
+        let bar_logical = self.bar_h_logical();
         let (Some(window), Some(surface)) = (self.window.as_ref(), self.surface.as_mut()) else {
             return;
         };
@@ -2902,7 +3013,7 @@ impl App {
         }
 
         // The remote desktop renders BELOW the toolbar strip (reserved at top).
-        let bar_h = (toolbar::TOOLBAR_H * k).min(win_h);
+        let bar_h = (bar_logical * k).min(win_h);
         let desk_h = win_h.saturating_sub(bar_h).max(1);
         let frame = self.shared.lock().unwrap();
         let frame_count = frame.frames;
@@ -3164,7 +3275,9 @@ impl App {
             encrypted,
             monitor: monitor_label.as_deref(),
         };
-        if k == 1 {
+        if bar_h == 0 {
+            // Native macOS toolbar: nothing to draw over the desktop.
+        } else if k == 1 {
             toolbar::draw(&mut buffer[..], win_w, win_h, &status, self.font.as_ref());
         } else {
             let strip_h = toolbar::TOOLBAR_H.min(lh);
