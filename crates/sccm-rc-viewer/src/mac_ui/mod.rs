@@ -221,7 +221,6 @@ impl ActionTarget {
 
 pub struct ToolbarIvars {
     target: Retained<ActionTarget>,
-    items: RefCell<Vec<(ToolbarAction, Retained<NSToolbarItem>)>>,
     state: RefCell<Chrome>,
 }
 
@@ -264,12 +263,13 @@ define_class!(
 );
 
 impl ToolbarDelegate {
-    /// Build (and remember) the toolbar item for `ident`.
+    /// Build the toolbar item for `ident` in the current state. `update`
+    /// reaches the live ones through `NSToolbar::items`, so palette copies
+    /// (customization) are not kept around.
     fn item_for(&self, ident: &NSString) -> Option<Retained<NSToolbarItem>> {
         let action = action_of_ident(&ident.to_string())?;
         let item = make_toolbar_item(self.mtm(), action, &self.ivars().target, ident);
         apply_item_state(&item, action, &self.ivars().state.borrow());
-        self.ivars().items.borrow_mut().push((action, item.clone()));
         Some(item)
     }
 }
@@ -328,7 +328,7 @@ pub struct NativeUi {
     window: Retained<NSWindow>,
     _target: Retained<ActionTarget>,
     toolbar_delegate: Retained<ToolbarDelegate>,
-    _toolbar: Retained<NSToolbar>,
+    toolbar: Retained<NSToolbar>,
     menu_items: Vec<(ToolbarAction, Retained<NSMenuItem>)>,
     /// Edit menu items and the shortcut each gets while a sheet is open.
     edit_items: Vec<(Retained<NSMenuItem>, &'static str)>,
@@ -370,7 +370,6 @@ impl NativeUi {
 
         let delegate_obj = ToolbarDelegate::alloc(mtm).set_ivars(ToolbarIvars {
             target: target.clone(),
-            items: RefCell::new(Vec::new()),
             state: RefCell::new(Chrome::default()),
         });
         // SAFETY: NSObject's init.
@@ -393,7 +392,7 @@ impl NativeUi {
             window: ns_window,
             _target: target,
             toolbar_delegate,
-            _toolbar: toolbar,
+            toolbar,
             menu_items,
             edit_items,
             last: RefCell::new(None),
@@ -471,6 +470,16 @@ impl NativeUi {
         self.sheet.borrow().is_some()
     }
 
+    /// The start sheet is the open sheet.
+    pub fn start_open(&self) -> bool {
+        self.sheet.borrow().as_ref().is_some_and(|s| s.start.is_some())
+    }
+
+    /// The logon sheet is the open sheet.
+    pub fn logon_open(&self) -> bool {
+        self.sheet.borrow().as_ref().is_some_and(|s| s.start.is_none())
+    }
+
     /// Push the current state into subtitle, toolbar and menus.
     pub fn update(&self, c: &Chrome) {
         if self.last.borrow().as_ref() == Some(c) {
@@ -478,8 +487,11 @@ impl NativeUi {
         }
         self.window.setSubtitle(&NSString::from_str(&c.subtitle));
         *self.toolbar_delegate.ivars().state.borrow_mut() = c.clone();
-        for (a, item) in self.toolbar_delegate.ivars().items.borrow().iter() {
-            apply_item_state(item, *a, c);
+        // The items actually in the toolbar (customization may add/remove).
+        for item in self.toolbar.items().iter() {
+            if let Some(a) = action_of_ident(&item.itemIdentifier().to_string()) {
+                apply_item_state(&item, a, c);
+            }
         }
         for (a, item) in &self.menu_items {
             item.setEnabled(c.enabled(*a));
@@ -490,9 +502,13 @@ impl NativeUi {
             };
             item.setState(on);
             if *a == ToolbarAction::MonitorCycle {
-                if let Some(m) = &c.monitor {
-                    item.setTitle(&NSString::from_str(&format!("{} ({m})", label_of(*a))));
-                }
+                // Back to the plain label on a single-screen target, so the
+                // last "(Screen: 2)" doesn't stick.
+                let title = match &c.monitor {
+                    Some(m) => format!("{} ({m})", label_of(*a)),
+                    None => label_of(*a),
+                };
+                item.setTitle(&NSString::from_str(&title));
             }
         }
         *self.last.borrow_mut() = Some(c.clone());

@@ -294,14 +294,13 @@ fn login_overlay(
 
 /// Window title for `target` (empty: no target yet). macOS shows just the
 /// target, as Mac apps do (the version is in the About panel); elsewhere
-/// "SCCM RC <version> — <target>".
-fn window_title(target: &str) -> String {
-    let shown = servers::display(target);
+/// "SCCM RC <version> — <target>". `shown` is `servers::display(target)`.
+fn window_title(target: &str, shown: &str) -> String {
     if cfg!(target_os = "macos") {
         if target.is_empty() {
             "SCCM RC".to_string()
         } else {
-            shown
+            shown.to_string()
         }
     } else if target.is_empty() {
         format!("SCCM RC {}", env!("CARGO_PKG_VERSION"))
@@ -793,7 +792,7 @@ fn main() -> anyhow::Result<()> {
         surface: None,
         gpu: None,
         gpu_dump: std::env::var("SCCM_RC_GPU_DUMP").ok(),
-        title: window_title(&target),
+        title: window_title(&target, &servers::display(&target)),
         last_cursor: (0, 0),
         last_move: std::time::Instant::now(),
         cursor,
@@ -1517,6 +1516,15 @@ impl App {
         }
     }
 
+    /// The window's real full-screen state: on macOS the user can also leave
+    /// (or enter) full screen with the green title-bar button, which
+    /// `self.fullscreen` does not see.
+    fn is_fullscreen(&self) -> bool {
+        self.window
+            .as_ref()
+            .map_or(self.fullscreen, |w| w.fullscreen().is_some())
+    }
+
     /// A native sheet covers the window (macOS): draw a calm background only.
     fn native_sheet_open(&self) -> bool {
         self.native.as_ref().is_some_and(|n| n.sheet_open())
@@ -1565,7 +1573,7 @@ impl App {
             view_only: self.view_only,
             curtain: self.curtain.load(Ordering::Relaxed),
             recording: self.recorder.is_some(),
-            fullscreen: self.fullscreen,
+            fullscreen: self.is_fullscreen(),
             monitor: if connected { self.monitor_label() } else { None },
         });
     }
@@ -1657,7 +1665,7 @@ impl App {
         recent::add(&new_target);
         self.host = new_target.clone();
         let shown = servers::display(&new_target);
-        self.title = window_title(&new_target);
+        self.title = window_title(&new_target, &shown);
         if let Some(w) = &self.window {
             w.set_title(&self.title);
         }
@@ -1854,7 +1862,7 @@ impl App {
                 }
             }
             ToolbarAction::ToggleFullscreen => {
-                self.fullscreen = !self.fullscreen;
+                self.fullscreen = !self.is_fullscreen();
                 if let Some(w) = &self.window {
                     let fs = self
                         .fullscreen
@@ -2046,16 +2054,21 @@ impl ApplicationHandler<UserEvent> for App {
                     w.request_redraw();
                 }
             }
+            // Only the sheet that is still open may answer: a late second
+            // event (double click, Enter twice) must not close the sheet
+            // that replaced it, or act on a session already started.
             UserEvent::Native(NativeEvent::Start(outcome)) => {
-                if let Some(native) = self.native.as_ref() {
-                    native.close_sheet();
-                }
+                let Some(native) = self.native.as_ref().filter(|n| n.start_open()) else {
+                    return;
+                };
+                native.close_sheet();
                 self.on_host_outcome(outcome, event_loop);
             }
             UserEvent::Native(NativeEvent::Logon(outcome)) => {
-                if let Some(native) = self.native.as_ref() {
-                    native.close_sheet();
-                }
+                let Some(native) = self.native.as_ref().filter(|n| n.logon_open()) else {
+                    return;
+                };
+                native.close_sheet();
                 self.on_login_outcome(outcome);
             }
             UserEvent::Native(NativeEvent::Action(action)) => {
@@ -2863,8 +2876,12 @@ impl App {
         // Overlay is drawn and uploaded at logical size (`ov_w × ov_h`); the GPU
         // stretches it over `dest` with nearest sampling (crisp pixel-doubling).
         let (lw, lh) = ((win_w / k).max(1), (win_h / k).max(1));
+        // With the native macOS toolbar (`bar_h == 0`) there is no strip:
+        // no overlay is drawn or uploaded while the desktop shows.
         let (ov_w, ov_h, dest) = if show_full_overlay {
             (lw, lh, gpu::OverlayDest::Full)
+        } else if bar_h == 0 {
+            (lw, 0, gpu::OverlayDest::TopStrip(0))
         } else {
             (
                 lw,
@@ -2881,6 +2898,8 @@ impl App {
             type_text::draw(&mut ov, ov_w, ov_h, self.font.as_ref(), prompt);
         } else if self.about_open {
             draw_about(&mut ov, ov_w, ov_h, self.font.as_ref());
+        } else if connected && ov_h == 0 {
+            // Native macOS toolbar: nothing to draw over the desktop.
         } else if connected {
             let mode = if self.view_only {
                 t!("mode.view_only")
@@ -3026,7 +3045,7 @@ impl App {
             win_h,
             bar_h,
             desktop,
-            Some((ov_w, ov_h, &ov_rgba, dest)),
+            (ov_h > 0).then_some((ov_w, ov_h, ov_rgba.as_slice(), dest)),
             cursor_ref,
             desktop_uv,
         );

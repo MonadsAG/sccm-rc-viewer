@@ -44,4 +44,12 @@ impl NativeUi {
     pub fn sheet_open(&self) -> bool {
         false
     }
+
+    pub fn start_open(&self) -> bool {
+        false
+    }
+
+    pub fn logon_open(&self) -> bool {
+        false
+    }
 }
