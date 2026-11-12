@@ -61,13 +61,16 @@ jobs:
           rustc -V
           cargo -V
 
+      # Only main saves the cache (~800 MB); PRs and branches restore main's.
+      # Saves upload time and keeps the repo under its 10 GB cache limit.
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      # Gating checks: the build must succeed and the test suite must pass.
-      - name: Build
-        run: cargo build --workspace
-
-      - name: Test
+      # Gating check: `cargo test` compiles the whole workspace (libs and
+      # binaries) and runs the suite, so a separate `cargo build` would only
+      # compile it a second time.
+      - name: Build + test
         run: cargo test --workspace
 
       # Advisory checks: the codebase predates fmt/clippy gating. These run for
@@ -76,7 +79,9 @@ jobs:
         run: cargo fmt --all -- --check
         continue-on-error: true
 
-      - name: Clippy (advisory)
+      # Clippy is a full extra compile pass; run it on main only.
+      - name: Clippy (advisory, main only)
+        if: github.ref == 'refs/heads/main'
         run: cargo clippy --workspace --all-targets
         continue-on-error: true
 
@@ -97,6 +102,8 @@ jobs:
           rustc -V
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Test
         run: cargo test --workspace
