@@ -145,6 +145,12 @@ cargo run --release -p sccm-rc-viewer -- TARGET-HOST --all-screens --wake --mac 
 cargo run -p sccm-rc-diag -- TARGET-HOST --json
 ```
 
+**Saved targets.** Without a host argument the viewer opens a start screen
+listing saved targets (by name) and recent ones; typing filters the list.
+Ctrl+S (Cmd+S on macOS) saves the highlighted or typed host under a name, or
+renames it; Ctrl+Del (Cmd+Delete) twice removes it. A saved name also works
+as the host argument. The list is personal, stored in the viewer's data folder.
+
 CI (`.github/workflows/ci.yml`) builds and tests the workspace on `windows-latest`
 with the same gnu toolchain, and on `macos-15` (tests only; see below).
 
