@@ -152,7 +152,7 @@ renames it; Ctrl+Del (Cmd+Delete) twice removes it. A saved name also works
 as the host argument. The list is personal, stored in the viewer's data folder.
 
 CI (`.github/workflows/ci.yml`) builds and tests the workspace on `windows-latest`
-with the same gnu toolchain, and on `macos-15` (tests only; see below).
+with the same gnu toolchain, and on `macos-26` (tests only; see below).
 
 ### macOS
 
