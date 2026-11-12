@@ -154,7 +154,7 @@ On macOS the start screen and the logon are native sheets (search field, list,
 Save…/Rename…/Delete buttons, double-click to connect).
 
 CI (`.github/workflows/ci.yml`) builds and tests the workspace on `windows-latest`
-with the same gnu toolchain, and on `macos-15` (tests only; see below).
+with the same gnu toolchain, and on `macos-26` (tests only; see below).
 
 ### macOS
 
