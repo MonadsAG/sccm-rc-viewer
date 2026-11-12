@@ -208,8 +208,44 @@ define_class!(
                 (self.ivars().on_event)(NativeEvent::Action(*a));
             }
         }
+
+        /// Quit from the app menu (Cmd+Q).
+        #[unsafe(method(performQuit:))]
+        fn perform_quit(&self, _sender: Option<&AnyObject>) {
+            (self.ivars().on_event)(NativeEvent::Quit);
+        }
+
+        /// The "quit" Apple Event: Dock › Quit, logout/shutdown, `osascript`.
+        #[unsafe(method(handleQuitEvent:withReply:))]
+        fn handle_quit_event(&self, _event: &AnyObject, _reply: &AnyObject) {
+            (self.ivars().on_event)(NativeEvent::Quit);
+        }
     }
 );
+
+/// `kCoreEventClass` ('aevt') and `kAEQuitApplication` ('quit').
+const AE_CORE_EVENT_CLASS: u32 = u32::from_be_bytes(*b"aevt");
+const AE_QUIT_APPLICATION: u32 = u32::from_be_bytes(*b"quit");
+
+/// Route the "quit" Apple Event to `target`. AppKit's own handling calls
+/// `terminate:`, which refuses while a sheet is open (and the start sheet
+/// is open whenever there is no session), so Dock › Quit did nothing. The
+/// App instead closes the sheet, releases the session and exits.
+fn install_quit_handler(target: &ActionTarget) {
+    let manager = objc2_foundation::NSAppleEventManager::sharedAppleEventManager();
+    // SAFETY: the selector exists on ActionTarget with the
+    // (NSAppleEventDescriptor, NSAppleEventDescriptor) signature; the target
+    // lives as long as NativeUi, i.e. the whole run.
+    let _: () = unsafe {
+        msg_send![
+            &manager,
+            setEventHandler: target,
+            andSelector: sel!(handleQuitEvent:withReply:),
+            forEventClass: AE_CORE_EVENT_CLASS,
+            andEventID: AE_QUIT_APPLICATION
+        ]
+    };
+}
 
 impl ActionTarget {
     fn new(mtm: MainThreadMarker, on_event: Rc<dyn Fn(NativeEvent)>) -> Retained<Self> {
@@ -366,6 +402,7 @@ impl NativeUi {
 
         let emit: Rc<dyn Fn(NativeEvent)> = Rc::from(on_event);
         let target = ActionTarget::new(mtm, emit.clone());
+        install_quit_handler(&target);
         let (menu_items, edit_items) = install_menu(mtm, &target);
 
         let delegate_obj = ToolbarDelegate::alloc(mtm).set_ivars(ToolbarIvars {
@@ -472,12 +509,18 @@ impl NativeUi {
 
     /// The start sheet is the open sheet.
     pub fn start_open(&self) -> bool {
-        self.sheet.borrow().as_ref().is_some_and(|s| s.start.is_some())
+        self.sheet
+            .borrow()
+            .as_ref()
+            .is_some_and(|s| s.start.is_some())
     }
 
     /// The logon sheet is the open sheet.
     pub fn logon_open(&self) -> bool {
-        self.sheet.borrow().as_ref().is_some_and(|s| s.start.is_none())
+        self.sheet
+            .borrow()
+            .as_ref()
+            .is_some_and(|s| s.start.is_none())
     }
 
     /// Push the current state into subtitle, toolbar and menus.
@@ -599,12 +642,11 @@ fn install_menu(mtm: MainThreadMarker, target: &ActionTarget) -> MenuItems {
         "",
     ));
     app_menu.addItem(&NSMenuItem::separatorItem(mtm));
-    app_menu.addItem(&menu_item(
-        mtm,
-        &t!("menu.quit"),
-        Some(sel!(terminate:)),
-        "q",
-    ));
+    // Quit goes through the App (see `install_quit_handler`), not terminate:.
+    let quit = menu_item(mtm, &t!("menu.quit"), Some(sel!(performQuit:)), "q");
+    // SAFETY: the target outlives the menu (NativeUi keeps both).
+    unsafe { quit.setTarget(Some(target)) };
+    app_menu.addItem(&quit);
 
     // Edit: sent to the first responder (the sheet's text fields). Shortcuts
     // only while a sheet is open; see `NativeUi::edit_shortcuts`.

@@ -383,6 +383,9 @@ pub(crate) enum NativeEvent {
     Logon(login_prompt::LoginOutcome),
     /// The native start sheet picked a target or asked to quit.
     Start(host_prompt::PromptOutcome),
+    /// Quit from the app menu, the Dock or the system (logout): close any
+    /// sheet, release the session, exit.
+    Quit,
 }
 
 /// Shared framebuffer written by the RDP task, read by the renderer.
@@ -2057,6 +2060,15 @@ impl ApplicationHandler<UserEvent> for App {
             // Only the sheet that is still open may answer: a late second
             // event (double click, Enter twice) must not close the sheet
             // that replaced it, or act on a session already started.
+            UserEvent::Native(NativeEvent::Quit) => {
+                if let Some(native) = self.native.as_ref() {
+                    native.close_sheet();
+                }
+                // Same graceful teardown as closing the window.
+                self.begin_shutdown();
+                let _ = self.done_rx.recv_timeout(std::time::Duration::from_secs(3));
+                event_loop.exit();
+            }
             UserEvent::Native(NativeEvent::Start(outcome)) => {
                 let Some(native) = self.native.as_ref().filter(|n| n.start_open()) else {
                     return;
