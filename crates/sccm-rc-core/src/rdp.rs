@@ -438,6 +438,7 @@ fn build_wlc_channel_set(
     curtain_enabled: bool,
     snapshot: &ChannelIdSnapshot,
     cliprdr_req_counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    opts: &RdpOptions,
 ) -> ironrdp_svc::StaticChannelSet {
     use core::any::TypeId;
     let mut set = ironrdp_svc::StaticChannelSet::new();
@@ -456,7 +457,7 @@ fn build_wlc_channel_set(
     } else {
         set.insert(PassiveCurtain);
     }
-    set.insert(ArbitrationChannel::default());
+    set.insert(ArbitrationChannel::new(opts.takeover, opts.host_in_use.clone()));
     set.insert(PassiveDynres);
     set.insert(PassiveDskcfg);
     set.insert(PassiveDrdynvc);
@@ -479,13 +480,56 @@ fn build_wlc_channel_set(
 /// arbitrates the session over this channel. RE of RdpCoreSccm.dll: the event
 /// is a 16-byte payload `[u32 tag=2][u32 len=16][u32 eventType][u32 arg2]`.
 /// We log every byte the server sends back (its Host Allowed/Idle/InUse/Denied).
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ArbitrationChannel {
     replies_sent: u32,
     takeover_sent: bool,
+    takeover: bool,
+    host_in_use: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Returned (by callers watching `RdpOptions::host_in_use`) when the till is in
+/// use by a logged-on user and take-over was not requested.
+#[derive(Debug, thiserror::Error)]
+#[error("the till is in use by a logged-on user")]
+pub struct HostInUse;
+
+/// Options for the RDP connection. Both `connect_rdp_with` and
+/// `run_active_session_with` must be given the SAME `RdpOptions` so they share
+/// one `host_in_use` flag; the plain `connect_rdp` / `run_active_session`
+/// wrappers each use their own `RdpOptions::default()`, so callers that need
+/// the flag must use the `*_with` variants.
+#[derive(Clone, Debug)]
+pub struct RdpOptions {
+    /// Take over a busy host (send sessarb type 5 on HostInUse).
+    pub takeover: bool,
+    /// Set by the sessarb channel when the server reports HostInUse and
+    /// `takeover` is false.
+    pub host_in_use: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Default for RdpOptions {
+    fn default() -> Self {
+        Self {
+            takeover: std::env::var("SCCM_RC_TAKEOVER").as_deref() == Ok("1"),
+            host_in_use: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
 }
 
 impl ArbitrationChannel {
+    pub fn new(
+        takeover: bool,
+        host_in_use: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        Self {
+            replies_sent: 0,
+            takeover_sent: false,
+            takeover,
+            host_in_use,
+        }
+    }
+
     /// Build the 16-byte arbitration event payload.
     pub fn event(event_type: u32, arg2: u32) -> Vec<u8> {
         let mut v = Vec::with_capacity(16);
@@ -541,10 +585,11 @@ impl ironrdp_svc::SvcProcessor for ArbitrationChannel {
         // replaying CmRcViewer's type-5 event with our machine name; the server
         // then grants HostAllowed(4) and attaches the shadow. Gated by
         // SCCM_RC_TAKEOVER=1 (it forcibly takes over a busy host).
-        if server_event == 1
-            && !self.takeover_sent
-            && std::env::var("SCCM_RC_TAKEOVER").as_deref() == Ok("1")
-        {
+        if server_event == 1 && !self.takeover {
+            self.host_in_use
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        if server_event == 1 && !self.takeover_sent && self.takeover {
             self.takeover_sent = true;
             let name = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "RUSTCLIENT".to_string());
             info!(client = %name, "sessarb: HostInUse — sending take-over request (type 5)");
@@ -1010,6 +1055,26 @@ pub async fn connect_rdp(
     monitors: &[ironrdp_pdu::gcc::Monitor],
     cliprdr_req_counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) -> Result<(ConnectionResult, Vec<u8>, u32)> {
+    connect_rdp_with(
+        session,
+        width,
+        height,
+        monitors,
+        cliprdr_req_counter,
+        &RdpOptions::default(),
+    )
+    .await
+}
+
+/// `connect_rdp` with explicit options. Share `opts` with `run_active_session_with`.
+pub async fn connect_rdp_with(
+    session: &mut SccmSession,
+    width: u16,
+    height: u16,
+    monitors: &[ironrdp_pdu::gcc::Monitor],
+    cliprdr_req_counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    opts: &RdpOptions,
+) -> Result<(ConnectionResult, Vec<u8>, u32)> {
     if session.grant() == Grant::ViewOnly {
         debug!("session is view-only — input will be rejected by the server");
     }
@@ -1044,7 +1109,10 @@ pub async fn connect_rdp(
         } else {
             connector = connector.with_static_channel(PassiveCurtain);
         }
-        connector = connector.with_static_channel(ArbitrationChannel::default());
+        connector = connector.with_static_channel(ArbitrationChannel::new(
+            opts.takeover,
+            opts.host_in_use.clone(),
+        ));
         connector = connector.with_static_channel(PassiveDynres);
         connector = connector.with_static_channel(PassiveDskcfg);
         connector = connector.with_static_channel(PassiveDrdynvc);
@@ -1306,6 +1374,35 @@ pub async fn run_active_session(
     curtain_on: std::sync::Arc<std::sync::atomic::AtomicBool>,
     file_offer: std::sync::Arc<std::sync::Mutex<Option<std::path::PathBuf>>>,
     cliprdr_req_counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
+) -> Result<()> {
+    run_active_session_with(
+        session,
+        connection_result,
+        initial_buf,
+        initial_share_id,
+        sink,
+        input_rx,
+        curtain_on,
+        file_offer,
+        cliprdr_req_counter,
+        &RdpOptions::default(),
+    )
+    .await
+}
+
+/// `run_active_session` with explicit options. Share `opts` with `connect_rdp_with`.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_active_session_with(
+    session: &mut SccmSession,
+    connection_result: ConnectionResult,
+    initial_buf: Vec<u8>,
+    initial_share_id: u32,
+    sink: &mut dyn SessionSink,
+    input_rx: &mut InputReceiver,
+    curtain_on: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    file_offer: std::sync::Arc<std::sync::Mutex<Option<std::path::PathBuf>>>,
+    cliprdr_req_counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    opts: &RdpOptions,
 ) -> Result<()> {
     let mut width = connection_result.desktop_size.width;
     let mut height = connection_result.desktop_size.height;
@@ -1883,6 +1980,7 @@ pub async fn run_active_session(
                         curtain_enabled,
                         &channel_id_snapshot,
                         cliprdr_req_counter.clone(),
+                        opts,
                     );
                     width = new_result.desktop_size.width;
                     height = new_result.desktop_size.height;
@@ -2882,5 +2980,37 @@ mod tests {
             }
         }
         eprintln!("replay OK: {ok_updates} order updates parsed, {total_orders} orders total");
+    }
+}
+
+#[cfg(test)]
+mod arbitration_tests {
+    use super::*;
+    use ironrdp_svc::SvcProcessor;
+    use std::sync::atomic::Ordering;
+
+    fn event1() -> Vec<u8> {
+        ArbitrationChannel::event(1, 0)[..12].to_vec()
+    }
+
+    #[test]
+    fn takeover_disabled_ignores_host_in_use() {
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut ch = ArbitrationChannel::new(false, flag.clone());
+        let msgs = ch.process(&event1()).unwrap();
+        assert!(msgs.is_empty());
+        assert!(flag.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn takeover_enabled_sends_type_5_once() {
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut ch = ArbitrationChannel::new(true, flag.clone());
+        let msgs = ch.process(&event1()).unwrap();
+        assert_eq!(msgs.len(), 1);
+        let bytes = ArbitrationChannel::takeover("X");
+        assert_eq!(&bytes[8..12], &5u32.to_le_bytes());
+        assert!(ch.process(&event1()).unwrap().is_empty());
+        assert!(!flag.load(Ordering::SeqCst));
     }
 }
