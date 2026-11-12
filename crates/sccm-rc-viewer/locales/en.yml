@@ -69,6 +69,7 @@ prompt:
   more: "%{n} more — type to filter"
 
 login:
+  log_on: "Log On"
   title: "Log on to %{target}"
   user: "User (DOMAIN\\user):"
   user_placeholder: "DOMAIN\\user"
@@ -95,3 +96,10 @@ menu:
   help: "Help"
   about_details: "Version, License and Security"
   next_screen: "Next Screen"
+  edit: "Edit"
+  undo: "Undo"
+  redo: "Redo"
+  cut: "Cut"
+  copy: "Copy"
+  paste: "Paste"
+  select_all: "Select All"

@@ -28,6 +28,7 @@ const SAVE_ROW_H: u32 = 40;
 const FIELD_H: u32 = 36;
 const CHECK: u32 = 18;
 
+#[derive(Debug, Clone)]
 pub enum LoginOutcome {
     Confirmed {
         target: String,
@@ -79,7 +80,7 @@ impl Drop for LoginPromptOverlay {
 
 /// Keychain account for the text in the user field: the same
 /// `DOMAIN\user` form the App saves under (`user@domain` is converted).
-fn account_key(user: &str) -> Option<String> {
+pub(crate) fn account_key(user: &str) -> Option<String> {
     LogonCredentials::parse(user, None, "")
         .ok()
         .map(|c| c.display_name())

@@ -69,6 +69,7 @@ prompt:
   more: "%{n} weitere – zum Filtern tippen"
 
 login:
+  log_on: "Anmelden"
   title: "Anmelden bei %{target}"
   user: "Benutzer (DOMÄNE\\benutzer):"
   user_placeholder: "DOMÄNE\\benutzer"
@@ -95,3 +96,10 @@ menu:
   help: "Hilfe"
   about_details: "Version, Lizenz und Sicherheit"
   next_screen: "Nächster Bildschirm"
+  edit: "Bearbeiten"
+  undo: "Widerrufen"
+  redo: "Wiederholen"
+  cut: "Ausschneiden"
+  copy: "Kopieren"
+  paste: "Einsetzen"
+  select_all: "Alles auswählen"

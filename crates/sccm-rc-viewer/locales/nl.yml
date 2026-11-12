@@ -69,6 +69,7 @@ prompt:
   more: "nog %{n} – typ om te filteren"
 
 login:
+  log_on: "Aanmelden"
   title: "Aanmelden bij %{target}"
   user: "Gebruiker (DOMEIN\\gebruiker):"
   user_placeholder: "DOMEIN\\gebruiker"
@@ -95,3 +96,10 @@ menu:
   help: "Help"
   about_details: "Versie, licentie en beveiliging"
   next_screen: "Volgend scherm"
+  edit: "Wijzig"
+  undo: "Herstel"
+  redo: "Opnieuw"
+  cut: "Knip"
+  copy: "Kopieer"
+  paste: "Plak"
+  select_all: "Selecteer alles"

@@ -380,6 +380,8 @@ enum UserEvent {
 pub(crate) enum NativeEvent {
     /// A menu or toolbar command; runs exactly like a click on the drawn toolbar.
     Action(ToolbarAction),
+    /// The native logon sheet was confirmed or cancelled.
+    Logon(login_prompt::LoginOutcome),
 }
 
 /// Shared framebuffer written by the RDP task, read by the renderer.
@@ -1421,6 +1423,64 @@ impl App {
         }
     }
 
+    /// A confirmed or cancelled logon, from the drawn overlay or the native
+    /// sheet: store the credentials and connect, or go back to the start screen.
+    fn on_login_outcome(&mut self, outcome: login_prompt::LoginOutcome) {
+        match outcome {
+            login_prompt::LoginOutcome::Confirmed {
+                target,
+                creds,
+                remember,
+                from_keychain,
+            } => {
+                recent::set_last_user(&creds.display_name());
+                // Unticked box: the user doesn't want it saved (any more).
+                if keychain::AVAILABLE && !remember {
+                    keychain::delete(&creds.display_name());
+                }
+                // Save only after a successful logon (SessionActive), and
+                // only if it is not already the saved one.
+                self.keychain_save = remember && !from_keychain;
+                self.creds_in_keychain = remember && from_keychain;
+                self.remember_choice = remember;
+                self.creds = Some(creds);
+                self.start_session(target);
+            }
+            login_prompt::LoginOutcome::Cancelled => {
+                self.host_prompt = Some(host_prompt::HostPromptOverlay::new());
+            }
+        }
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
+    }
+
+    /// Ask for the logon: the native sheet on macOS, else the drawn overlay.
+    /// `fill`: fill in a saved password; `remember`: earlier checkbox choice.
+    fn open_logon(
+        &mut self,
+        target: String,
+        user: Option<String>,
+        error: Option<String>,
+        fill: bool,
+        remember: Option<bool>,
+    ) {
+        if let Some(native) = self.native.as_ref() {
+            self.login_prompt = None;
+            native.show_logon(&target, user, error, fill, remember);
+        } else {
+            self.login_prompt = Some(login_overlay(target, user, error, fill, remember));
+        }
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
+    }
+
+    /// A native sheet covers the window (macOS): draw a calm background only.
+    fn native_sheet_open(&self) -> bool {
+        self.native.as_ref().is_some_and(|n| n.sheet_open())
+    }
+
     /// Push the session state into the native chrome (no-op without it).
     fn update_native_chrome(&self) {
         let Some(native) = self.native.as_ref() else {
@@ -1840,6 +1900,12 @@ impl ApplicationHandler<UserEvent> for App {
         );
         if self.native.is_some() {
             info!("native macOS chrome active (menu bar + title-bar toolbar)");
+            // Started with a target: the logon overlay was set up before the
+            // window existed; show the native sheet instead.
+            if self.login_prompt.take().is_some() {
+                self.window = Some(window.clone());
+                self.open_logon(self.host.clone(), initial_login_user(), None, true, None);
+            }
         }
         let context = softbuffer::Context::new(window.clone()).expect("softbuffer context");
         let surface =
@@ -1925,16 +1991,22 @@ impl ApplicationHandler<UserEvent> for App {
                     *f = SharedFrame::default();
                 }
                 let msg = t!("login.rejected", reason => reason).to_string();
-                self.login_prompt = Some(login_overlay(
+                self.open_logon(
                     self.host.clone(),
                     failed_user.or_else(initial_login_user),
                     Some(msg),
                     false,
                     Some(remember),
-                ));
+                );
                 if let Some(w) = &self.window {
                     w.request_redraw();
                 }
+            }
+            UserEvent::Native(NativeEvent::Logon(outcome)) => {
+                if let Some(native) = self.native.as_ref() {
+                    native.close_sheet();
+                }
+                self.on_login_outcome(outcome);
             }
             UserEvent::Native(NativeEvent::Action(action)) => {
                 self.run_toolbar_action(action, event_loop);
@@ -1997,8 +2069,7 @@ impl ApplicationHandler<UserEvent> for App {
                 host_prompt::PromptOutcome::Confirmed(target) => {
                     if NEEDS_EXPLICIT_LOGON && self.creds.is_none() {
                         self.host_prompt = None;
-                        self.login_prompt =
-                            Some(login_overlay(target, initial_login_user(), None, true, None));
+                        self.open_logon(target, initial_login_user(), None, true, None);
                         if let Some(w) = &self.window {
                             w.request_redraw();
                         }
@@ -2016,33 +2087,7 @@ impl ApplicationHandler<UserEvent> for App {
         // Drain any pending logon outcome (Enter → connect, Esc → host picker).
         if let Some(outcome) = self.login_prompt.as_mut().and_then(|p| p.take_outcome()) {
             self.login_prompt = None;
-            match outcome {
-                login_prompt::LoginOutcome::Confirmed {
-                    target,
-                    creds,
-                    remember,
-                    from_keychain,
-                } => {
-                    recent::set_last_user(&creds.display_name());
-                    // Unticked box: the user doesn't want it saved (any more).
-                    if keychain::AVAILABLE && !remember {
-                        keychain::delete(&creds.display_name());
-                    }
-                    // Save only after a successful logon (SessionActive), and
-                    // only if it is not already the saved one.
-                    self.keychain_save = remember && !from_keychain;
-                    self.creds_in_keychain = remember && from_keychain;
-                    self.remember_choice = remember;
-                    self.creds = Some(creds);
-                    self.start_session(target);
-                }
-                login_prompt::LoginOutcome::Cancelled => {
-                    self.host_prompt = Some(host_prompt::HostPromptOverlay::new());
-                }
-            }
-            if let Some(w) = &self.window {
-                w.request_redraw();
-            }
+            self.on_login_outcome(outcome);
         }
         // Ctrl+V → UAC fallback: if V has been released AND at least
         // 100 ms elapsed since key-down (floor so a fast tap still gives
@@ -2104,7 +2149,7 @@ impl ApplicationHandler<UserEvent> for App {
             let f = self.shared.lock().unwrap();
             f.width != 0 && !f.rgba.is_empty()
         };
-        if !painted && self.closed.is_none() {
+        if !painted && self.closed.is_none() && !self.native_sheet_open() {
             if let Some(w) = &self.window {
                 w.request_redraw();
             }
@@ -2734,6 +2779,8 @@ impl App {
         let (win_w, win_h) = (size.width.max(1), size.height.max(1));
         let k = ui_scale_of(&window);
         let bar_h = (self.bar_h_logical() * k).min(win_h);
+        // A native sheet is open: plain background, no spinner or text.
+        let quiet = self.native_sheet_open();
         let mut frame = self.shared.lock().unwrap();
         let connected = frame.width != 0 && frame.height != 0 && !frame.rgba.is_empty();
         let (fb_w, fb_h) = (frame.width, frame.height);
@@ -2847,7 +2894,7 @@ impl App {
                 status_msg
             };
             let (cx, cy) = (ov_w / 2, ov_h / 2);
-            if self.closed.is_none() {
+            if self.closed.is_none() && !quiet {
                 draw_spinner(
                     &mut ov,
                     ov_w,
@@ -2857,7 +2904,8 @@ impl App {
                     self.connect_start.elapsed(),
                 );
             }
-            if let Some(f) = self.font.as_ref() {
+            if quiet {
+            } else if let Some(f) = self.font.as_ref() {
                 f.draw_centered(
                     &mut ov,
                     ov_w,
@@ -2964,6 +3012,8 @@ impl App {
         // (which then precludes any `&self` method call for the rest of render).
         let view = self.view;
         let bar_logical = self.bar_h_logical();
+        // A native sheet is open: plain background, no spinner or text.
+        let quiet = self.native_sheet_open();
         let (Some(window), Some(surface)) = (self.window.as_ref(), self.surface.as_mut()) else {
             return;
         };
@@ -3048,7 +3098,7 @@ impl App {
             let cx = win_w / 2;
             let cy = win_h / 2;
             // Animated spinner above the text (only while still connecting).
-            if self.closed.is_none() {
+            if self.closed.is_none() && !quiet {
                 draw_spinner(
                     &mut buffer[..],
                     win_w,
@@ -3058,7 +3108,8 @@ impl App {
                     self.connect_start.elapsed(),
                 );
             }
-            if let Some(f) = self.font.as_ref() {
+            if quiet {
+            } else if let Some(f) = self.font.as_ref() {
                 f.draw_centered(
                     &mut buffer[..],
                     win_w,

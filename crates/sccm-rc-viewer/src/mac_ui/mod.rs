@@ -11,11 +11,17 @@
 //! Shortcuts: only the ones winit's default menu already had (Cmd+Q, Cmd+H,
 //! Option+Cmd+H) plus Ctrl+Cmd+F for full screen. Menu key equivalents are
 //! matched before the remote view sees a key, so anything else (Cmd+C/V/A/F…)
-//! must stay free for the remote session, where Cmd is sent as Ctrl.
+//! must stay free for the remote session, where Cmd is sent as Ctrl. The Edit
+//! menu therefore gets its shortcuts (Cmd+Z/X/C/V/A) only while a sheet with
+//! text fields is open, and loses them again when it closes.
 //!
 //! `SCCM_RC_NATIVE_UI=0` turns it off (the drawn toolbar comes back).
 
 use std::cell::RefCell;
+use std::rc::Rc;
+
+mod logon;
+mod sheet;
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, Sel};
@@ -178,7 +184,7 @@ impl Chrome {
 }
 
 pub struct TargetIvars {
-    on_event: Box<dyn Fn(NativeEvent)>,
+    on_event: Rc<dyn Fn(NativeEvent)>,
 }
 
 define_class!(
@@ -205,7 +211,7 @@ define_class!(
 );
 
 impl ActionTarget {
-    fn new(mtm: MainThreadMarker, on_event: Box<dyn Fn(NativeEvent)>) -> Retained<Self> {
+    fn new(mtm: MainThreadMarker, on_event: Rc<dyn Fn(NativeEvent)>) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(TargetIvars { on_event });
         // SAFETY: NSObject's init.
         unsafe { msg_send![super(this), init] }
@@ -323,7 +329,12 @@ pub struct NativeUi {
     toolbar_delegate: Retained<ToolbarDelegate>,
     _toolbar: Retained<NSToolbar>,
     menu_items: Vec<(ToolbarAction, Retained<NSMenuItem>)>,
+    /// Edit menu items and the shortcut each gets while a sheet is open.
+    edit_items: Vec<(Retained<NSMenuItem>, &'static str)>,
     last: RefCell<Option<Chrome>>,
+    emit: Rc<dyn Fn(NativeEvent)>,
+    /// The open sheet (window + its target, which owns the closures).
+    sheet: RefCell<Option<(Retained<NSWindow>, Retained<sheet::SheetTarget>)>>,
 }
 
 impl NativeUi {
@@ -344,8 +355,9 @@ impl NativeUi {
         let view: &NSView = unsafe { handle.ns_view.cast::<NSView>().as_ref() };
         let ns_window = view.window()?;
 
-        let target = ActionTarget::new(mtm, on_event);
-        let menu_items = install_menu(mtm, &target);
+        let emit: Rc<dyn Fn(NativeEvent)> = Rc::from(on_event);
+        let target = ActionTarget::new(mtm, emit.clone());
+        let (menu_items, edit_items) = install_menu(mtm, &target);
 
         let delegate_obj = ToolbarDelegate::alloc(mtm).set_ivars(ToolbarIvars {
             target: target.clone(),
@@ -374,8 +386,52 @@ impl NativeUi {
             toolbar_delegate,
             _toolbar: toolbar,
             menu_items,
+            edit_items,
             last: RefCell::new(None),
+            emit,
+            sheet: RefCell::new(None),
         })
+    }
+
+    /// Show the logon sheet (replacing any open sheet). The result arrives as
+    /// `NativeEvent::Logon`; the App then calls [`close_sheet`](Self::close_sheet).
+    pub fn show_logon(
+        &self,
+        target: &str,
+        user: Option<String>,
+        error: Option<String>,
+        fill: bool,
+        remember: Option<bool>,
+    ) {
+        self.close_sheet();
+        let Some(mtm) = MainThreadMarker::new() else {
+            return;
+        };
+        let s = logon::build(mtm, target, user, error, fill, remember, self.emit.clone());
+        self.window.beginSheet_completionHandler(&s.window, None);
+        s.window.makeFirstResponder(Some(&s.focus));
+        *self.sheet.borrow_mut() = Some((s.window, s.target));
+        self.edit_shortcuts(true);
+    }
+
+    pub fn close_sheet(&self) {
+        if let Some((w, _target)) = self.sheet.borrow_mut().take() {
+            self.window.endSheet(&w);
+            w.orderOut(None);
+        }
+        self.edit_shortcuts(false);
+    }
+
+    /// Edit-menu shortcuts on (a sheet's text fields need them) or off (the
+    /// remote session gets Cmd+C/V/… as Ctrl+C/V/…).
+    fn edit_shortcuts(&self, on: bool) {
+        for (item, key) in &self.edit_items {
+            item.setKeyEquivalent(&NSString::from_str(if on { key } else { "" }));
+        }
+    }
+
+    pub fn sheet_open(&self) -> bool {
+        self.sheet.borrow().is_some()
     }
 
     /// Push the current state into subtitle, toolbar and menus.
@@ -432,11 +488,24 @@ fn submenu(mtm: MainThreadMarker, bar: &NSMenu, title: &str) -> Retained<NSMenu>
     menu
 }
 
-/// Build and install the main menu; returns the action items for `update`.
-fn install_menu(
-    mtm: MainThreadMarker,
-    target: &ActionTarget,
-) -> Vec<(ToolbarAction, Retained<NSMenuItem>)> {
+/// Edit menu items: title key, selector, shortcut (Cmd+key; "Z" = Shift+Cmd+Z).
+const EDIT_ITEMS: [(&str, &str, &str); 6] = [
+    ("menu.undo", "undo:", "z"),
+    ("menu.redo", "redo:", "Z"),
+    ("menu.cut", "cut:", "x"),
+    ("menu.copy", "copy:", "c"),
+    ("menu.paste", "paste:", "v"),
+    ("menu.select_all", "selectAll:", "a"),
+];
+
+type MenuItems = (
+    Vec<(ToolbarAction, Retained<NSMenuItem>)>,
+    Vec<(Retained<NSMenuItem>, &'static str)>,
+);
+
+/// Build and install the main menu; returns the action items for `update`
+/// and the Edit items (whose shortcuts `edit_shortcuts` switches).
+fn install_menu(mtm: MainThreadMarker, target: &ActionTarget) -> MenuItems {
     let app = NSApplication::sharedApplication(mtm);
     let bar = NSMenu::new(mtm);
     let mut actions = Vec::new();
@@ -483,6 +552,25 @@ fn install_menu(
         Some(sel!(terminate:)),
         "q",
     ));
+
+    // Edit: sent to the first responder (the sheet's text fields). Shortcuts
+    // only while a sheet is open; see `NativeUi::edit_shortcuts`.
+    let edit = submenu(mtm, &bar, &t!("menu.edit"));
+    edit.setAutoenablesItems(true);
+    let mut edit_items = Vec::new();
+    for (i, (title, selector, key)) in EDIT_ITEMS.iter().enumerate() {
+        if i == 2 {
+            edit.addItem(&NSMenuItem::separatorItem(mtm));
+        }
+        let item = menu_item(
+            mtm,
+            &t!(*title),
+            Some(Sel::register(&std::ffi::CString::new(*selector).unwrap())),
+            "",
+        );
+        edit.addItem(&item);
+        edit_items.push((item, *key));
+    }
 
     let conn = submenu(mtm, &bar, &t!("menu.connection"));
     add_action(
@@ -569,7 +657,7 @@ fn install_menu(
     app.setHelpMenu(Some(&help));
 
     app.setMainMenu(Some(&bar));
-    actions
+    (actions, edit_items)
 }
 
 #[cfg(test)]
