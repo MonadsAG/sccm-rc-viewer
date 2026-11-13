@@ -503,8 +503,9 @@ pub struct HostInUse;
 pub struct RdpOptions {
     /// Take over a busy host (send sessarb type 5 on HostInUse).
     pub takeover: bool,
-    /// Set by the sessarb channel when the server reports HostInUse and
-    /// `takeover` is false.
+    /// Set by the sessarb channel when the server reports HostInUse, whether
+    /// or not `takeover` is set (with `takeover` it means a logged-on user
+    /// was taken over).
     pub host_in_use: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -585,7 +586,9 @@ impl ironrdp_svc::SvcProcessor for ArbitrationChannel {
         // replaying CmRcViewer's type-5 event with our machine name; the server
         // then grants HostAllowed(4) and attaches the shadow. Gated by
         // SCCM_RC_TAKEOVER=1 (it forcibly takes over a busy host).
-        if server_event == 1 && !self.takeover {
+        // Recorded as a fact either way, so a caller that took over can
+        // report (and audit) that a logged-on user was displaced.
+        if server_event == 1 {
             self.host_in_use
                 .store(true, std::sync::atomic::Ordering::SeqCst);
         }
@@ -3011,6 +3014,7 @@ mod arbitration_tests {
         let bytes = ArbitrationChannel::takeover("X");
         assert_eq!(&bytes[8..12], &5u32.to_le_bytes());
         assert!(ch.process(&event1()).unwrap().is_empty());
-        assert!(!flag.load(Ordering::SeqCst));
+        // The flag records that the host was in use, so the take-over can be reported.
+        assert!(flag.load(Ordering::SeqCst));
     }
 }

@@ -139,7 +139,19 @@ pub struct Session {
     shared: Arc<Shared>,
     done: Option<oneshot::Receiver<()>>,
     view_only: bool,
+    /// A logged-on user was reported and taken over (force).
+    took_over: bool,
 }
+
+/// A session that is still starting, or was abandoned while starting. It is
+/// registered before any start-up await, so shutdown and the next connect
+/// can stop it and wait for the till to be released.
+pub struct Pending {
+    input: Arc<Mutex<Option<InputSender>>>,
+    done: Option<oneshot::Receiver<()>>,
+}
+
+pub type PendingSlot = Arc<Mutex<Option<Pending>>>;
 
 impl Session {
     pub fn new(
@@ -153,7 +165,25 @@ impl Session {
             shared,
             done,
             view_only,
+            took_over: false,
         }
+    }
+
+    /// A session whose thread signals `done` once the till is released.
+    /// Registers it in `slot` first: if the start-up is cancelled or times
+    /// out, the backend can still stop it and wait for the release.
+    pub fn start(
+        input: InputSender,
+        shared: Arc<Shared>,
+        done: oneshot::Receiver<()>,
+        slot: &PendingSlot,
+    ) -> Self {
+        let s = Self::new(input, shared, None, false);
+        *lock(slot) = Some(Pending {
+            input: s.input.clone(),
+            done: Some(done),
+        });
+        s
     }
 
     /// Ask the session to end: closing the input channel ends the active
@@ -200,7 +230,7 @@ impl Session {
 }
 
 pub type ConnectFuture = Pin<Box<dyn Future<Output = Result<Session, Reply>> + Send>>;
-type Connector = Box<dyn FnMut(String, bool) -> ConnectFuture + Send>;
+type Connector = Box<dyn FnMut(String, bool, PendingSlot) -> ConnectFuture + Send>;
 type Audit = Arc<dyn Fn(&str, &str) + Send + Sync>;
 
 struct Conn {
@@ -216,6 +246,8 @@ pub struct Headless {
     idle: Duration,
     last_call: Arc<Mutex<Instant>>,
     conn: Option<Conn>,
+    pending: PendingSlot,
+    release_wait: Duration,
 }
 
 impl Headless {
@@ -224,14 +256,14 @@ impl Headless {
         // An explicit logon the till rejected is never retried in this
         // process: every retry is another failed logon (lockout).
         let rejected: Arc<Mutex<Option<String>>> = Arc::default();
-        Self::with_connector(move |target, force| {
+        Self::with_connector(move |target, force, slot| {
             let rejected = rejected.clone();
-            Box::pin(async move { real_connect(target, force, rejected).await })
+            Box::pin(async move { real_connect(target, force, rejected, slot).await })
         })
     }
 
     pub fn with_connector(
-        connector: impl FnMut(String, bool) -> ConnectFuture + Send + 'static,
+        connector: impl FnMut(String, bool, PendingSlot) -> ConnectFuture + Send + 'static,
     ) -> Self {
         Self {
             connector: Box::new(connector),
@@ -239,7 +271,34 @@ impl Headless {
             idle: IDLE_TIMEOUT,
             last_call: Arc::new(Mutex::new(Instant::now())),
             conn: None,
+            pending: PendingSlot::default(),
+            release_wait: RELEASE_WAIT,
         }
+    }
+
+    #[cfg(test)]
+    fn with_release_wait(mut self, d: Duration) -> Self {
+        self.release_wait = d;
+        self
+    }
+
+    /// Stop a pending (starting or abandoned) session and wait for its
+    /// release. `false` if it is still winding down; it stays registered.
+    async fn reap_pending(&mut self) -> bool {
+        let p = lock(&self.pending).take();
+        let Some(mut p) = p else {
+            return true;
+        };
+        lock(&p.input).take();
+        let released = match p.done.as_mut() {
+            Some(d) => tokio::time::timeout(self.release_wait, d).await.is_ok(),
+            None => true,
+        };
+        if !released {
+            warn!("an abandoned connection attempt has not released the till yet");
+            *lock(&self.pending) = Some(p);
+        }
+        released
     }
 
     #[cfg(test)]
@@ -589,6 +648,13 @@ impl Backend for Headless {
         if target.is_empty() {
             return bad_args("connect needs a non-empty target");
         }
+        // An earlier attempt that was cancelled or timed out may still hold
+        // the till: stop it and wait for the release before starting anew.
+        if !self.reap_pending().await {
+            return session_err(
+                "the previous connection attempt has not released the till yet; try again in a few seconds",
+            );
+        }
         (self.audit)(
             &target,
             if force {
@@ -597,19 +663,30 @@ impl Backend for Headless {
                 "connect"
             },
         );
-        let session = match (self.connector)(target.clone(), force).await {
+        let mut session = match (self.connector)(target.clone(), force, self.pending.clone()).await
+        {
             Ok(s) => s,
             Err(reply) => {
                 if let Reply::Error { message, .. } = &reply {
                     (self.audit)(&target, &format!("connect failed: {message}"));
                 }
+                self.reap_pending().await;
                 return reply;
             }
         };
+        // Established: the session now owns its release signal.
+        if let Some(p) = lock(&self.pending).take() {
+            if session.done.is_none() {
+                session.done = p.done;
+            }
+        }
         self.touch();
         let mut text = format!("connected to {target}");
-        if force {
-            text.push_str(" with force (a logged-on user's session, if any, was taken over)");
+        if session.took_over {
+            (self.audit)(&target, "take-over of a logged-on user");
+            text.push_str("; took the till over from the logged-on user");
+        } else if force {
+            text.push_str(" with force (no logged-on user was reported)");
         }
         if session.view_only {
             text.push_str("; view only: the till grants no control, input will be ignored");
@@ -633,6 +710,16 @@ impl Backend for Headless {
         }
         let idle_s = self.idle_s();
         self.touch();
+        if let Command::Batch { steps } = &cmd {
+            if steps.iter().any(|s| {
+                matches!(
+                    s,
+                    Command::Screenshot { .. } | Command::Status | Command::Disconnect
+                )
+            }) {
+                return bad_args("screenshot/status/disconnect are not allowed in batch");
+            }
+        }
         let reaped = self.reap().await;
         let r = match cmd {
             Command::Status | Command::Disconnect => self.step(cmd, idle_s).await,
@@ -676,6 +763,10 @@ impl Backend for Headless {
     async fn shutdown(&mut self) {
         if let Some((t, released)) = self.close("disconnect (shutdown)").await {
             info!(target = %t, released, "disconnected on shutdown");
+        }
+        // A connect that was still starting (e.g. cancelled by a signal).
+        if !self.reap_pending().await {
+            warn!("shutdown: a starting session did not confirm the release in time");
         }
     }
 }
@@ -759,11 +850,14 @@ pub(crate) async fn await_first_frame(
 ) -> Result<Session, Reply> {
     let deadline = Instant::now() + timeout;
     loop {
-        if !force && host_in_use.load(Ordering::SeqCst) {
+        let in_use = host_in_use.load(Ordering::SeqCst);
+        if !force && in_use {
+            // The caller waits for the release (pending slot or `done`).
             session.stop_and_wait().await;
             return Err(err(ErrorCode::InUse, MSG_IN_USE));
         }
         if session.has_frame() {
+            session.took_over = force && in_use;
             return Ok(session);
         }
         if let Some(why) = session.shared.ended() {
@@ -774,6 +868,7 @@ pub(crate) async fn await_first_frame(
         }
         if Instant::now() >= deadline {
             // Connected, just slow to paint; connect says so.
+            session.took_over = force && in_use;
             return Ok(session);
         }
         tokio::time::sleep(POLL).await;
@@ -784,6 +879,7 @@ async fn real_connect(
     target: String,
     force: bool,
     rejected: Arc<Mutex<Option<String>>>,
+    slot: PendingSlot,
 ) -> Result<Session, Reply> {
     if let Some(user) = lock(&rejected).clone() {
         return Err(session_err(format!(
@@ -839,8 +935,11 @@ async fn real_connect(
             let _ = done_tx.send(());
         })
         .map_err(|e| session_err(format!("could not start the session thread: {e}")))?;
+    // Registered before the start-up await: if this future is dropped (signal)
+    // or times out, shutdown / the next connect stop it and wait for release.
+    let mut session = Session::start(input_tx, shared, done_rx, &slot);
 
-    let view_only = match tokio::time::timeout(STARTUP_TIMEOUT, ready_rx).await {
+    session.view_only = match tokio::time::timeout(STARTUP_TIMEOUT, ready_rx).await {
         Ok(Ok(Ok(view_only))) => view_only,
         Ok(Ok(Err(e))) => {
             if e.logon_rejected {
@@ -850,15 +949,15 @@ async fn real_connect(
         }
         Ok(Err(_)) => return Err(session_err("the session thread stopped unexpectedly")),
         Err(_) => {
-            // Dropping the sender lets the thread wind down and disconnect.
-            drop(input_tx);
+            // Closing input lets the thread wind down and disconnect; the
+            // backend reaps it through the pending slot.
+            session.stop();
             return Err(session_err(format!(
                 "connecting to {target} timed out after {} s",
                 STARTUP_TIMEOUT.as_secs()
             )));
         }
     };
-    let session = Session::new(input_tx, shared, Some(done_rx), view_only);
     await_first_frame(session, &host_in_use, force, FIRST_FRAME_WAIT).await
 }
 
@@ -874,6 +973,10 @@ async fn session_thread(
     ready: oneshot::Sender<Result<bool, StartError>>,
 ) {
     let user = creds.display_name();
+    // Core limitation: on this timeout the half-built SCCM session future is
+    // dropped without a disconnect (there is no session to disconnect yet);
+    // if the till had already granted it, it may report an existing session
+    // until the server times it out.
     let connected = tokio::time::timeout(
         CONNECT_TIMEOUT,
         SccmSession::connect_with(&target, Some(&creds)),
@@ -908,9 +1011,13 @@ async fn session_thread(
     let counter = Arc::new(AtomicU64::new(0));
     let mut ready = Some(ready);
     let res = async {
-        let (result, buf, share_id) =
-            rdp::connect_rdp_with(&mut session, DESK_W, DESK_H, &[], counter.clone(), &opts)
-                .await?;
+        // Bounded, so an abandoned start-up always reaches disconnect().
+        let (result, buf, share_id) = tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            rdp::connect_rdp_with(&mut session, DESK_W, DESK_H, &[], counter.clone(), &opts),
+        )
+        .await
+        .map_err(|_| CoreError::Protocol("RDP negotiation timed out".into()))??;
         info!("RDP active");
         if let Some(r) = ready.take() {
             let _ = r.send(Ok(grant == sccm_rc_core::Grant::ViewOnly));
@@ -994,7 +1101,7 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let audited: Audited = Arc::default();
         let (r2, c2, a2) = (rxs.clone(), calls.clone(), audited.clone());
-        let hl = Headless::with_connector(move |_t, _f| {
+        let hl = Headless::with_connector(move |_t, _f, _slot| {
             c2.fetch_add(1, Ordering::SeqCst);
             let (s, rx, _) = stub(w, h);
             lock(&r2).push(rx);
@@ -1151,7 +1258,7 @@ mod tests {
     async fn stale_screenshot_rejected_after_resize() {
         let (s, _rx, shared) = stub(1920, 1080);
         let slot = Arc::new(Mutex::new(Some(s)));
-        let mut hl = Headless::with_connector(move |_t, _f| {
+        let mut hl = Headless::with_connector(move |_t, _f, _slot| {
             let s = lock(&slot).take().unwrap();
             Box::pin(async move { Ok(s) })
         })
@@ -1306,7 +1413,7 @@ mod tests {
     async fn wait_sees_change() {
         let (s, _rx, shared) = stub(100, 100);
         let slot = Arc::new(Mutex::new(Some(s)));
-        let mut hl = Headless::with_connector(move |_t, _f| {
+        let mut hl = Headless::with_connector(move |_t, _f, _slot| {
             let s = lock(&slot).take().unwrap();
             Box::pin(async move { Ok(s) })
         })
@@ -1339,7 +1446,7 @@ mod tests {
     async fn ended_session_reports_not_connected() {
         let (s, _rx, shared) = stub(100, 100);
         let slot = Arc::new(Mutex::new(Some(s)));
-        let mut hl = Headless::with_connector(move |_t, _f| {
+        let mut hl = Headless::with_connector(move |_t, _f, _slot| {
             let s = lock(&slot).take().unwrap();
             Box::pin(async move { Ok(s) })
         })
@@ -1466,5 +1573,181 @@ mod tests {
         let px = |x: usize, y: usize| f.rgba[(y * 4 + x) * 4];
         assert_eq!((px(1, 1), px(0, 1), px(1, 0)), (9, 1, 1));
         assert_eq!(lock(&shared.watch).mark(), 2);
+    }
+    /// A fake session thread: once input closes (stop) it waits for `gate`,
+    /// then marks `released` and signals done, like the real thread after
+    /// `disconnect()`.
+    fn fake_thread(
+        slot: &PendingSlot,
+        gate: Option<oneshot::Receiver<()>>,
+    ) -> (Session, Arc<AtomicBool>) {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<FastPathInputEvent>>(8);
+        let (done_tx, done_rx) = oneshot::channel();
+        let released = Arc::new(AtomicBool::new(false));
+        let r2 = released.clone();
+        tokio::spawn(async move {
+            while rx.recv().await.is_some() {}
+            if let Some(g) = gate {
+                let _ = g.await;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            r2.store(true, Ordering::SeqCst);
+            let _ = done_tx.send(());
+        });
+        let s = Session::start(tx, Arc::new(Shared::default()), done_rx, slot);
+        (s, released)
+    }
+
+    #[tokio::test]
+    async fn shutdown_during_connect_waits_for_session() {
+        let released: Arc<Mutex<Option<Arc<AtomicBool>>>> = Arc::default();
+        let r2 = released.clone();
+        let mut hl = Headless::with_connector(move |_t, _f, slot| {
+            let r2 = r2.clone();
+            Box::pin(async move {
+                let (_s, rel) = fake_thread(&slot, None);
+                *lock(&r2) = Some(rel);
+                // Start-up never finishes (slow logon / RDP).
+                std::future::pending::<()>().await;
+                unreachable!()
+            })
+        })
+        .with_audit(|_, _| {});
+        // A signal cancels the pending connect, as select! in main does.
+        let r = tokio::time::timeout(Duration::from_millis(100), hl.connect("t", false)).await;
+        assert!(r.is_err(), "connect must still be pending");
+        let rel = lock(&released).clone().unwrap();
+        assert!(!rel.load(Ordering::SeqCst));
+        hl.shutdown().await;
+        assert!(
+            rel.load(Ordering::SeqCst),
+            "shutdown must stop the starting session and wait for its release"
+        );
+        assert!(lock(&hl.pending).is_none());
+    }
+
+    #[tokio::test]
+    async fn retry_after_startup_timeout_reaps_old_session() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let gate_tx: Arc<Mutex<Option<oneshot::Sender<()>>>> = Arc::default();
+        let first_released: Arc<Mutex<Option<Arc<AtomicBool>>>> = Arc::default();
+        let (c2, g2, f2) = (calls.clone(), gate_tx.clone(), first_released.clone());
+        let mut hl = Headless::with_connector(move |_t, _f, slot| {
+            let n = c2.fetch_add(1, Ordering::SeqCst);
+            let (g2, f2) = (g2.clone(), f2.clone());
+            Box::pin(async move {
+                if n == 0 {
+                    // Start-up timed out; the thread is still winding down
+                    // until the test opens the gate.
+                    let (tx, rx) = oneshot::channel();
+                    *lock(&g2) = Some(tx);
+                    let (_s, rel) = fake_thread(&slot, Some(rx));
+                    *lock(&f2) = Some(rel);
+                    Err(session_err("connecting to t timed out"))
+                } else {
+                    let (s, _rel) = fake_thread(&slot, None);
+                    Ok(s)
+                }
+            })
+        })
+        .with_audit(|_, _| {})
+        .with_release_wait(Duration::from_millis(200));
+        assert_eq!(
+            code(&hl.connect("t", false).await),
+            Some(ErrorCode::Session)
+        );
+        assert!(
+            lock(&hl.pending).is_some(),
+            "abandoned session stays pending"
+        );
+        // Still winding down: no second session is started on top of it.
+        match hl.connect("t", false).await {
+            Reply::Error { message, .. } => {
+                assert!(message.contains("previous connection attempt"), "{message}")
+            }
+            r => panic!("{r:?}"),
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // Once the old thread can finish, the retry reaps it first.
+        lock(&gate_tx).take().unwrap().send(()).unwrap();
+        assert!(is_ok(&hl.connect("t", false).await));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(lock(&first_released)
+            .as_ref()
+            .unwrap()
+            .load(Ordering::SeqCst));
+        // The new session owns its release signal; disconnect waits for it.
+        assert!(lock(&hl.pending).is_none());
+        assert!(hl.conn.as_ref().unwrap().session.done.is_some());
+    }
+
+    #[tokio::test]
+    async fn take_over_audited_as_fact() {
+        let (s, _rx, _shared) = stub(100, 100);
+        let flag = AtomicBool::new(true);
+        let s = await_first_frame(s, &flag, true, Duration::from_secs(1))
+            .await
+            .ok()
+            .unwrap();
+        assert!(s.took_over);
+        let slot = Arc::new(Mutex::new(Some(s)));
+        let audited: Audited = Arc::default();
+        let a2 = audited.clone();
+        let mut hl = Headless::with_connector(move |_t, _f, _slot| {
+            let s = lock(&slot).take().unwrap();
+            Box::pin(async move { Ok(s) })
+        })
+        .with_audit(move |t, a| lock(&a2).push(format!("{t}: {a}")));
+        match hl.connect("till-01", true).await {
+            Reply::Ok { text } => assert!(text.contains("took the till over"), "{text}"),
+            r => panic!("{r:?}"),
+        }
+        let a = lock(&audited).join("\n");
+        assert!(a.contains("till-01: connect (force"), "{a}");
+        assert!(a.contains("till-01: take-over of a logged-on user"), "{a}");
+        // Force without a logged-on user: no take-over claimed.
+        let (s, _rx, _shared) = stub(100, 100);
+        let s = await_first_frame(s, &AtomicBool::new(false), true, Duration::from_secs(1))
+            .await
+            .ok()
+            .unwrap();
+        assert!(!s.took_over);
+    }
+
+    #[tokio::test]
+    async fn batch_rejects_screenshot_status_disconnect() {
+        let (mut hl, rxs, _a, _c) = backend(100, 100);
+        hl.connect("t", false).await;
+        for bad in [
+            Command::Screenshot {
+                region: None,
+                max_width: None,
+            },
+            Command::Status,
+            Command::Disconnect,
+        ] {
+            let r = hl
+                .run(Command::Batch {
+                    steps: vec![
+                        Command::Key {
+                            combo: "Enter".into(),
+                        },
+                        bad,
+                    ],
+                })
+                .await;
+            match r {
+                Reply::Error { code, message, .. } => {
+                    assert_eq!(code, ErrorCode::BadArgs);
+                    assert_eq!(
+                        message,
+                        "screenshot/status/disconnect are not allowed in batch"
+                    );
+                }
+                r => panic!("{r:?}"),
+            }
+        }
+        assert!(drain(&rxs).is_empty(), "nothing runs before the check");
+        assert!(hl.conn.as_ref().unwrap().shot.is_none());
     }
 }

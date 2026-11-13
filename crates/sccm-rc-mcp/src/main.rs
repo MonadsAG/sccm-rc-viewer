@@ -49,10 +49,21 @@ fn main() -> anyhow::Result<()> {
             std::env::set_var(k, v);
         }
     }
-    tokio::runtime::Builder::new_multi_thread()
+    let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .build()?
-        .block_on(run(args.mode))
+        .build()?;
+    let res = rt.block_on(run(args.mode));
+    // run() has already shut the backend down (till released or the 3 s
+    // wait over). Exit now: dropping the runtime would wait for tokio's
+    // blocking stdin read, which never ends while stdin stays open (signal).
+    let code = match &res {
+        Ok(()) => 0,
+        Err(e) => {
+            tracing::error!(error = %e, "sccm-rc-mcp failed");
+            1
+        }
+    };
+    std::process::exit(code)
 }
 
 async fn run(mode: Mode) -> anyhow::Result<()> {
