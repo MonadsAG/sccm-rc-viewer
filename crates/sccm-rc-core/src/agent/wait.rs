@@ -36,12 +36,9 @@ impl FrameWatch {
         self.count > mark
     }
 
-    /// Time since the last update (`Duration::MAX` if none ever arrived).
-    pub fn quiet_for(&self, now: Instant) -> Duration {
-        match self.last {
-            Some(t) => now.saturating_duration_since(t),
-            None => Duration::MAX,
-        }
+    /// Time since the last update (`None` if none ever arrived).
+    pub fn quiet_for(&self, now: Instant) -> Option<Duration> {
+        self.last.map(|t| now.saturating_duration_since(t))
     }
 
     /// `None` means keep waiting.
@@ -55,7 +52,13 @@ impl FrameWatch {
         now: Instant,
     ) -> Option<WaitResult> {
         let changed = self.changed_since(mark);
-        let quiet = stable_ms.map(|ms| self.quiet_for(now) >= Duration::from_millis(ms));
+        // Quiet is measured from max(last update, wait start), and only
+        // counts once at least one frame has ever arrived.
+        let quiet = stable_ms.map(|ms| {
+            self.last.is_some_and(|last| {
+                now.saturating_duration_since(last.max(started)) >= Duration::from_millis(ms)
+            })
+        });
         let done = match (want_change, quiet) {
             (true, Some(q)) if changed && q => Some(WaitResult::Stable),
             (true, None) if changed => Some(WaitResult::Changed),
@@ -98,7 +101,7 @@ mod tests {
         let mark = w.mark();
         let to = Duration::from_secs(5);
         w.on_update(ms(t0, 100));
-        assert_eq!(w.quiet_for(ms(t0, 300)), Duration::from_millis(200));
+        assert_eq!(w.quiet_for(ms(t0, 300)), Some(Duration::from_millis(200)));
         assert_eq!(
             w.evaluate(mark, false, Some(500), t0, to, ms(t0, 300)),
             None
@@ -151,11 +154,47 @@ mod tests {
     #[test]
     fn stable_only_without_change_requirement() {
         let t0 = Instant::now();
-        let w = FrameWatch::new();
+        let mut w = FrameWatch::new();
         let to = Duration::from_secs(5);
-        // No update ever: already stable.
+        w.on_update(ms(t0, 0));
         assert_eq!(
-            w.evaluate(w.mark(), false, Some(300), t0, to, ms(t0, 0)),
+            w.evaluate(w.mark(), false, Some(300), t0, to, ms(t0, 100)),
+            None
+        );
+        assert_eq!(
+            w.evaluate(w.mark(), false, Some(300), t0, to, ms(t0, 300)),
+            Some(WaitResult::Stable)
+        );
+    }
+
+    #[test]
+    fn never_stable_before_first_frame() {
+        let t0 = Instant::now();
+        let w = FrameWatch::new();
+        let to = Duration::from_secs(2);
+        assert_eq!(
+            w.evaluate(w.mark(), false, Some(500), t0, to, ms(t0, 1000)),
+            None
+        );
+        assert_eq!(
+            w.evaluate(w.mark(), false, Some(500), t0, to, ms(t0, 2000)),
+            Some(WaitResult::Timeout)
+        );
+    }
+
+    #[test]
+    fn stable_waits_at_least_stable_ms_after_start() {
+        let base = Instant::now();
+        let mut w = FrameWatch::new();
+        w.on_update(base);
+        let started = ms(base, 10_000);
+        let to = Duration::from_secs(5);
+        assert_eq!(
+            w.evaluate(w.mark(), false, Some(500), started, to, ms(started, 100)),
+            None
+        );
+        assert_eq!(
+            w.evaluate(w.mark(), false, Some(500), started, to, ms(started, 500)),
             Some(WaitResult::Stable)
         );
     }

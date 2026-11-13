@@ -1,7 +1,7 @@
 //! Screenshot space: what the script client sees, and how points in the
 //! delivered image map back to desktop pixels.
 
-use image::{imageops::FilterType, ImageBuffer, ImageEncoder, Rgba};
+use image::{imageops::FilterType, ImageBuffer, ImageEncoder, Rgb};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -59,8 +59,8 @@ impl ShotSpace {
         }
         let dx = self.crop.x as f64 + x * (self.crop.w as f64 / iw);
         let dy = self.crop.y as f64 + y * (self.crop.h as f64 / ih);
-        let max_x = (self.crop.x + self.crop.w - 1) as f64;
-        let max_y = (self.crop.y + self.crop.h - 1) as f64;
+        let max_x = (self.crop.x as u32 + (self.crop.w as u32).saturating_sub(1)) as f64;
+        let max_y = (self.crop.y as u32 + (self.crop.h as u32).saturating_sub(1)) as f64;
         Ok((dx.round().min(max_x) as u16, dy.round().min(max_y) as u16))
     }
 }
@@ -113,13 +113,15 @@ pub fn take(
     }
 
     let stride = desk_w as usize * 4;
-    let row_len = crop.w as usize * 4;
-    let mut buf = Vec::with_capacity(row_len * crop.h as usize);
-    for row in crop.y as usize..(crop.y + crop.h) as usize {
+    // Alpha is dropped: live frames may carry alpha 0, and the PNG must be opaque.
+    let mut buf = Vec::with_capacity(crop.w as usize * crop.h as usize * 3);
+    for row in crop.y as usize..crop.y as usize + crop.h as usize {
         let start = row * stride + crop.x as usize * 4;
-        buf.extend_from_slice(&rgba[start..start + row_len]);
+        for px in rgba[start..start + crop.w as usize * 4].chunks_exact(4) {
+            buf.extend_from_slice(&px[..3]);
+        }
     }
-    let cropped: ImageBuffer<Rgba<u8>, Vec<u8>> =
+    let cropped: ImageBuffer<Rgb<u8>, Vec<u8>> =
         ImageBuffer::from_raw(crop.w as u32, crop.h as u32, buf).ok_or(ShotError::BadFrame)?;
 
     let max_w = max_width.max(1);
@@ -133,7 +135,7 @@ pub fn take(
 
     let mut png = Vec::new();
     image::codecs::png::PngEncoder::new(&mut png)
-        .write_image(&pixels, img_w, img_h, image::ExtendedColorType::Rgba8)
+        .write_image(&pixels, img_w, img_h, image::ExtendedColorType::Rgb8)
         .map_err(|e| ShotError::Encode(e.to_string()))?;
 
     Ok((
@@ -232,6 +234,15 @@ mod tests {
             take(&frame(100, 100), 100, 100, Some(r), 1280).unwrap_err(),
             ShotError::BadRegion
         );
+    }
+
+    #[test]
+    fn png_is_opaque() {
+        let rgba = vec![0u8; 8 * 8 * 4]; // alpha 0 everywhere
+        let (png, _) = take(&rgba, 8, 8, None, 1280).unwrap();
+        let img = image::load_from_memory(&png).unwrap();
+        assert!(!img.color().has_alpha());
+        assert!(img.to_rgba8().pixels().all(|p| p.0[3] == 255));
     }
 
     #[test]
