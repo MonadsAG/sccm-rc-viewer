@@ -3,3 +3,4 @@
 pub mod keys;
 pub mod text;
 pub mod shot;
+pub mod wait;
