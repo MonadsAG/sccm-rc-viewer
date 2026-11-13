@@ -13,24 +13,26 @@ pub trait Backend {
     async fn shutdown(&mut self);
 }
 
-/// Placeholder until the real backends exist.
-pub struct Unimplemented;
+/// Live mode on a platform without Unix sockets.
+#[allow(dead_code)]
+pub struct Unavailable;
 
 #[async_trait]
-impl Backend for Unimplemented {
+impl Backend for Unavailable {
     async fn connect(&mut self, _target: &str, _force: bool) -> Reply {
-        not_implemented()
+        unavailable()
     }
     async fn run(&mut self, _cmd: Command) -> Reply {
-        not_implemented()
+        unavailable()
     }
     async fn shutdown(&mut self) {}
 }
 
-fn not_implemented() -> Reply {
+#[allow(dead_code)]
+fn unavailable() -> Reply {
     Reply::Error {
-        code: ErrorCode::Session,
-        message: "backend not implemented yet".into(),
+        code: ErrorCode::ControlDisabled,
+        message: "live mode is only available on macOS/Linux".into(),
         completed_steps: None,
     }
 }

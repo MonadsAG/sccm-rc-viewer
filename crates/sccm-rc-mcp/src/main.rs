@@ -1,6 +1,8 @@
 mod backend;
 mod creds;
 mod headless;
+#[cfg(unix)]
+mod live;
 mod mcp;
 mod tools;
 
@@ -66,6 +68,16 @@ fn main() -> anyhow::Result<()> {
     std::process::exit(code)
 }
 
+#[cfg(unix)]
+fn live_backend() -> Box<dyn backend::Backend + Send> {
+    Box::new(live::Live::new())
+}
+
+#[cfg(not(unix))]
+fn live_backend() -> Box<dyn backend::Backend + Send> {
+    Box::new(backend::Unavailable)
+}
+
 async fn run(mode: Mode) -> anyhow::Result<()> {
     tracing::info!(
         mode = match mode {
@@ -76,8 +88,7 @@ async fn run(mode: Mode) -> anyhow::Result<()> {
     );
     let backend: Box<dyn backend::Backend + Send> = match mode {
         Mode::Headless => Box::new(headless::Headless::new()),
-        // Placeholder until the live backend exists.
-        Mode::Live => Box::new(backend::Unimplemented),
+        Mode::Live => live_backend(),
     };
     let mut server = mcp::Server::new(backend);
     // stdin EOF ends serve(), which shuts the backend down itself. On a
