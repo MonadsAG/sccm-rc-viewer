@@ -3775,9 +3775,11 @@ version = "0.9.13"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64",
  "clap",
  "sccm-rc-core",
  "serde_json",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
  "tracing-subscriber",

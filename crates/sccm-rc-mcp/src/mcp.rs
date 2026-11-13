@@ -28,6 +28,12 @@ impl Server {
         r
     }
 
+    /// Shut the backend down (e.g. on a signal, when `serve` was cancelled).
+    /// Safe to call more than once.
+    pub async fn shutdown(&mut self) {
+        self.backend.shutdown().await;
+    }
+
     async fn run_loop<R, W>(&mut self, input: &mut R, output: &mut W) -> Result<()>
     where
         R: AsyncBufRead + Unpin,
