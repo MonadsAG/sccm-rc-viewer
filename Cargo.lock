@@ -3734,6 +3734,7 @@ dependencies = [
  "sccm-rc-orders",
  "sccm-rc-protocol",
  "security-framework",
+ "serde",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
