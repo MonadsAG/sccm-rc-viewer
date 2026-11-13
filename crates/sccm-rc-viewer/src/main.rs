@@ -374,9 +374,10 @@ enum UserEvent {
     /// From the native macOS chrome (menu bar / title-bar toolbar).
     Native(NativeEvent),
     /// A request from the control socket ("Allow control by Claude"), with
-    /// where to send its one reply.
-    Control(Command, std::sync::mpsc::Sender<Reply>),
-    /// The control ticker: run the next due piece of a Claude command.
+    /// where to send its one reply and a flag set once its client is gone.
+    Control(Command, std::sync::mpsc::Sender<Reply>, Arc<AtomicBool>),
+    /// The control ticker (run the next due piece of a Claude command), or
+    /// the socket: a client left while its command runs.
     ControlTick,
 }
 
@@ -1430,7 +1431,7 @@ struct App {
     control: Option<(control::Server, control::Ticker)>,
     arbiter: control::Arbiter,
     /// The Claude command running now and where its reply goes.
-    control_job: Option<(control::Job, std::sync::mpsc::Sender<Reply>)>,
+    control_job: Option<ControlJob>,
     /// Geometry of the last screenshot Claude got (maps its coordinates).
     control_shot: Option<ShotSpace>,
     /// When a Claude command last ran, and whether the user took over from
@@ -1444,6 +1445,13 @@ struct App {
     /// `control_poll_user` (input handlers only have `&self`).
     user_input_at: std::cell::Cell<Option<std::time::Instant>>,
 }
+
+/// A running Claude command, where its reply goes, and its "client gone" flag.
+type ControlJob = (
+    control::Job,
+    std::sync::mpsc::Sender<Reply>,
+    Arc<AtomicBool>,
+);
 
 /// How long the subtitle says "Controlled by Claude" after a command.
 const CONTROL_SHOWN: std::time::Duration = std::time::Duration::from_secs(5);
@@ -1879,7 +1887,7 @@ impl App {
 
     /// Stop the running Claude command, if any, and answer it with `code`.
     fn control_abort(&mut self, code: ErrorCode, message: &str) {
-        let Some((mut job, reply)) = self.control_job.take() else {
+        let Some((mut job, reply, _)) = self.control_job.take() else {
             return;
         };
         let mut t = LiveTarget {
@@ -1895,10 +1903,23 @@ impl App {
         self.arbiter.end_command();
     }
 
+    /// The client of the running Claude command disconnected: abort it, so
+    /// nothing keeps typing for nobody (keys and buttons released).
+    fn control_check_gone(&mut self) {
+        let gone = self
+            .control_job
+            .as_ref()
+            .is_some_and(|(_, _, gone)| gone.load(Ordering::SeqCst));
+        if gone {
+            info!("Claude client gone during a command: aborting it");
+            self.control_abort(ErrorCode::Session, control::MSG_CLIENT_GONE);
+        }
+    }
+
     /// Run the due part of the Claude command; reply once it is done.
     fn control_run(&mut self) {
         let now = std::time::Instant::now();
-        let Some((job, _)) = self.control_job.as_mut() else {
+        let Some((job, _, _)) = self.control_job.as_mut() else {
             return;
         };
         let mut t = LiveTarget {
@@ -1916,7 +1937,7 @@ impl App {
                 }
             }
             control::Poll::Done(r) => {
-                if let Some((_, reply)) = self.control_job.take() {
+                if let Some((_, reply, _)) = self.control_job.take() {
                     let _ = reply.send(r);
                 }
                 self.arbiter.end_command();
@@ -1927,9 +1948,17 @@ impl App {
 
     /// A request from the control socket. Commands run one at a time on
     /// this thread; long ones are paced by the ticker.
-    fn control_command(&mut self, cmd: Command, reply: std::sync::mpsc::Sender<Reply>) {
+    fn control_command(
+        &mut self,
+        cmd: Command,
+        reply: std::sync::mpsc::Sender<Reply>,
+        gone: Arc<AtomicBool>,
+    ) {
         let now = std::time::Instant::now();
         self.control_poll_user();
+        if gone.load(Ordering::SeqCst) {
+            return; // the client left before its command came up
+        }
         if self.control.is_none() {
             let _ = reply.send(exec::err(
                 ErrorCode::ControlDisabled,
@@ -1960,19 +1989,23 @@ impl App {
             control::Target::desk_size(&t)
         };
         let r = match cmd {
-            Command::Disconnect => exec::ok("control handed back"),
+            // As headless: not connected is a status, not an error.
+            Command::Status => control::status_reply(
+                has_session.then_some((self.host.as_str(), desk_w, desk_h)),
+                idle_s,
+            ),
+            // Only hands control back: the viewer's session stays.
+            Command::Disconnect => {
+                if has_session {
+                    audit::log_agent(&self.host, "disconnect (control handed back)");
+                }
+                self.control_shot = None;
+                exec::ok("control handed back; the viewer stays connected")
+            }
             _ if !has_session => exec::err(
                 ErrorCode::NotConnected,
                 "the viewer is not connected to a till; connect in the viewer first",
             ),
-            Command::Status => Reply::Status {
-                connected: true,
-                target: Some(self.host.clone()),
-                desk_w,
-                desk_h,
-                mode: "live".into(),
-                idle_s,
-            },
             _ if !self.arbiter.accepts_commands(now) => {
                 exec::err(ErrorCode::UserTookOver, control::MSG_COOLDOWN)
             }
@@ -1981,7 +2014,7 @@ impl App {
             ref c if self.view_only && exec::sends_input(c) => exec::view_only(),
             cmd => {
                 self.arbiter.begin_command();
-                self.control_job = Some((control::Job::new(cmd), reply));
+                self.control_job = Some((control::Job::new(cmd), reply, gone));
                 self.control_seen = Some((now, false));
                 self.control_run();
                 return;
@@ -2064,6 +2097,9 @@ impl App {
     /// Signal the session thread to stop and disconnect gracefully: clear
     /// `running` and drop the input sender (unblocks run_active_session).
     fn begin_shutdown(&mut self) {
+        // A running Claude command must never go on on another till: abort
+        // it (releases on this session, while its input channel is open).
+        self.control_abort(ErrorCode::NotConnected, control::MSG_LEFT_TILL);
         self.release_held_buttons(u8::MAX);
         self.running.store(false, Ordering::Relaxed);
         self.input_tx = None;
@@ -2530,9 +2566,10 @@ impl ApplicationHandler<UserEvent> for App {
                     w.request_redraw();
                 }
             }
-            UserEvent::Control(cmd, reply) => self.control_command(cmd, reply),
+            UserEvent::Control(cmd, reply, gone) => self.control_command(cmd, reply, gone),
             UserEvent::ControlTick => {
                 self.control_poll_user();
+                self.control_check_gone();
                 self.control_run();
             }
             UserEvent::Closed(reason) => {

@@ -49,7 +49,12 @@ pub fn list() -> Vec<Value> {
             }),
             &["target"],
         ),
-        tool("disconnect", "Disconnect from the till.", json!({}), &[]),
+        tool(
+            "disconnect",
+            "Disconnect from the till (headless mode). In live mode only hands control back; the viewer stays connected.",
+            json!({}),
+            &[],
+        ),
         tool(
             "screenshot",
             "Capture the till desktop as a PNG, scaled down to max_width (default 1280). Coordinates for click, move and scroll refer to the most recent screenshot's image space.",

@@ -29,6 +29,32 @@ pub const MSG_TOOK_OVER: &str =
     "the user took over (local keyboard or mouse input); command aborted";
 pub const MSG_COOLDOWN: &str =
     "the user is working in the viewer; try again when they have stopped for 2 seconds";
+pub const MSG_CLIENT_GONE: &str = "the Claude client disconnected; command aborted";
+pub const MSG_LEFT_TILL: &str =
+    "the viewer left the till (disconnect or host switch); command aborted";
+
+/// The reply to `status`: the viewer's session, or not connected (mode
+/// "live" either way, as headless answers `connected: false`).
+pub fn status_reply(session: Option<(&str, u16, u16)>, idle_s: u64) -> Reply {
+    match session {
+        Some((host, desk_w, desk_h)) => Reply::Status {
+            connected: true,
+            target: Some(host.to_string()),
+            desk_w,
+            desk_h,
+            mode: "live".into(),
+            idle_s,
+        },
+        None => Reply::Status {
+            connected: false,
+            target: None,
+            desk_w: 0,
+            desk_h: 0,
+            mode: "live".into(),
+            idle_s,
+        },
+    }
+}
 
 /// Who has the remote session's input: pure state, all `Instant`s injected.
 #[derive(Debug, Default)]
@@ -388,7 +414,7 @@ pub fn parse_request(line: &[u8]) -> Option<Result<Command, Reply>> {
 
 #[cfg(unix)]
 mod unix {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, VecDeque};
     use std::io::{self, BufRead, BufReader, Read, Write};
     use std::os::unix::fs::{FileTypeExt, PermissionsExt};
     use std::os::unix::net::{UnixListener, UnixStream};
@@ -407,8 +433,16 @@ mod unix {
     /// Longest accepted request line (a long type_text fits easily).
     const MAX_LINE: usize = 1 << 20;
     const ACCEPT_POLL: Duration = Duration::from_millis(50);
+    /// How often a connection waiting for its reply checks that the client
+    /// is still there.
+    const GONE_POLL: Duration = Duration::from_millis(50);
 
-    type Dispatch = Arc<dyn Fn(Command, mpsc::Sender<Reply>) -> bool + Send + Sync>;
+    /// Hands a command, its reply channel and its "client gone" flag to the
+    /// App; false if nobody will answer.
+    type Dispatch =
+        Arc<dyn Fn(Command, mpsc::Sender<Reply>, Arc<AtomicBool>) -> bool + Send + Sync>;
+    /// Wakes the App after a "client gone" flag was set.
+    type Wake = Arc<dyn Fn() + Send + Sync>;
     type Conns = Arc<Mutex<HashMap<u64, UnixStream>>>;
 
     /// The listening control socket. Dropping it stops it.
@@ -421,23 +455,37 @@ mod unix {
 
     impl Server {
         /// Listen on `data_dir/control.sock`; each request goes to the App
-        /// as `UserEvent::Control`.
+        /// as `UserEvent::Control`. A client that disconnects while its
+        /// command runs sets the command's flag and wakes the App
+        /// (`UserEvent::ControlTick`), which aborts it.
         pub fn start(data_dir: &Path, proxy: EventLoopProxy<UserEvent>) -> io::Result<Server> {
+            let wake = Mutex::new(proxy.clone());
             let proxy = Mutex::new(proxy);
-            Self::start_with(data_dir, move |cmd, reply| {
-                proxy
-                    .lock()
-                    .unwrap()
-                    .send_event(UserEvent::Control(cmd, reply))
-                    .is_ok()
-            })
+            Self::start_with(
+                data_dir,
+                move |cmd, reply, gone| {
+                    proxy
+                        .lock()
+                        .unwrap()
+                        .send_event(UserEvent::Control(cmd, reply, gone))
+                        .is_ok()
+                },
+                move || {
+                    let _ = wake.lock().unwrap().send_event(UserEvent::ControlTick);
+                },
+            )
         }
 
-        /// `start` with any App side: `dispatch` hands a command and its
-        /// reply channel over and returns false if nobody will answer.
+        /// `start` with any App side: `dispatch` hands a command, its reply
+        /// channel and its "client gone" flag over and returns false if
+        /// nobody will answer; `wake` is called after a flag was set.
         pub fn start_with(
             data_dir: &Path,
-            dispatch: impl Fn(Command, mpsc::Sender<Reply>) -> bool + Send + Sync + 'static,
+            dispatch: impl Fn(Command, mpsc::Sender<Reply>, Arc<AtomicBool>) -> bool
+                + Send
+                + Sync
+                + 'static,
+            wake: impl Fn() + Send + Sync + 'static,
         ) -> io::Result<Server> {
             let path = data_dir.join(super::SOCKET_NAME);
             if let Ok(meta) = std::fs::symlink_metadata(&path) {
@@ -465,11 +513,12 @@ mod unix {
             let stop = Arc::new(AtomicBool::new(false));
             let conns: Conns = Arc::default();
             let dispatch: Dispatch = Arc::new(dispatch);
+            let wake: Wake = Arc::new(wake);
             let accept = {
                 let (stop, conns) = (stop.clone(), conns.clone());
                 std::thread::Builder::new()
                     .name("control-accept".into())
-                    .spawn(move || accept_loop(listener, stop, conns, dispatch))?
+                    .spawn(move || accept_loop(listener, stop, conns, dispatch, wake))?
             };
             info!(path = %path.display(), "control socket listening");
             Ok(Server {
@@ -502,7 +551,13 @@ mod unix {
         }
     }
 
-    fn accept_loop(listener: UnixListener, stop: Arc<AtomicBool>, conns: Conns, d: Dispatch) {
+    fn accept_loop(
+        listener: UnixListener,
+        stop: Arc<AtomicBool>,
+        conns: Conns,
+        d: Dispatch,
+        wake: Wake,
+    ) {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         while !stop.load(Ordering::SeqCst) {
             match listener.accept() {
@@ -519,11 +574,11 @@ mod unix {
                         conns.lock().unwrap().remove(&id);
                         break;
                     }
-                    let (conns, d) = (conns.clone(), d.clone());
+                    let (conns, d, wake) = (conns.clone(), d.clone(), wake.clone());
                     let _ = std::thread::Builder::new()
                         .name("control-conn".into())
                         .spawn(move || {
-                            serve(s, &d);
+                            serve(s, &d, &wake);
                             conns.lock().unwrap().remove(&id);
                         });
                     debug!(id, "control client connected");
@@ -537,36 +592,71 @@ mod unix {
         }
     }
 
-    fn serve(stream: UnixStream, d: &Dispatch) {
-        let Ok(read) = stream.try_clone() else { return };
+    /// One request line as the reader thread saw it.
+    enum Line {
+        Data(Vec<u8>),
+        TooLong,
+        /// The client closed the connection (or reading failed).
+        Eof,
+    }
+
+    /// Reads request lines on its own thread, so a connection waiting for
+    /// a reply still notices the client going away.
+    fn read_lines(read: UnixStream, tx: mpsc::Sender<Line>) {
         let mut reader = BufReader::new(read);
-        let mut w = stream;
         loop {
             let mut buf = Vec::new();
-            match (&mut reader)
+            let line = match (&mut reader)
                 .take(MAX_LINE as u64 + 1)
                 .read_until(b'\n', &mut buf)
             {
-                Ok(0) | Err(_) => return,
-                Ok(_) => {}
+                Ok(0) | Err(_) => Line::Eof,
+                Ok(_) if buf.len() > MAX_LINE => Line::TooLong,
+                Ok(_) => Line::Data(buf),
+            };
+            let last = !matches!(line, Line::Data(_));
+            if tx.send(line).is_err() || last {
+                return;
             }
-            let too_long = buf.len() > MAX_LINE;
-            let reply = if too_long {
-                Some(bad_args("request line too long"))
-            } else {
-                super::parse_request(&buf).map(|r| match r {
-                    Ok(cmd) => {
-                        debug!(cmd = super::cmd_name(&cmd), "control command");
-                        let (tx, rx) = mpsc::channel();
-                        if !d(cmd, tx) {
-                            session_err("the viewer is shutting down")
-                        } else {
-                            rx.recv()
-                                .unwrap_or_else(|_| session_err("the viewer dropped the command"))
+        }
+    }
+
+    fn serve(stream: UnixStream, d: &Dispatch, wake: &Wake) {
+        let Ok(read) = stream.try_clone() else { return };
+        let (tx, lines) = mpsc::channel();
+        if std::thread::Builder::new()
+            .name("control-read".into())
+            .spawn(move || read_lines(read, tx))
+            .is_err()
+        {
+            return;
+        }
+        let mut pending: VecDeque<Line> = VecDeque::new();
+        let mut w = stream;
+        loop {
+            let line = match pending.pop_front() {
+                Some(l) => l,
+                None => lines.recv().unwrap_or(Line::Eof),
+            };
+            let (reply, last) = match line {
+                Line::Eof => return,
+                Line::TooLong => (Some(bad_args("request line too long")), true),
+                Line::Data(buf) => (
+                    super::parse_request(&buf).map(|r| match r {
+                        Ok(cmd) => {
+                            debug!(cmd = super::cmd_name(&cmd), "control command");
+                            let (tx, rx) = mpsc::channel();
+                            let gone = Arc::new(AtomicBool::new(false));
+                            if !d(cmd, tx, gone.clone()) {
+                                session_err("the viewer is shutting down")
+                            } else {
+                                await_reply(&rx, &lines, &mut pending, &gone, wake)
+                            }
                         }
-                    }
-                    Err(e) => e,
-                })
+                        Err(e) => e,
+                    }),
+                    false,
+                ),
             };
             if let Some(r) = reply {
                 let mut line = serde_json::to_vec(&r).unwrap_or_default();
@@ -575,8 +665,48 @@ mod unix {
                     return;
                 }
             }
-            if too_long {
+            if last {
                 return;
+            }
+        }
+    }
+
+    /// Wait for the App's reply. If the client disconnects meanwhile, set
+    /// `gone` and wake the App so it aborts the command (keys and buttons
+    /// released); its reply then ends the wait. Lines the client sent
+    /// meanwhile are kept in `pending`.
+    fn await_reply(
+        rx: &mpsc::Receiver<Reply>,
+        lines: &mpsc::Receiver<Line>,
+        pending: &mut VecDeque<Line>,
+        gone: &AtomicBool,
+        wake: &Wake,
+    ) -> Reply {
+        loop {
+            match rx.recv_timeout(GONE_POLL) {
+                Ok(r) => return r,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return session_err("the viewer dropped the command")
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+            if gone.load(Ordering::SeqCst) {
+                continue;
+            }
+            loop {
+                let l = match lines.try_recv() {
+                    Ok(l) => l,
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => Line::Eof,
+                };
+                let eof = matches!(l, Line::Eof);
+                pending.push_back(l);
+                if eof {
+                    debug!("control client gone while its command runs");
+                    gone.store(true, Ordering::SeqCst);
+                    wake();
+                    break;
+                }
             }
         }
     }
@@ -1056,6 +1186,35 @@ mod tests {
     }
 
     #[test]
+    fn status_without_a_session_is_not_connected_live() {
+        assert_eq!(
+            status_reply(None, 4),
+            Reply::Status {
+                connected: false,
+                target: None,
+                desk_w: 0,
+                desk_h: 0,
+                mode: "live".into(),
+                idle_s: 4,
+            }
+        );
+        match status_reply(Some(("till", 800, 600)), 0) {
+            Reply::Status {
+                connected,
+                target,
+                desk_w,
+                mode,
+                ..
+            } => {
+                assert!(connected);
+                assert_eq!(target.as_deref(), Some("till"));
+                assert_eq!((desk_w, mode.as_str()), (800, "live"));
+            }
+            r => panic!("{r:?}"),
+        }
+    }
+
+    #[test]
     fn ticker_fires_after_the_deadline() {
         let (tx, rx) = mpsc::channel();
         let t = Ticker::new(move || {
@@ -1123,7 +1282,12 @@ mod socket_tests {
             }
         });
         let tx = std::sync::Mutex::new(tx);
-        Server::start_with(dir, move |c, r| tx.lock().unwrap().send((c, r)).is_ok()).unwrap()
+        Server::start_with(
+            dir,
+            move |c, r, _gone| tx.lock().unwrap().send((c, r)).is_ok(),
+            || {},
+        )
+        .unwrap()
     }
 
     fn ask(s: &mut UnixStream, line: &str) -> Reply {
@@ -1191,13 +1355,52 @@ mod socket_tests {
     fn second_server_refuses_a_live_socket() {
         let dir = temp_dir("dup");
         let mut server = fake_app(&dir);
-        assert!(Server::start_with(&dir, |_, _| false).is_err());
+        assert!(Server::start_with(&dir, |_, _, _| false, || {}).is_err());
         server.stop();
         // A stale socket file (nobody listening) is replaced.
         drop(std::os::unix::net::UnixListener::bind(dir.join(SOCKET_NAME)).unwrap());
         assert!(dir.join(SOCKET_NAME).exists());
         let mut again = fake_app(&dir);
         again.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn client_leaving_mid_command_flags_it_and_wakes_the_app() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let dir = temp_dir("gone");
+        type Held = (mpsc::Sender<Reply>, Arc<AtomicBool>);
+        let (held_tx, held_rx) = mpsc::channel::<Held>();
+        let held_tx = std::sync::Mutex::new(held_tx);
+        let woken = Arc::new(AtomicUsize::new(0));
+        let w2 = woken.clone();
+        // An App that keeps the command running (never answers by itself).
+        let mut server = Server::start_with(
+            &dir,
+            move |_c, r, gone| held_tx.lock().unwrap().send((r, gone)).is_ok(),
+            move || {
+                w2.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .unwrap();
+        let mut s = UnixStream::connect(dir.join(SOCKET_NAME)).unwrap();
+        s.write_all(b"{\"cmd\":\"key\",\"combo\":\"enter\"}\n")
+            .unwrap();
+        let (reply, gone) = held_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        std::thread::sleep(Duration::from_millis(120));
+        assert!(!gone.load(Ordering::SeqCst), "client still there");
+        assert_eq!(woken.load(Ordering::SeqCst), 0);
+        drop(s);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !gone.load(Ordering::SeqCst) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(gone.load(Ordering::SeqCst), "the command is flagged");
+        assert_eq!(woken.load(Ordering::SeqCst), 1, "the App is woken once");
+        // The App's abort reply ends the connection's wait.
+        let _ = reply.send(exec::err(ErrorCode::Session, MSG_CLIENT_GONE));
+        server.stop();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
