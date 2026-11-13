@@ -428,13 +428,15 @@ impl GpuRenderer {
         );
     }
 
-    /// Render one frame: an optional desktop quad (drawn below `bar_h`) and an
+    /// Render one frame: an optional desktop quad (drawn in `desktop_rect`) and an
     /// optional overlay quad (toolbar strip or full-window splash).
     pub fn render(
         &mut self,
         win_w: u32,
         win_h: u32,
-        bar_h: u32,
+        // Window-space rect (x, y, w, h) the desktop quad fills; the rest of the
+        // frame keeps the clear colour (letterbox bars).
+        desktop_rect: (u32, u32, u32, u32),
         desktop: Option<(u32, u32, &[u8], DesktopUpload)>,
         overlay: Option<(u32, u32, &[u8], OverlayDest)>,
         cursor: Option<(u32, u32, &[u8], i32, i32)>,
@@ -447,8 +449,9 @@ impl GpuRenderer {
             self.resize(win_w, win_h);
         }
         let top_ndc = |px: u32| 1.0 - 2.0 * (px as f32) / (win_h as f32);
+        let left_ndc = |px: u32| 2.0 * (px as f32) / (win_w as f32) - 1.0;
 
-        // Desktop: fills y in [bar_h, win_h].
+        // Desktop: fills `desktop_rect`.
         let mut draw_desktop = false;
         if let Some((fb_w, fb_h, rgba, upload)) = desktop {
             if fb_w > 0 && fb_h > 0 && rgba.len() >= (fb_w * fb_h * 4) as usize {
@@ -476,8 +479,14 @@ impl GpuRenderer {
                     }
                 }
                 let rect = RectUniform {
-                    min: [-1.0, -1.0],
-                    max: [1.0, top_ndc(bar_h)],
+                    min: [
+                        left_ndc(desktop_rect.0),
+                        top_ndc(desktop_rect.1 + desktop_rect.3),
+                    ],
+                    max: [
+                        left_ndc(desktop_rect.0 + desktop_rect.2),
+                        top_ndc(desktop_rect.1),
+                    ],
                     uv_min: [desktop_uv[0], desktop_uv[1]],
                     uv_max: [desktop_uv[2], desktop_uv[3]],
                 };

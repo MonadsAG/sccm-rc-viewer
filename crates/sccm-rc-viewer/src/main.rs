@@ -813,6 +813,7 @@ fn main() -> anyhow::Result<()> {
         gpu_dump: std::env::var("SCCM_RC_GPU_DUMP").ok(),
         title: window_title(&target, &servers::display(&target)),
         last_cursor: (0, 0),
+        cursor_on_desktop: false,
         last_move: std::time::Instant::now(),
         cursor,
         mouse_win: (0.0, 0.0),
@@ -1032,6 +1033,62 @@ fn ui_scale_of(w: &Window) -> u32 {
 /// Nearest-neighbour upscale of a logical `lw × lh` buffer by `k` into a
 /// `pw × ph` physical buffer. Rows/columns past `lw*k` / `lh*k` (when the
 /// physical size is not a multiple of `k`) repeat the last logical pixel.
+/// Largest rect with the desktop's aspect ratio that fits (centred) inside the
+/// `area_w × area_h` area. Returns `(x, y, w, h)` relative to the area; the rest
+/// of the area is letterbox/pillarbox bars.
+fn fit_rect(desk_w: u32, desk_h: u32, area_w: u32, area_h: u32) -> (u32, u32, u32, u32) {
+    let (dw, dh) = (desk_w.max(1) as u64, desk_h.max(1) as u64);
+    let (aw, ah) = (area_w.max(1) as u64, area_h.max(1) as u64);
+    let (w, h) = if aw * dh > dw * ah {
+        // Area is wider than the desktop: height-limited.
+        (((dw * ah + dh / 2) / dh).clamp(1, aw), ah)
+    } else {
+        (aw, ((dh * aw + dw / 2) / dw).clamp(1, ah))
+    };
+    (((aw - w) / 2) as u32, ((ah - h) / 2) as u32, w as u32, h as u32)
+}
+
+/// Window-space rect (below the toolbar strip) the shown desktop region occupies.
+fn desktop_rect(
+    crop: (u32, u32, u32, u32),
+    win_w: u32,
+    win_h: u32,
+    bar_h: u32,
+) -> (u32, u32, u32, u32) {
+    let (x, y, w, h) = fit_rect(crop.2, crop.3, win_w, win_h.saturating_sub(bar_h));
+    (x, y + bar_h, w, h)
+}
+
+/// The point lies inside `rect` (`x, y, w, h` in window pixels).
+fn mouse_in_rect((mx, my): (f64, f64), rect: (u32, u32, u32, u32)) -> bool {
+    mx >= rect.0 as f64
+        && my >= rect.1 as f64
+        && mx < (rect.0 + rect.2) as f64
+        && my < (rect.1 + rect.3) as f64
+}
+
+/// Background fill for the letterbox bars on the CPU path (GPU: `BAR_CLEAR`).
+const CPU_BAR_FILL: u32 = 0x0007_0708;
+
+/// Map a window-space point through `rect` (see [`desktop_rect`]) into desktop
+/// coordinates of the `crop` sub-rect. `None` when the point is in the bars.
+fn map_to_desktop(
+    x: f64,
+    y: f64,
+    rect: (u32, u32, u32, u32),
+    crop: (u32, u32, u32, u32),
+    fb: (u32, u32),
+) -> Option<(u16, u16)> {
+    let (rx, ry, rw, rh) = (rect.0 as f64, rect.1 as f64, rect.2 as f64, rect.3 as f64);
+    if x < rx || y < ry || x >= rx + rw || y >= ry + rh {
+        return None;
+    }
+    let (cx, cy, cw, ch) = (crop.0 as f64, crop.1 as f64, crop.2 as f64, crop.3 as f64);
+    let dx = (cx + (x - rx) * cw / rw).clamp(0.0, fb.0.saturating_sub(1) as f64);
+    let dy = (cy + (y - ry) * ch / rh).clamp(0.0, fb.1.saturating_sub(1) as f64);
+    Some((dx as u16, dy as u16))
+}
+
 fn upscale_into(src: &[u32], lw: u32, lh: u32, k: u32, dst: &mut [u32], pw: u32, ph: u32) {
     if lw == 0 || lh == 0 {
         return;
@@ -1268,6 +1325,8 @@ struct App {
     gpu_dump: Option<String>,
     title: String,
     last_cursor: (u16, u16),
+    /// The pointer is over the desktop rect (not in a letterbox bar).
+    cursor_on_desktop: bool,
     last_move: std::time::Instant,
     cursor: Arc<Mutex<CursorState>>,
     mouse_win: (f64, f64),
@@ -2137,14 +2196,14 @@ impl App {
 
     /// Map a window-space cursor position to desktop coordinates, honouring the
     /// active monitor crop (so a click while viewing Screen 2 lands on the
-    /// right-hand monitor's true desktop coordinate).
-    fn map_cursor(&self, x: f64, y: f64) -> (u16, u16) {
+    /// right-hand monitor's true desktop coordinate). `None` in the bars.
+    fn map_cursor(&self, x: f64, y: f64) -> Option<(u16, u16)> {
         let (fb_w, fb_h) = {
             let f = self.shared.lock().unwrap();
             (f.width.max(1), f.height.max(1))
         };
-        let (cx, cy, cw, ch) = Self::crop_rect(self.view, fb_w, fb_h);
-        let (cw, ch) = (cw.max(1), ch.max(1));
+        let crop = Self::crop_rect(self.view, fb_w, fb_h);
+        let crop = (crop.0, crop.1, crop.2.max(1), crop.3.max(1));
         let (win_w, win_h) = self
             .window
             .as_ref()
@@ -2153,14 +2212,10 @@ impl App {
                 (s.width.max(1), s.height.max(1))
             })
             .unwrap_or((1, 1));
-        // The desktop occupies the window below the toolbar strip and shows only
-        // the crop sub-rect, so window space maps into [cx, cx+cw) × [cy, cy+ch).
-        let bar = self.bar_h_phys() as f64;
-        let usable_h = (win_h as f64 - bar).max(1.0);
-        let yy = (y - bar).max(0.0);
-        let dx = (cx as f64 + x * cw as f64 / win_w as f64).clamp(0.0, (fb_w - 1) as f64);
-        let dy = (cy as f64 + yy * ch as f64 / usable_h).clamp(0.0, (fb_h - 1) as f64);
-        (dx as u16, dy as u16)
+        // The desktop keeps its aspect ratio inside the window below the toolbar
+        // strip and shows only the crop sub-rect; points in the bars are outside.
+        let rect = desktop_rect(crop, win_w, win_h, self.bar_h_phys().min(win_h));
+        map_to_desktop(x, y, rect, crop, (fb_w, fb_h))
     }
 
     /// Run a toolbar button action.
@@ -2656,7 +2711,16 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     return;
                 }
-                let (x, y) = self.map_cursor(position.x, position.y);
+                let Some((x, y)) = self.map_cursor(position.x, position.y) else {
+                    // In the letterbox bars: nothing to forward.
+                    self.cursor_on_desktop = false;
+                    if let Some(w) = &self.window {
+                        w.set_cursor_visible(true);
+                        w.request_redraw();
+                    }
+                    return;
+                };
+                self.cursor_on_desktop = true;
                 self.last_cursor = (x, y);
                 // Redraw so the client-side cursor follows the mouse instantly
                 // (winit coalesces these into one redraw per frame).
@@ -2745,6 +2809,9 @@ impl ApplicationHandler<UserEvent> for App {
                             self.run_toolbar_action(action, event_loop);
                         }
                     }
+                    return;
+                }
+                if !self.cursor_on_desktop {
                     return;
                 }
                 let down = state == ElementState::Pressed;
@@ -3217,8 +3284,14 @@ impl App {
         // Active monitor crop (RRCV-20): source UV sub-rect + toolbar label. The
         // `_for` variants take the dims we already hold so they don't re-lock.
         let monitor_label = Self::monitor_label_for(self.view, fb_w, fb_h);
+        let crop = if connected && fb_w > 0 && fb_h > 0 {
+            Self::crop_rect(self.view, fb_w, fb_h)
+        } else {
+            (0, 0, 1, 1)
+        };
+        let desk_rect = desktop_rect(crop, win_w, win_h, bar_h);
         let desktop_uv = if connected && fb_w > 0 && fb_h > 0 {
-            let (cx, cy, cw, ch) = Self::crop_rect(self.view, fb_w, fb_h);
+            let (cx, cy, cw, ch) = crop;
             [
                 cx as f32 / fb_w as f32,
                 cy as f32 / fb_h as f32,
@@ -3391,7 +3464,7 @@ impl App {
                 && cur.draw
                 && !cur.rgba.is_empty()
                 && self.cursor_inside
-                && self.mouse_win.1 >= bar_h as f64;
+                && mouse_in_rect(self.mouse_win, desk_rect);
             window.set_cursor_visible(!show);
             if show {
                 let dx = self.mouse_win.0 as i32 - cur.hotspot_x as i32;
@@ -3425,7 +3498,7 @@ impl App {
         gpu.render(
             win_w,
             win_h,
-            bar_h,
+            desk_rect,
             desktop,
             (ov_h > 0).then_some((ov_w, ov_h, ov_rgba.as_slice(), dest)),
             cursor_ref,
@@ -3500,12 +3573,15 @@ impl App {
 
         // The remote desktop renders BELOW the toolbar strip (reserved at top).
         let bar_h = (bar_logical * k).min(win_h);
-        let desk_h = win_h.saturating_sub(bar_h).max(1);
         let frame = self.shared.lock().unwrap();
         let frame_count = frame.frames;
         let bytes_per_sec = frame.bytes_per_sec;
         let connected = frame.width != 0 && frame.height != 0 && !frame.rgba.is_empty();
         let monitor_label = Self::monitor_label_for(view, frame.width, frame.height);
+        let desk_rect = {
+            let (_, _, cw, ch) = Self::crop_rect(view, frame.width, frame.height);
+            desktop_rect((0, 0, cw.max(1), ch.max(1)), win_w, win_h, bar_h)
+        };
         let status = frame.status.clone();
         let security = frame.security.clone();
         let secure = frame.secure;
@@ -3592,12 +3668,19 @@ impl App {
             // to fill the desktop area. `All` = the whole framebuffer.
             let (cx, cy, cw, ch) = Self::crop_rect(view, fb_w, fb_h);
             let (cx, cy) = (cx as usize, cy as usize);
-            if win_w == cw && desk_h == ch {
+            // The shown region keeps its aspect ratio: letterbox/pillarbox bars in
+            // the background colour, the desktop in `desk_rect`.
+            let (rx, ry, rw, rh) = desk_rect;
+            for wy in bar_h..win_h {
+                let out_row = (wy * win_w) as usize;
+                buffer[out_row..out_row + win_w as usize].fill(CPU_BAR_FILL);
+            }
+            if rw == cw && rh == ch {
                 // 1:1 — direct copy, sharpest (no interpolation).
-                for wy in bar_h..win_h {
-                    let row = (cy + (wy - bar_h) as usize) * fbw + cx;
-                    let out_row = (wy * win_w) as usize;
-                    for wx in 0..win_w as usize {
+                for wy in ry..ry + rh {
+                    let row = (cy + (wy - ry) as usize) * fbw + cx;
+                    let out_row = (wy * win_w + rx) as usize;
+                    for wx in 0..rw as usize {
                         let si = (row + wx) * 4;
                         buffer[out_row + wx] = if si + 2 < src.len() {
                             ((src[si] as u32) << 16)
@@ -3624,9 +3707,9 @@ impl App {
                 };
                 // Column/row sample indices are taken within the crop, then shifted
                 // by the crop origin (cx, cy) into the full framebuffer.
-                let cols: Vec<(usize, usize, u32)> = (0..win_w)
+                let cols: Vec<(usize, usize, u32)> = (0..rw)
                     .map(|wx| {
-                        let (i0, i1, f) = map(wx, win_w, cw);
+                        let (i0, i1, f) = map(wx, rw, cw);
                         (cx + i0, cx + i1, f)
                     })
                     .collect();
@@ -3634,11 +3717,11 @@ impl App {
                 fn lerp(a: u32, b: u32, f: u32) -> u32 {
                     (a * (256 - f) + b * f) >> 8
                 }
-                for wy in bar_h..win_h {
-                    let (y0, y1, fy) = map(wy - bar_h, desk_h, ch);
+                for wy in ry..ry + rh {
+                    let (y0, y1, fy) = map(wy - ry, rh, ch);
                     let r0 = (cy + y0) * fbw;
                     let r1 = (cy + y1) * fbw;
-                    let out_row = (wy * win_w) as usize;
+                    let out_row = (wy * win_w + rx) as usize;
                     for (wx, &(x0, x1, fx)) in cols.iter().enumerate() {
                         let p00 = (r0 + x0) * 4;
                         let p01 = (r0 + x1) * 4;
@@ -3676,7 +3759,8 @@ impl App {
         let draw_remote = cur.draw
             && !cur.rgba.is_empty()
             && self.cursor_inside
-            && self.mouse_win.1 >= bar_h as f64;
+            && connected
+            && mouse_in_rect(self.mouse_win, desk_rect);
         window.set_cursor_visible(!draw_remote);
         if draw_remote {
             // The remote cursor arrives as a separate Pointer PDU (the host sends it
@@ -3849,5 +3933,59 @@ mod ui_scale_tests {
         let mut dst = vec![0u32; 3];
         upscale_into(&src, 3, 1, 1, &mut dst, 3, 1);
         assert_eq!(dst, src);
+    }
+}
+
+#[cfg(test)]
+mod aspect_tests {
+    use super::{fit_rect, map_to_desktop};
+
+    #[test]
+    fn fit_rect_letterboxes_wide_window() {
+        // 1024x768 into a 1467x650 area: height-limited, centred horizontally.
+        assert_eq!(fit_rect(1024, 768, 1467, 650), (300, 0, 867, 650));
+    }
+
+    #[test]
+    fn fit_rect_pillarboxes_tall_window() {
+        assert_eq!(fit_rect(1920, 1080, 800, 800), (0, 175, 800, 450));
+    }
+
+    #[test]
+    fn fit_rect_exact_fit() {
+        assert_eq!(fit_rect(1024, 768, 1024, 768), (0, 0, 1024, 768));
+        assert_eq!(fit_rect(1024, 768, 512, 384), (0, 0, 512, 384));
+    }
+
+    #[test]
+    fn cursor_in_bar_is_outside() {
+        let rect = fit_rect(1024, 768, 1467, 650); // window area, bar_h = 0
+        let crop = (0, 0, 1024, 768);
+        let fb = (1024, 768);
+        assert_eq!(map_to_desktop(100.0, 300.0, rect, crop, fb), None);
+        assert_eq!(map_to_desktop(1300.0, 300.0, rect, crop, fb), None);
+        // Centre of the window maps to the centre of the desktop.
+        assert_eq!(
+            map_to_desktop(734.0, 325.5, rect, crop, fb),
+            Some((512, 384))
+        );
+        // Corners of the rect map to the desktop corners.
+        assert_eq!(map_to_desktop(300.0, 0.0, rect, crop, fb), Some((0, 0)));
+        assert_eq!(
+            map_to_desktop(1166.9, 649.9, rect, crop, fb),
+            Some((1023, 767))
+        );
+    }
+
+    #[test]
+    fn cursor_honours_toolbar_offset_and_crop() {
+        // Second monitor of a 3840x1080 desktop, window 960x540 below a 40px bar.
+        let rect = (0, 40, 960, 540);
+        let crop = (1920, 0, 1920, 1080);
+        assert_eq!(
+            map_to_desktop(0.0, 40.0, rect, crop, (3840, 1080)),
+            Some((1920, 0))
+        );
+        assert_eq!(map_to_desktop(10.0, 20.0, rect, crop, (3840, 1080)), None);
     }
 }
