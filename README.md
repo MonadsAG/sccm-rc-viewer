@@ -202,8 +202,9 @@ click and type on it. Claude sees the till as a picture and works like a person
 at the keyboard. It has no access to the Windows system behind the screen:
 no files, no shell, only what the remote-control session shows.
 
-The server runs on macOS (the viewer's session code is shared). Build it and
-register it with Claude Code:
+Headless mode builds and runs on macOS and Windows (the viewer's session code
+is shared); live mode needs a Unix socket and runs on macOS and Linux. Build it
+and register it with Claude Code:
 
 ```sh
 cargo build --release -p sccm-rc-mcp
@@ -223,14 +224,15 @@ never asks for anything, so the logon data must already be there:
 - User: `SCCM_USER` (`DOMAIN\user`, or a bare user plus `SCCM_DOMAIN`), else the
   user of the last explicit logon in the viewer.
 - Password: the Keychain item the viewer saves ("Save password in Keychain",
-  see macOS above), else `SCCM_PASS`.
+  see macOS above; macOS only), else `SCCM_PASS`.
 
 A logon the till rejects is not retried until the server is restarted, so a
 wrong password cannot lock the account.
 
 **Live mode** drives the viewer you are looking at. In the viewer, switch on
-*Allow Control by Claude* (Control menu or toolbar). Claude then uses your
-open session, and you see what it does. You always win:
+*Allow Control by Claude* (Control menu or toolbar; the switch is part of the
+native macOS window chrome, so it exists only in the macOS viewer). Claude then
+uses your open session, and you see what it does. You always win:
 
 - A mouse click, the wheel or a key press from you interrupts the running
   command. Plain mouse moves do not.
@@ -246,8 +248,8 @@ fractions from 0 to 1 of the desktop with `relative: true`.
 
 | Tool | What it does |
 |---|---|
-| `connect` | Connect to a till by host name or IP (`target`). Refuses if a user is logged on, unless `force: true`. Headless mode only. |
-| `disconnect` | Release the till. |
+| `connect` | Headless: connect to a till by host name or IP (`target`); refuses if a user is logged on, unless `force: true`. Live: never dials a till; reports the viewer's session (and notes it if the viewer is connected to another till). |
+| `disconnect` | Headless: release the till. Live: only hands control back; the viewer stays connected. |
 | `screenshot` | PNG of the desktop, scaled down to `max_width` (default 1280). Optional `region` in desktop pixels. |
 | `click` | Click at `x`, `y`. `button` left (default), right or middle; `double` for a double click. |
 | `move` | Move the pointer without clicking, for hover effects. |
@@ -255,8 +257,8 @@ fractions from 0 to 1 of the desktop with `relative: true`.
 | `type_text` | Type text, independent of the till's keyboard layout. `secret: true` for passwords. |
 | `key` | Press a key or combination: `Enter`, `Esc`, `Tab`, `F5`, `Ctrl+A`, `Ctrl+Alt+Del`, `Num0` to `Num9`, `NumEnter`. |
 | `batch` | Run several steps in order in one call. Steps are `click`, `move`, `scroll`, `type_text`, `key` and `wait`, with the arguments of that tool. Stops at the first failing step. No `screenshot`, `status`, `disconnect` or nested `batch` inside. |
-| `wait` | Wait until the screen changes (`change: true`) and/or has stayed unchanged for `stable_ms`; gives up after `timeout_ms`. At least one of `change` and `stable_ms` is required. |
-| `status` | Connection state, target, desktop size, mode and idle time. |
+| `wait` | Wait until the screen changes (`change: true`) and/or has stayed unchanged for `stable_ms`; gives up after `timeout_ms` (required, at most 5 minutes). At least one of `change` and `stable_ms` is required. |
+| `status` | Connection state, target, desktop size, mode and idle time. In live mode the state of the viewer's session. |
 
 ### Safety
 
@@ -266,15 +268,18 @@ fractions from 0 to 1 of the desktop with `relative: true`.
   active, perhaps your own viewer), it cannot be taken over. Try again later.
 - **Idle timeout.** In headless mode a session with no tool call for 10 minutes
   is released.
-- **Graceful release.** `disconnect`, the end of the MCP connection (stdin
-  closing), SIGINT, SIGTERM and the idle timeout all release the till. Only a
-  hard kill (SIGKILL) leaves it occupied until the till times the session out.
+- **Graceful release.** In headless mode `disconnect`, the end of the MCP
+  connection (stdin closing), SIGINT, SIGTERM, SIGHUP (the terminal closed),
+  SIGQUIT and the idle timeout all release the till. Only a hard kill
+  (SIGKILL) leaves it occupied until the till times the session out. In live
+  mode the session belongs to the viewer and is never released by the server.
 - **Secrets stay out.** Text typed with `secret: true` is never logged and not
   echoed in the result or in error messages. The server logs to stderr only;
   stdout carries the protocol.
 - **Audit log.** `connect`, `disconnect` and every action go to the viewer's
-  `audit.jsonl` (`~/Library/Application Support/sccm-rc/`), as entries with
-  `"event":"agent"`. Secret text is not recorded.
+  `audit.jsonl` (on macOS in `~/Library/Application Support/sccm-rc/`), as
+  entries with `"event":"agent"`. In headless mode the server writes them; in
+  live mode the viewer does. Secret text is not recorded.
 
 ## Vendored IronRDP
 

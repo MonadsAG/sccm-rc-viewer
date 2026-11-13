@@ -117,7 +117,7 @@ pub fn take(
     let mut buf = Vec::with_capacity(crop.w as usize * crop.h as usize * 3);
     for row in crop.y as usize..crop.y as usize + crop.h as usize {
         let start = row * stride + crop.x as usize * 4;
-        for px in rgba[start..start + crop.w as usize * 4].chunks_exact(4) {
+        for px in rgba[start..start + crop.w as usize * 4].as_chunks::<4>().0 {
             buf.extend_from_slice(&px[..3]);
         }
     }

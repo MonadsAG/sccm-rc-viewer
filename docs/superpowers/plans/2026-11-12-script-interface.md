@@ -42,7 +42,7 @@
 
 **Interfaces:**
 - Produces: `pub struct RdpOptions { pub takeover: bool }` with `impl Default` (takeover = `SCCM_RC_TAKEOVER=1`, i.e. today's behaviour); `pub async fn connect_rdp_with(session, width, height, monitors, cliprdr_req_counter, opts: RdpOptions) -> Result<(ConnectionResult, Vec<u8>, u32)>`; `connect_rdp(...)` becomes a wrapper passing `RdpOptions::default()`. `ArbitrationChannel::new(takeover: bool)`.
-- Produces: a host-in-use signal the caller can see: `pub static`-free design — `connect_rdp_with` returns `Err(anyhow!(HostInUse))` where `#[derive(Debug, thiserror::Error)] #[error("the till is in use by a logged-on user")] pub struct HostInUse;` is defined in `rdp.rs`, when the server reports event 1 and `takeover == false` and the shadow is not granted within the existing wait.
+- Produces: a host-in-use signal the caller can see: `pub static`-free design — `connect_rdp_with` returns `Err(anyhow!(HostInUse))` where `#[derive(Debug, thiserror::Error)] #[error("the till is in use by a logged-on user")] pub struct HostInUse;` is defined in `rdp.rs`, when the server reports event 1 and `takeover == false` and the shadow is not granted within the existing wait. *(As built: no `HostInUse` type; the sessarb channel sets the shared `RdpOptions::host_in_use` flag and the headless backend answers `ErrorCode::InUse` itself.)*
 
 - [ ] **Step 1: Write failing tests** `takeover_disabled_ignores_host_in_use` (feeding a 12-byte payload with event 1 yields no `SvcMessage`) and `takeover_enabled_sends_type_5_once` (first event 1 → one message whose bytes 8..12 are `5u32` LE; second event 1 → none).
 - [ ] **Step 2:** `cargo test -p sccm-rc-core arbitration_tests` → FAIL (`new` takes no argument).
@@ -153,7 +153,7 @@
 - Create: `crates/sccm-rc-mcp/src/headless.rs`, `src/creds.rs`
 
 **Interfaces:**
-- Consumes: `SccmSession::connect_with`, `rdp::connect_rdp_with(.., RdpOptions { takeover: force })`, `rdp::run_active_session`, `rdp::HostInUse`, `Error::{ExistingSession, LogonRejected}`, `agent::{keys, text, shot, wait}`, `keychain::load`, `paths::data_dir`, `audit::log_agent`.
+- Consumes: `SccmSession::connect_with`, `rdp::connect_rdp_with(.., RdpOptions { takeover: force })`, `rdp::run_active_session`, `RdpOptions::host_in_use`, `Error::{ExistingSession, LogonRejected}`, `agent::{keys, text, shot, wait}`, `keychain::load`, `paths::data_dir`, `audit::log_agent`.
 - Produces: `pub struct Headless` implementing `Backend`. Session runs in a spawned task with a sink that copies the latest RGBA frame into `Arc<Mutex<Frame { rgba, w, h }>>` and feeds `FrameWatch`; input via the `InputSender`. `creds::resolve(env: impl Fn(&str)->Option<String>, last_user: Option<String>, keychain: Lookup) -> Result<LogonCredentials, CredError>`: user = `SCCM_USER` else last user (`data_dir()/last_user.txt`); password = Keychain(user) else `SCCM_PASS`; missing → `CredError::NoPassword`.
 - Behaviour: second `connect` while connected → `Reply::Error{BadArgs, "already connected to X"}`; `ExistingSession` → `ErrorCode::ExistingSession` ("another remote-control session is active, e.g. your viewer or a session that was not released; try again later"); `HostInUse` without force → `ErrorCode::InUse` ("use force to take over"); `LogonRejected` → no retry. Idle 10 min → `shutdown`. SIGINT/SIGTERM (`tokio::signal`) and stdin EOF → `shutdown` (graceful disconnect, wait up to 3 s). Every action → `audit::log_agent` (secret text as `"type_text (secret, N chars)"`).
 

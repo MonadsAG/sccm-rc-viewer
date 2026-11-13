@@ -348,7 +348,7 @@ mod tests {
             ok()
         }
         async fn run(&mut self, cmd: Command) -> Reply {
-            let text = format!("{}", serde_json::to_string(&cmd).unwrap());
+            let text = serde_json::to_string(&cmd).unwrap();
             if matches!(cmd, Command::Batch { ref steps } if steps.len() == 3) {
                 Reply::Error {
                     code: sccm_rc_core::agent::proto::ErrorCode::Session,

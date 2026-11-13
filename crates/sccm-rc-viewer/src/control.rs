@@ -23,6 +23,7 @@ pub const COOLDOWN: Duration = Duration::from_secs(2);
 const TEXT_GAP: Duration = STEP_GAP;
 /// How often a running `wait` looks at the frame counter.
 const WAIT_POLL: Duration = Duration::from_millis(50);
+#[cfg(unix)]
 pub const SOCKET_NAME: &str = "control.sock";
 pub const MSG_TOOK_OVER: &str =
     "the user took over (local keyboard or mouse input); command aborted";
@@ -344,7 +345,6 @@ impl Drop for Ticker {
     }
 }
 
-/// Parse and check one request line. `None` for a blank line.
 /// Whether the user's input event takes over from Claude: anything but a
 /// plain pointer move.
 pub fn counts_as_takeover(ev: &FastPathInputEvent) -> bool {
@@ -352,6 +352,7 @@ pub fn counts_as_takeover(ev: &FastPathInputEvent) -> bool {
 }
 
 /// The command's name, for logs (never its arguments).
+#[cfg(unix)]
 pub fn cmd_name(c: &Command) -> &'static str {
     match c {
         Command::Status => "status",
@@ -367,6 +368,8 @@ pub fn cmd_name(c: &Command) -> &'static str {
     }
 }
 
+/// Parse and check one request line. `None` for a blank line.
+#[cfg(unix)]
 pub fn parse_request(line: &[u8]) -> Option<Result<Command, Reply>> {
     let Ok(text) = std::str::from_utf8(line) else {
         return Some(Err(bad_args("request is not valid UTF-8")));
@@ -952,6 +955,7 @@ mod tests {
         assert!(f.sent.is_empty() && f.audited.is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn parse_request_checks_and_hides_typed_text() {
         assert!(parse_request(b"  \n").is_none());
@@ -1025,6 +1029,7 @@ mod tests {
         assert!(!a.should_abort(t0));
     }
 
+    #[cfg(unix)]
     #[test]
     fn parse_errors_are_generic() {
         for line in [
@@ -1039,6 +1044,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn cmd_name_has_no_arguments() {
         let c = Command::TypeText {

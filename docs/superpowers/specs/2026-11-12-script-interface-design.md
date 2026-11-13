@@ -59,7 +59,7 @@ through the session, in the till's own pixel coordinates.
 
 ## What we know about operating TCPOS remotely
 
-From an exploration session on a test till (TCPOS 8.1.3, Denner layout),
+From an exploration session on a test till (TCPOS 8.1.3, customer keyboard layout),
 operating it through the viewer with screenshots of the Mac:
 
 - **Clicks are reliable, keys are not.** In the sale and payment screens,
@@ -76,7 +76,7 @@ operating it through the viewer with screenshots of the Mac:
   and an operator settlement).
 - **Feedback:** the two-line operator display (bottom left) shows the input
   buffer and messages; a crop of it is cheap feedback.
-- **Layout:** fixed Denner keyboard layout; buttons keep their arrangement
+- **Layout:** fixed customer keyboard layout; buttons keep their arrangement
   (user: they never move), pop-ups are full-screen layers with their own
   grid and a ← button top left. Only one monitor; the customer display is
   not part of the session.

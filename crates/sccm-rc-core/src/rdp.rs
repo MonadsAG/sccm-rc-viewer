@@ -488,12 +488,6 @@ pub struct ArbitrationChannel {
     host_in_use: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
-/// Returned (by callers watching `RdpOptions::host_in_use`) when the till is in
-/// use by a logged-on user and take-over was not requested.
-#[derive(Debug, thiserror::Error)]
-#[error("the till is in use by a logged-on user")]
-pub struct HostInUse;
-
 /// Options for the RDP connection. Both `connect_rdp_with` and
 /// `run_active_session_with` must be given the SAME `RdpOptions` so they share
 /// one `host_in_use` flag; the plain `connect_rdp` / `run_active_session`
@@ -585,7 +579,8 @@ impl ironrdp_svc::SvcProcessor for ArbitrationChannel {
         // HostInUse(1): the host has an active session/user. Take it over by
         // replaying CmRcViewer's type-5 event with our machine name; the server
         // then grants HostAllowed(4) and attaches the shadow. Gated by
-        // SCCM_RC_TAKEOVER=1 (it forcibly takes over a busy host).
+        // `RdpOptions::takeover` (it forcibly takes over a busy host); the
+        // SCCM_RC_TAKEOVER=1 env var only feeds `RdpOptions::default()`.
         // Recorded as a fact either way, so a caller that took over can
         // report (and audit) that a logged-on user was displaced.
         if server_event == 1 {
