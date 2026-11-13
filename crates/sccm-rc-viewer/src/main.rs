@@ -34,6 +34,7 @@ mod paths;
 mod recent;
 mod record;
 mod report;
+mod servers;
 mod text;
 mod toolbar;
 mod type_text;
@@ -619,7 +620,11 @@ fn main() -> anyhow::Result<()> {
     // Target: CLI arg (like CmRcViewer) or, if absent, the in-window host-prompt
     // overlay collects one after the event loop starts. In --demo mode we never
     // connect, so default to a placeholder name instead of prompting.
-    let cli_target = cli.target.clone();
+    // A saved target's name works on the command line too.
+    let cli_target = cli
+        .target
+        .clone()
+        .map(|t| servers::resolve(&t).unwrap_or(t));
     let target = match cli_target.as_deref() {
         Some(t) => t.to_string(),
         None if cli.demo => "DEMO-PC".to_string(),
@@ -750,7 +755,11 @@ fn main() -> anyhow::Result<()> {
         surface: None,
         gpu: None,
         gpu_dump: std::env::var("SCCM_RC_GPU_DUMP").ok(),
-        title: format!("SCCM RC {} — {target}", env!("CARGO_PKG_VERSION")),
+        title: format!(
+            "SCCM RC {} — {}",
+            env!("CARGO_PKG_VERSION"),
+            servers::display(&target)
+        ),
         last_cursor: (0, 0),
         last_move: std::time::Instant::now(),
         cursor,
@@ -1060,7 +1069,8 @@ async fn run_session(
     creds: Option<&LogonCredentials>,
     session_flag: &Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
-    shared.lock().unwrap().status = t!("status.connecting_to", target => target).to_string();
+    shared.lock().unwrap().status =
+        t!("status.connecting_to", target => servers::display(target)).to_string();
     let _ = proxy.send_event(UserEvent::Frame);
     // Bound the WHOLE bring-up (TCP connect + SSPI handshake + grant), not just
     // the TCP connect: a peer that completes the TCP handshake but then stalls
@@ -1453,14 +1463,15 @@ impl App {
         self.locks_sent = None;
         recent::add(&new_target);
         self.host = new_target.clone();
-        self.title = format!("SCCM RC {} — {new_target}", env!("CARGO_PKG_VERSION"));
+        let shown = servers::display(&new_target);
+        self.title = format!("SCCM RC {} — {shown}", env!("CARGO_PKG_VERSION"));
         if let Some(w) = &self.window {
             w.set_title(&self.title);
         }
         {
             let mut f = self.shared.lock().unwrap();
             *f = SharedFrame::default();
-            f.status = t!("status.connecting_to", target => new_target).to_string();
+            f.status = t!("status.connecting_to", target => shown).to_string();
         }
         self.closed = None;
         self.connect_start = std::time::Instant::now();
@@ -2376,21 +2387,40 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                             return;
                         }
-                        // Ctrl+A / Ctrl+Delete → clear the field. We don't
-                        // render a visual selection, so "select all + type"
-                        // and "clear" look the same to the operator.
-                        if edit_mod(self.modifiers)
-                            && matches!(
-                                event.physical_key,
-                                PhysicalKey::Code(KeyCode::KeyA)
-                                    | PhysicalKey::Code(KeyCode::Delete)
-                            )
-                        {
-                            prompt.on_clear();
-                            if let Some(w) = &self.window {
-                                w.request_redraw();
+                        // Ctrl+A → clear the field. We don't render a visual
+                        // selection, so "select all + type" and "clear" look
+                        // the same to the operator.
+                        // Cmd/Ctrl+S → save / rename the highlighted target.
+                        // Cmd/Ctrl+Backspace / Delete → delete the highlighted
+                        // saved target (twice), else clear the field. Key
+                        // repeat is ignored so holding it can't confirm.
+                        if edit_mod(self.modifiers) {
+                            let done = match event.physical_key {
+                                PhysicalKey::Code(KeyCode::KeyA) => {
+                                    prompt.on_clear();
+                                    true
+                                }
+                                PhysicalKey::Code(KeyCode::KeyS) => {
+                                    if !event.repeat {
+                                        prompt.on_save();
+                                    }
+                                    true
+                                }
+                                PhysicalKey::Code(KeyCode::Backspace)
+                                | PhysicalKey::Code(KeyCode::Delete) => {
+                                    if !event.repeat {
+                                        prompt.on_delete();
+                                    }
+                                    true
+                                }
+                                _ => false,
+                            };
+                            if done {
+                                if let Some(w) = &self.window {
+                                    w.request_redraw();
+                                }
+                                return;
                             }
-                            return;
                         }
                         let handled = match event.physical_key {
                             PhysicalKey::Code(KeyCode::Escape) => {
