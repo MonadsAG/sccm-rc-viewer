@@ -67,3 +67,4 @@ login:
   ntlm_note: "NTLM-aanmelding: de identiteit van de server kan niet worden geverifieerd."
   hint: "Tab = ander veld · Enter = aanmelden · Esc = terug"
   rejected: "Aanmelding geweigerd: %{reason}"
+  save_password: "Wachtwoord bewaren in sleutelhanger"

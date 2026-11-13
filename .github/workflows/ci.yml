@@ -4,8 +4,9 @@ on:
   push:
     branches: [main]
     paths-ignore: ["**.md", "docs/**", "LICENSE-*", ".github/workflows/release-*.yml"]
+  # No paths-ignore for PRs: build-test and macos are required checks on
+  # main, and a skipped workflow never reports them, so the PR could not merge.
   pull_request:
-    paths-ignore: ["**.md", "docs/**", "LICENSE-*", ".github/workflows/release-*.yml"]
   workflow_dispatch:
 
 # A newer push to the same branch or PR cancels the older run (saves minutes).
@@ -20,7 +21,7 @@ jobs:
   build-test:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # Match the local toolchain: x86_64-pc-windows-gnu + a recent MinGW-w64.
       # The `windows` crate's gnu target needs a working dlltool to generate
@@ -60,13 +61,16 @@ jobs:
           rustc -V
           cargo -V
 
+      # Only main saves the cache (~800 MB); PRs and branches restore main's.
+      # Saves upload time and keeps the repo under its 10 GB cache limit.
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      # Gating checks: the build must succeed and the test suite must pass.
-      - name: Build
-        run: cargo build --workspace
-
-      - name: Test
+      # Gating check: `cargo test` compiles the whole workspace (libs and
+      # binaries) and runs the suite, so a separate `cargo build` would only
+      # compile it a second time.
+      - name: Build + test
         run: cargo test --workspace
 
       # Advisory checks: the codebase predates fmt/clippy gating. These run for
@@ -75,7 +79,9 @@ jobs:
         run: cargo fmt --all -- --check
         continue-on-error: true
 
-      - name: Clippy (advisory)
+      # Clippy is a full extra compile pass; run it on main only.
+      - name: Clippy (advisory, main only)
+        if: github.ref == 'refs/heads/main'
         run: cargo clippy --workspace --all-targets
         continue-on-error: true
 
@@ -87,7 +93,7 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust
         run: |
@@ -96,6 +102,8 @@ jobs:
           rustc -V
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Test
         run: cargo test --workspace
