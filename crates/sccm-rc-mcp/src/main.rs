@@ -6,7 +6,14 @@ mod live;
 mod mcp;
 mod tools;
 
+use std::future::Future;
+use std::panic::AssertUnwindSafe;
+use std::pin::Pin;
+use std::sync::OnceLock;
+use std::task::{Context, Poll};
+
 use clap::{Parser, ValueEnum};
+use tokio::sync::Notify;
 
 #[derive(Clone, Copy, ValueEnum)]
 enum Mode {
@@ -45,6 +52,7 @@ fn main() -> anyhow::Result<()> {
         .with_ansi(false)
         .init();
     let args = Args::parse();
+    install_panic_hook();
     // Before any other thread exists, so setting the environment is race-free.
     for (k, v) in SESSION_ENV {
         if std::env::var_os(k).is_none() {
@@ -92,34 +100,89 @@ async fn run(mode: Mode) -> anyhow::Result<()> {
     };
     let mut server = mcp::Server::new(backend);
     // stdin EOF ends serve(), which shuts the backend down itself. On a
-    // signal serve() is cancelled, so shut down here (idempotent).
+    // signal or a panic serve() is cancelled (or unwound), so shut down here
+    // (idempotent): the till is released either way.
+    let serve = CatchUnwind(Box::pin(server.serve(
+        tokio::io::BufReader::new(tokio::io::stdin()),
+        tokio::io::stdout(),
+    )));
     let res = tokio::select! {
-        r = server.serve(
-            tokio::io::BufReader::new(tokio::io::stdin()),
-            tokio::io::stdout(),
-        ) => r,
+        r = serve => r.unwrap_or_else(|()| Err(anyhow::anyhow!("the server panicked"))),
         sig = shutdown_signal() => {
             tracing::info!(signal = sig, "shutting down");
             Ok(())
+        }
+        () = panicked().notified() => {
+            tracing::error!("a task panicked; releasing the till and exiting");
+            Err(anyhow::anyhow!("a task panicked"))
         }
     };
     server.shutdown().await;
     res
 }
 
+/// Signalled by the panic hook, so a panic on any thread (a spawned task,
+/// the session thread) ends the server through the graceful shutdown.
+fn panicked() -> &'static Notify {
+    static PANICKED: OnceLock<Notify> = OnceLock::new();
+    PANICKED.get_or_init(Notify::new)
+}
+
+/// Log the panic (location only: the payload may quote typed text), run the
+/// default hook, then trigger the shutdown that releases the till.
+fn install_panic_hook() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let at = info
+            .location()
+            .map(|l| format!("{}:{}", l.file(), l.line()))
+            .unwrap_or_default();
+        tracing::error!(location = %at, "panic");
+        default(info);
+        // A stored permit: wakes the select! even if it is not waiting yet.
+        panicked().notify_one();
+    }));
+}
+
+/// A future that turns a panic while polling into `Err(())`, so the caller
+/// can still shut the backend down. Safe code only (`catch_unwind` per poll).
+struct CatchUnwind<F>(Pin<Box<F>>);
+
+impl<F: Future> Future for CatchUnwind<F> {
+    type Output = Result<F::Output, ()>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let inner = self.0.as_mut();
+        match std::panic::catch_unwind(AssertUnwindSafe(|| inner.poll(cx))) {
+            Ok(Poll::Pending) => Poll::Pending,
+            Ok(Poll::Ready(v)) => Poll::Ready(Ok(v)),
+            Err(_) => Poll::Ready(Err(())),
+        }
+    }
+}
+
+/// SIGINT, SIGTERM, SIGHUP (the terminal was closed) or SIGQUIT: each ends
+/// the server through the graceful shutdown that releases the till.
 #[cfg(unix)]
 async fn shutdown_signal() -> &'static str {
     use tokio::signal::unix::{signal, SignalKind};
-    match signal(SignalKind::terminate()) {
-        Ok(mut term) => tokio::select! {
-            _ = tokio::signal::ctrl_c() => "SIGINT",
-            _ = term.recv() => "SIGTERM",
-        },
-        Err(e) => {
-            tracing::warn!(error = %e, "cannot watch SIGTERM");
-            let _ = tokio::signal::ctrl_c().await;
-            "SIGINT"
+    async fn on(kind: SignalKind, name: &'static str) -> &'static str {
+        match signal(kind) {
+            Ok(mut s) => {
+                s.recv().await;
+                name
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, signal = name, "cannot watch signal");
+                std::future::pending().await
+            }
         }
+    }
+    tokio::select! {
+        n = on(SignalKind::interrupt(), "SIGINT") => n,
+        n = on(SignalKind::terminate(), "SIGTERM") => n,
+        n = on(SignalKind::hangup(), "SIGHUP") => n,
+        n = on(SignalKind::quit(), "SIGQUIT") => n,
     }
 }
 
@@ -127,4 +190,40 @@ async fn shutdown_signal() -> &'static str {
 async fn shutdown_signal() -> &'static str {
     let _ = tokio::signal::ctrl_c().await;
     "Ctrl+C"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn catch_unwind_turns_a_panic_into_err() {
+        let ok = CatchUnwind(Box::pin(async { 7 })).await;
+        assert_eq!(ok, Ok(7));
+        // The panic still reaches the global hook (test output), not the caller.
+        let r = CatchUnwind(Box::pin(async {
+            tokio::task::yield_now().await;
+            panic!("boom")
+        }))
+        .await;
+        assert_eq!(r, Err::<(), ()>(()));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sighup_ends_the_server() {
+        // Registered before raising (as at start-up); once registered, the
+        // signal no longer terminates the test process.
+        let wait = tokio::spawn(shutdown_signal());
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        std::process::Command::new("kill")
+            .args(["-HUP", &std::process::id().to_string()])
+            .status()
+            .unwrap();
+        let sig = tokio::time::timeout(std::time::Duration::from_secs(5), wait)
+            .await
+            .expect("signal seen")
+            .unwrap();
+        assert_eq!(sig, "SIGHUP");
+    }
 }

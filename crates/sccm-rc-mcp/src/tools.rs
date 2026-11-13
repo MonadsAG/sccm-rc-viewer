@@ -212,8 +212,9 @@ fn text_result(text: String) -> Value {
 /// Secret input carried by a command, so its result can be sanitized.
 #[derive(Clone, Copy)]
 pub enum Secret {
-    /// A top-level secret type_text of this many characters.
-    Text(usize),
+    /// A top-level secret type_text: characters typed, and skipped
+    /// because they cannot be sent (counts only, never the characters).
+    Text { typed: usize, skipped: usize },
     /// A batch of this many steps containing a secret type_text.
     Batch(usize),
 }
@@ -223,7 +224,13 @@ pub enum Secret {
 pub fn result(reply: Reply, secret: Option<Secret>) -> Value {
     match reply {
         Reply::Ok { text } => match secret {
-            Some(Secret::Text(n)) => text_result(format!("typed {n} characters (secret)")),
+            Some(Secret::Text { typed, skipped }) => {
+                let mut t = format!("typed {typed} characters (secret)");
+                if skipped > 0 {
+                    t.push_str(&format!("; skipped {skipped} that cannot be sent"));
+                }
+                text_result(t)
+            }
             Some(Secret::Batch(n)) => {
                 text_result(format!("batch done: {n} steps (contains secret input)"))
             }
@@ -281,10 +288,62 @@ pub fn result(reply: Reply, secret: Option<Secret>) -> Value {
 /// Whether the command carries secret input.
 pub fn secret_input(cmd: &Command) -> Option<Secret> {
     match cmd {
-        Command::TypeText { text, secret: true } => Some(Secret::Text(text.chars().count())),
+        Command::TypeText { text, secret: true } => {
+            let skipped = sccm_rc_core::agent::text::encode_text(text).1.len();
+            Some(Secret::Text {
+                typed: text.chars().count() - skipped,
+                skipped,
+            })
+        }
         Command::Batch { steps } if steps.iter().any(|s| secret_input(s).is_some()) => {
             Some(Secret::Batch(steps.len()))
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ok_text(v: &Value) -> &str {
+        assert_eq!(v["isError"], false, "{v}");
+        v["content"][0]["text"].as_str().unwrap()
+    }
+
+    #[test]
+    fn secret_text_reports_skipped_count_without_the_text() {
+        let cmd = Command::TypeText {
+            text: "pa\tss😀wd".into(),
+            secret: true,
+        };
+        let secret = secret_input(&cmd);
+        let r = result(
+            Reply::Ok {
+                text: "typed 6 characters; skipped 2".into(),
+            },
+            secret,
+        );
+        let t = ok_text(&r);
+        assert_eq!(
+            t,
+            "typed 6 characters (secret); skipped 2 that cannot be sent"
+        );
+        assert!(!t.contains("pa") && !t.contains('😀') && !t.contains('\t'));
+    }
+
+    #[test]
+    fn secret_text_without_skips_says_so_plainly() {
+        let cmd = Command::TypeText {
+            text: "hunter2ä".into(),
+            secret: true,
+        };
+        let r = result(
+            Reply::Ok {
+                text: "anything".into(),
+            },
+            secret_input(&cmd),
+        );
+        assert_eq!(ok_text(&r), "typed 8 characters (secret)");
     }
 }

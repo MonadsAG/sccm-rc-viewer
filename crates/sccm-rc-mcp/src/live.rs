@@ -21,6 +21,10 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const SLACK: Duration = Duration::from_secs(10);
 /// The viewer's pause between batch steps, rounded up.
 const STEP_BUDGET: Duration = Duration::from_millis(100);
+/// The viewer types text in chunks of this many characters (64 key events),
+/// with `TEXT_GAP` between chunks.
+const TEXT_CHARS_PER_CHUNK: u32 = 32;
+const TEXT_GAP: Duration = sccm_rc_core::agent::exec::STEP_GAP;
 
 pub struct Live {
     socket: PathBuf,
@@ -110,9 +114,16 @@ fn disabled() -> Reply {
     err(ErrorCode::ControlDisabled, MSG_DISABLED.into())
 }
 
+/// The time a command takes in the viewer by its nature: a wait's timeout,
+/// the pauses between a long text's chunks.
 fn own_time(cmd: &Command) -> Duration {
     match cmd {
         Command::Wait { timeout_ms, .. } => Duration::from_millis(*timeout_ms),
+        Command::TypeText { text, .. } => {
+            let chunks =
+                u32::try_from(text.chars().count()).unwrap_or(u32::MAX) / TEXT_CHARS_PER_CHUNK;
+            TEXT_GAP.saturating_mul(chunks)
+        }
         _ => Duration::ZERO,
     }
 }
@@ -120,6 +131,7 @@ fn own_time(cmd: &Command) -> Duration {
 fn reply_timeout(cmd: &Command, slack: Duration) -> Duration {
     match cmd {
         Command::Wait { .. } => own_time(cmd) + slack,
+        Command::TypeText { .. } => DEFAULT_TIMEOUT + own_time(cmd),
         Command::Batch { steps } => {
             let waits: Duration = steps.iter().map(own_time).sum();
             waits + STEP_BUDGET * steps.len() as u32 + slack
@@ -384,5 +396,29 @@ mod tests {
             steps: vec![w.clone(), Command::Key { combo: "a".into() }],
         };
         assert_eq!(reply_timeout(&b, s), Duration::from_millis(5000 + 200) + s);
+    }
+
+    #[test]
+    fn long_text_gets_time_for_its_paced_chunks() {
+        let s = SLACK;
+        let text = |n: usize| Command::TypeText {
+            text: "x".repeat(n),
+            secret: false,
+        };
+        // Short text: the plain deadline.
+        assert_eq!(reply_timeout(&text(10), s), DEFAULT_TIMEOUT);
+        // 32 characters per chunk, 100 ms between chunks.
+        assert_eq!(
+            reply_timeout(&text(32_000), s),
+            DEFAULT_TIMEOUT + Duration::from_secs(100)
+        );
+        // In a batch the text's time adds to the steps' budget.
+        let b = Command::Batch {
+            steps: vec![text(3200), Command::Key { combo: "a".into() }],
+        };
+        assert_eq!(
+            reply_timeout(&b, s),
+            Duration::from_secs(10) + STEP_BUDGET * 2 + s
+        );
     }
 }

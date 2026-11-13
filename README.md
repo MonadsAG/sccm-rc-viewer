@@ -270,9 +270,10 @@ fractions from 0 to 1 of the desktop with `relative: true`.
   is released.
 - **Graceful release.** In headless mode `disconnect`, the end of the MCP
   connection (stdin closing), SIGINT, SIGTERM, SIGHUP (the terminal closed),
-  SIGQUIT and the idle timeout all release the till. Only a hard kill
-  (SIGKILL) leaves it occupied until the till times the session out. In live
-  mode the session belongs to the viewer and is never released by the server.
+  SIGQUIT, a crash (panic) and the idle timeout all release the till. Only a
+  hard kill (SIGKILL) leaves it occupied until the till times the session out.
+  In live mode the session belongs to the viewer and is never released by the
+  server.
 - **Secrets stay out.** Text typed with `secret: true` is never logged and not
   echoed in the result or in error messages. The server logs to stderr only;
   stdout carries the protocol.
