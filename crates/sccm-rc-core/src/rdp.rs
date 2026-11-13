@@ -1279,7 +1279,7 @@ pub trait SessionSink: Send {
     fn on_terminate(&mut self, reason: String);
 }
 
-/// Connection-progress phases reported through [`FrameSink::on_status`].
+/// Connection-progress phases reported through [`SessionSink::on_status`].
 /// The core stays language-neutral; the viewer localizes them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusPhase {

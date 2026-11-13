@@ -293,14 +293,15 @@ fn login_overlay(
 }
 
 /// Window title for `target` (empty: no target yet). macOS shows just the
-/// target, as Mac apps do (the version is in the About panel); elsewhere
-/// "SCCM RC <version> — <target>". `shown` is `servers::display(target)`.
-fn window_title(target: &str, shown: &str) -> String {
+/// target (`servers::display`), as Mac apps do (the version is in the About
+/// panel); elsewhere "SCCM RC <version> — <target>".
+fn window_title(target: &str) -> String {
+    let shown = servers::display(target);
     if cfg!(target_os = "macos") {
         if target.is_empty() {
             "SCCM RC".to_string()
         } else {
-            shown.to_string()
+            shown
         }
     } else if target.is_empty() {
         format!("SCCM RC {}", env!("CARGO_PKG_VERSION"))
@@ -386,6 +387,27 @@ pub(crate) enum NativeEvent {
     /// Quit from the app menu, the Dock or the system (logout): close any
     /// sheet, release the session, exit.
     Quit,
+}
+
+/// Session state the App pushes into the native chrome (`mac_ui`); the
+/// chrome skips identical states.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // read by mac_ui only
+pub(crate) struct Chrome {
+    pub subtitle: String,
+    /// A remote desktop is showing (session controls enabled).
+    pub connected: bool,
+    /// A session exists or is being set up (Disconnect enabled).
+    pub has_session: bool,
+    /// A native sheet covers the window: the drawn About panel could not
+    /// be dismissed under it.
+    pub sheet: bool,
+    pub view_only: bool,
+    pub curtain: bool,
+    pub recording: bool,
+    pub fullscreen: bool,
+    /// Screen switcher label for multi-monitor targets, else disabled.
+    pub monitor: Option<String>,
 }
 
 /// Shared framebuffer written by the RDP task, read by the renderer.
@@ -800,7 +822,7 @@ fn main() -> anyhow::Result<()> {
         surface: None,
         gpu: None,
         gpu_dump: std::env::var("SCCM_RC_GPU_DUMP").ok(),
-        title: window_title(&target, &servers::display(&target)),
+        title: window_title(&target),
         last_cursor: (0, 0),
         last_move: std::time::Instant::now(),
         cursor,
@@ -1543,12 +1565,16 @@ impl App {
         let Some(native) = self.native.as_ref() else {
             return;
         };
-        let (connected, status_msg, security) = {
+        let (connected, status_msg, security, monitor) = {
             let f = self.shared.lock().unwrap();
+            let connected = f.width != 0 && f.height != 0 && !f.rgba.is_empty();
             (
-                f.width != 0 && f.height != 0 && !f.rgba.is_empty(),
+                connected,
                 f.status.clone(),
                 f.security.clone(),
+                connected
+                    .then(|| Self::monitor_label_for(self.view, f.width, f.height))
+                    .flatten(),
             )
         };
         let has_session = self.input_tx.is_some() && self.running.load(Ordering::Relaxed);
@@ -1574,15 +1600,16 @@ impl App {
         } else {
             String::new()
         };
-        native.update(&mac_ui::Chrome {
+        native.update(&Chrome {
             subtitle,
             connected,
             has_session,
+            sheet: native.sheet_open(),
             view_only: self.view_only,
             curtain: self.curtain.load(Ordering::Relaxed),
             recording: self.recorder.is_some(),
             fullscreen: self.is_fullscreen(),
-            monitor: if connected { self.monitor_label() } else { None },
+            monitor,
         });
     }
 
@@ -1673,7 +1700,7 @@ impl App {
         recent::add(&new_target);
         self.host = new_target.clone();
         let shown = servers::display(&new_target);
-        self.title = window_title(&new_target, &shown);
+        self.title = window_title(&new_target);
         if let Some(w) = &self.window {
             w.set_title(&self.title);
         }
@@ -2062,9 +2089,6 @@ impl ApplicationHandler<UserEvent> for App {
                     w.request_redraw();
                 }
             }
-            // Only the sheet that is still open may answer: a late second
-            // event (double click, Enter twice) must not close the sheet
-            // that replaced it, or act on a session already started.
             UserEvent::Native(NativeEvent::Quit) => {
                 if let Some(native) = self.native.as_ref() {
                     native.close_sheet();
@@ -2074,6 +2098,9 @@ impl ApplicationHandler<UserEvent> for App {
                 let _ = self.done_rx.recv_timeout(std::time::Duration::from_secs(3));
                 event_loop.exit();
             }
+            // Only the sheet that is still open may answer: a late second
+            // event (double click, Enter twice) must not close the sheet
+            // that replaced it, or act on a session already started.
             UserEvent::Native(NativeEvent::Start(outcome)) => {
                 let Some(native) = self.native.as_ref().filter(|n| n.start_open()) else {
                     return;
@@ -2089,6 +2116,11 @@ impl ApplicationHandler<UserEvent> for App {
                 self.on_login_outcome(outcome);
             }
             UserEvent::Native(NativeEvent::Action(action)) => {
+                // The menu item is disabled under a sheet; this covers a
+                // click that was queued before the chrome caught up.
+                if action == ToolbarAction::About && self.native_sheet_open() {
+                    return;
+                }
                 self.run_toolbar_action(action, event_loop);
                 if let Some(w) = &self.window {
                     w.request_redraw();
@@ -2975,37 +3007,38 @@ impl App {
                     self.connect_start.elapsed(),
                 );
             }
-            if quiet {
-            } else if let Some(f) = self.font.as_ref() {
-                f.draw_centered(
-                    &mut ov,
-                    ov_w,
-                    ov_h,
-                    cy as f32 + 4.0,
-                    &self.host,
-                    0x00FF_FFFF,
-                    34.0,
-                );
-                f.draw_centered(
-                    &mut ov,
-                    ov_w,
-                    ov_h,
-                    cy as f32 + 38.0,
-                    &msg,
-                    0x00B0_C0D0,
-                    19.0,
-                );
-            } else {
-                toolbar::draw_text_centered(
-                    &mut ov,
-                    ov_w,
-                    ov_h,
-                    cy.saturating_sub(28),
-                    &self.host,
-                    0x00FF_FFFF,
-                    3,
-                );
-                toolbar::draw_text_centered(&mut ov, ov_w, ov_h, cy + 8, &msg, 0x00B0_C0D0, 2);
+            if !quiet {
+                if let Some(f) = self.font.as_ref() {
+                    f.draw_centered(
+                        &mut ov,
+                        ov_w,
+                        ov_h,
+                        cy as f32 + 4.0,
+                        &self.host,
+                        0x00FF_FFFF,
+                        34.0,
+                    );
+                    f.draw_centered(
+                        &mut ov,
+                        ov_w,
+                        ov_h,
+                        cy as f32 + 38.0,
+                        &msg,
+                        0x00B0_C0D0,
+                        19.0,
+                    );
+                } else {
+                    toolbar::draw_text_centered(
+                        &mut ov,
+                        ov_w,
+                        ov_h,
+                        cy.saturating_sub(28),
+                        &self.host,
+                        0x00FF_FFFF,
+                        3,
+                    );
+                    toolbar::draw_text_centered(&mut ov, ov_w, ov_h, cy + 8, &msg, 0x00B0_C0D0, 2);
+                }
             }
         }
         // Pack 0x00RRGGBB -> RGBA bytes (opaque).
@@ -3179,45 +3212,46 @@ impl App {
                     self.connect_start.elapsed(),
                 );
             }
-            if quiet {
-            } else if let Some(f) = self.font.as_ref() {
-                f.draw_centered(
-                    &mut buffer[..],
-                    win_w,
-                    win_h,
-                    cy as f32 + 4.0,
-                    &self.host,
-                    0x00FF_FFFF,
-                    34.0,
-                );
-                f.draw_centered(
-                    &mut buffer[..],
-                    win_w,
-                    win_h,
-                    cy as f32 + 38.0,
-                    &msg,
-                    0x00B0_C0D0,
-                    19.0,
-                );
-            } else {
-                toolbar::draw_text_centered(
-                    &mut buffer[..],
-                    win_w,
-                    win_h,
-                    cy.saturating_sub(28),
-                    &self.host,
-                    0x00FF_FFFF,
-                    3,
-                );
-                toolbar::draw_text_centered(
-                    &mut buffer[..],
-                    win_w,
-                    win_h,
-                    cy + 8,
-                    &msg,
-                    0x00B0_C0D0,
-                    2,
-                );
+            if !quiet {
+                if let Some(f) = self.font.as_ref() {
+                    f.draw_centered(
+                        &mut buffer[..],
+                        win_w,
+                        win_h,
+                        cy as f32 + 4.0,
+                        &self.host,
+                        0x00FF_FFFF,
+                        34.0,
+                    );
+                    f.draw_centered(
+                        &mut buffer[..],
+                        win_w,
+                        win_h,
+                        cy as f32 + 38.0,
+                        &msg,
+                        0x00B0_C0D0,
+                        19.0,
+                    );
+                } else {
+                    toolbar::draw_text_centered(
+                        &mut buffer[..],
+                        win_w,
+                        win_h,
+                        cy.saturating_sub(28),
+                        &self.host,
+                        0x00FF_FFFF,
+                        3,
+                    );
+                    toolbar::draw_text_centered(
+                        &mut buffer[..],
+                        win_w,
+                        win_h,
+                        cy + 8,
+                        &msg,
+                        0x00B0_C0D0,
+                        2,
+                    );
+                }
             }
         } else {
             let (fb_w, fb_h) = (frame.width, frame.height);
