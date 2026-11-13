@@ -1,4 +1,7 @@
 status:
+  attaching_session: "Sitzung wird verbunden…"
+  display_recovered: "Bild wiederhergestellt – verbinde neu…"
+  loading_desktop: "Desktop wird geladen…"
   connecting_to: "Verbinde mit %{target}…"
   connecting: "Verbinde…"
   existing_session: "Auf %{target} ist bereits eine Remotesteuerungssitzung aktiv (möglicherweise deine vorherige Sitzung). Erneuter Versuch…"
@@ -51,6 +54,13 @@ about:
   dismiss: "Klicken oder Esc drücken zum Schließen"
 
 prompt:
+  name_taken_native: "Name schon für %{host} vergeben. Nochmals «Speichern» ersetzt diesen Eintrag."
+  name_taken: "Name schon für %{host} vergeben. Nochmals Enter ersetzt diesen Eintrag."
+  native_title: "Mit Computer verbinden"
+  save_dots: "Speichern…"
+  rename_dots: "Umbenennen…"
+  quit: "Beenden"
+  empty_native: "Noch keine Ziele. Oben Namen oder IP-Adresse eingeben."
   label: "Computername oder IP-Adresse:"
   connect: "Verbinden"
   cancel: "Abbrechen"
@@ -69,6 +79,7 @@ prompt:
   more: "%{n} weitere – zum Filtern tippen"
 
 login:
+  log_on: "Anmelden"
   title: "Anmelden bei %{target}"
   user: "Benutzer (DOMÄNE\\benutzer):"
   user_placeholder: "DOMÄNE\\benutzer"
@@ -79,3 +90,26 @@ login:
   hint: "Tab = Feld wechseln · Enter = anmelden · Esc = zurück"
   rejected: "Anmeldung abgelehnt: %{reason}"
   save_password: "Passwort im Schlüsselbund sichern"
+
+menu:
+  about: "Über SCCM RC"
+  hide: "SCCM RC ausblenden"
+  hide_others: "Andere ausblenden"
+  show_all: "Alle einblenden"
+  quit: "SCCM RC beenden"
+  connection: "Verbindung"
+  view: "Darstellung"
+  control: "Steuerung"
+  window: "Fenster"
+  minimize: "Im Dock ablegen"
+  zoom: "Zoomen"
+  help: "Hilfe"
+  about_details: "Version, Lizenz und Sicherheit"
+  next_screen: "Nächster Bildschirm"
+  edit: "Bearbeiten"
+  undo: "Widerrufen"
+  redo: "Wiederholen"
+  cut: "Ausschneiden"
+  copy: "Kopieren"
+  paste: "Einsetzen"
+  select_all: "Alles auswählen"

@@ -30,6 +30,11 @@ mod host_prompt;
 mod keychain;
 mod keymap;
 mod login_prompt;
+#[cfg(target_os = "macos")]
+mod mac_ui;
+#[cfg(not(target_os = "macos"))]
+#[path = "mac_ui_stub.rs"]
+mod mac_ui;
 mod paths;
 mod recent;
 mod record;
@@ -287,6 +292,23 @@ fn login_overlay(
     }
 }
 
+/// Window title for `target` (empty: no target yet). macOS shows just the
+/// target, as Mac apps do (the version is in the About panel); elsewhere
+/// "SCCM RC <version> — <target>". `shown` is `servers::display(target)`.
+fn window_title(target: &str, shown: &str) -> String {
+    if cfg!(target_os = "macos") {
+        if target.is_empty() {
+            "SCCM RC".to_string()
+        } else {
+            shown.to_string()
+        }
+    } else if target.is_empty() {
+        format!("SCCM RC {}", env!("CARGO_PKG_VERSION"))
+    } else {
+        format!("SCCM RC {} — {shown}", env!("CARGO_PKG_VERSION"))
+    }
+}
+
 /// User name to pre-fill in the logon overlay: `SCCM_USER`, else the last one used.
 fn initial_login_user() -> Option<String> {
     std::env::var("SCCM_USER")
@@ -346,6 +368,24 @@ enum UserEvent {
     LoginFailed(String, Arc<AtomicBool>),
     #[allow(dead_code)] // retained for an alternate teardown path
     Closed(String),
+    /// From the native macOS chrome (menu bar / title-bar toolbar).
+    Native(NativeEvent),
+}
+
+/// What the native macOS UI (`mac_ui`) asks the App to do. Built on the main
+/// thread inside AppKit callbacks and posted through the event loop, so no
+/// App state is touched from inside AppKit.
+#[derive(Debug, Clone)]
+pub(crate) enum NativeEvent {
+    /// A menu or toolbar command; runs exactly like a click on the drawn toolbar.
+    Action(ToolbarAction),
+    /// The native logon sheet was confirmed or cancelled.
+    Logon(login_prompt::LoginOutcome),
+    /// The native start sheet picked a target or asked to quit.
+    Start(host_prompt::PromptOutcome),
+    /// Quit from the app menu, the Dock or the system (logout): close any
+    /// sheet, release the session, exit.
+    Quit,
 }
 
 /// Shared framebuffer written by the RDP task, read by the renderer.
@@ -482,7 +522,12 @@ impl SessionSink for FrameSink {
         self.shared.lock().unwrap().bytes_per_sec = stats.bytes_per_sec;
         let _ = self.proxy.send_event(UserEvent::Frame);
     }
-    fn on_status(&mut self, status: &str) {
+    fn on_status(&mut self, phase: rdp::StatusPhase) {
+        let status = match phase {
+            rdp::StatusPhase::AttachingSession => t!("status.attaching_session"),
+            rdp::StatusPhase::DisplayRecovered => t!("status.display_recovered"),
+            rdp::StatusPhase::LoadingDesktop => t!("status.loading_desktop"),
+        };
         self.shared.lock().unwrap().status = status.to_string();
         let _ = self.proxy.send_event(UserEvent::Frame);
     }
@@ -755,11 +800,7 @@ fn main() -> anyhow::Result<()> {
         surface: None,
         gpu: None,
         gpu_dump: std::env::var("SCCM_RC_GPU_DUMP").ok(),
-        title: format!(
-            "SCCM RC {} — {}",
-            env!("CARGO_PKG_VERSION"),
-            servers::display(&target)
-        ),
+        title: window_title(&target, &servers::display(&target)),
         last_cursor: (0, 0),
         last_move: std::time::Instant::now(),
         cursor,
@@ -805,6 +846,7 @@ fn main() -> anyhow::Result<()> {
         cliprdr_req_counter,
         paste_pending: None,
         locks_sent: None,
+        native: None,
     };
     event_loop.run_app(&mut app)?;
     // Window closed: stop the session and close the input channel, which unblocks
@@ -1285,6 +1327,9 @@ struct App {
     /// Lock-key state last sent to the remote via an RDP sync event (macOS
     /// only, see `keymap::local_lock_flags`). `None` = not synced yet.
     locks_sent: Option<sccm_rc_core::rdp::SynchronizeFlags>,
+    /// Native macOS chrome (menu bar + title-bar toolbar); `None` elsewhere or
+    /// with `SCCM_RC_NATIVE_UI=0`, where the drawn toolbar strip is used.
+    native: Option<mac_ui::NativeUi>,
 }
 
 struct PastePending {
@@ -1374,7 +1419,171 @@ impl App {
 
     /// Toolbar height in physical pixels (logical height × UI scale).
     fn bar_h_phys(&self) -> u32 {
-        toolbar::TOOLBAR_H * self.window.as_deref().map(ui_scale_of).unwrap_or(1)
+        self.bar_h_logical() * self.window.as_deref().map(ui_scale_of).unwrap_or(1)
+    }
+
+    /// Height of the drawn toolbar strip in logical pixels: 0 when the native
+    /// macOS toolbar replaces it (the desktop then uses the full height).
+    fn bar_h_logical(&self) -> u32 {
+        if self.native.is_some() {
+            0
+        } else {
+            toolbar::TOOLBAR_H
+        }
+    }
+
+    /// A confirmed or cancelled logon, from the drawn overlay or the native
+    /// sheet: store the credentials and connect, or go back to the start screen.
+    fn on_login_outcome(&mut self, outcome: login_prompt::LoginOutcome) {
+        match outcome {
+            login_prompt::LoginOutcome::Confirmed {
+                target,
+                creds,
+                remember,
+                from_keychain,
+            } => {
+                recent::set_last_user(&creds.display_name());
+                // Unticked box: the user doesn't want it saved (any more).
+                if keychain::AVAILABLE && !remember {
+                    keychain::delete(&creds.display_name());
+                }
+                // Save only after a successful logon (SessionActive), and
+                // only if it is not already the saved one.
+                self.keychain_save = remember && !from_keychain;
+                self.creds_in_keychain = remember && from_keychain;
+                self.remember_choice = remember;
+                self.creds = Some(creds);
+                self.start_session(target);
+            }
+            login_prompt::LoginOutcome::Cancelled => self.open_start(),
+        }
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
+    }
+
+    /// A target picked (or quit) on the start screen, from the drawn overlay
+    /// or the native sheet. Returns false when the app is exiting.
+    fn on_host_outcome(
+        &mut self,
+        outcome: host_prompt::PromptOutcome,
+        event_loop: &ActiveEventLoop,
+    ) -> bool {
+        match outcome {
+            host_prompt::PromptOutcome::Confirmed(target) => {
+                self.host_prompt = None;
+                if NEEDS_EXPLICIT_LOGON && self.creds.is_none() {
+                    self.open_logon(target, initial_login_user(), None, true, None);
+                } else {
+                    self.start_session(target);
+                }
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+                true
+            }
+            host_prompt::PromptOutcome::Cancelled => {
+                self.closed = Some(t!("status.disconnected").to_string());
+                event_loop.exit();
+                false
+            }
+        }
+    }
+
+    /// Show the start screen: the native sheet on macOS, else the overlay.
+    fn open_start(&mut self) {
+        if let Some(native) = self.native.as_ref() {
+            self.host_prompt = None;
+            native.show_start();
+        } else {
+            self.host_prompt = Some(host_prompt::HostPromptOverlay::new());
+        }
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
+    }
+
+    /// Ask for the logon: the native sheet on macOS, else the drawn overlay.
+    /// `fill`: fill in a saved password; `remember`: earlier checkbox choice.
+    fn open_logon(
+        &mut self,
+        target: String,
+        user: Option<String>,
+        error: Option<String>,
+        fill: bool,
+        remember: Option<bool>,
+    ) {
+        if let Some(native) = self.native.as_ref() {
+            self.login_prompt = None;
+            native.show_logon(&target, user, error, fill, remember);
+        } else {
+            self.login_prompt = Some(login_overlay(target, user, error, fill, remember));
+        }
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
+    }
+
+    /// The window's real full-screen state: on macOS the user can also leave
+    /// (or enter) full screen with the green title-bar button, which
+    /// `self.fullscreen` does not see.
+    fn is_fullscreen(&self) -> bool {
+        self.window
+            .as_ref()
+            .map_or(self.fullscreen, |w| w.fullscreen().is_some())
+    }
+
+    /// A native sheet covers the window (macOS): draw a calm background only.
+    fn native_sheet_open(&self) -> bool {
+        self.native.as_ref().is_some_and(|n| n.sheet_open())
+    }
+
+    /// Push the session state into the native chrome (no-op without it).
+    fn update_native_chrome(&self) {
+        let Some(native) = self.native.as_ref() else {
+            return;
+        };
+        let (connected, status_msg, security) = {
+            let f = self.shared.lock().unwrap();
+            (
+                f.width != 0 && f.height != 0 && !f.rgba.is_empty(),
+                f.status.clone(),
+                f.security.clone(),
+            )
+        };
+        let has_session = self.input_tx.is_some() && self.running.load(Ordering::Relaxed);
+        let subtitle = if let Some(reason) = &self.closed {
+            t!("status.disconnected_reason", reason => reason).to_string()
+        } else if connected {
+            let mode = if self.view_only {
+                t!("mode.view_only")
+            } else {
+                t!("mode.control")
+            };
+            if security.is_empty() {
+                mode.to_string()
+            } else {
+                format!("{security} \u{00b7} {mode}")
+            }
+        } else if has_session {
+            if status_msg.is_empty() {
+                t!("status.connecting").to_string()
+            } else {
+                status_msg
+            }
+        } else {
+            String::new()
+        };
+        native.update(&mac_ui::Chrome {
+            subtitle,
+            connected,
+            has_session,
+            view_only: self.view_only,
+            curtain: self.curtain.load(Ordering::Relaxed),
+            recording: self.recorder.is_some(),
+            fullscreen: self.is_fullscreen(),
+            monitor: if connected { self.monitor_label() } else { None },
+        });
     }
 
     /// Window size in logical (UI-scale) pixels plus the scale itself, for
@@ -1444,7 +1653,7 @@ impl App {
             let mut f = self.shared.lock().unwrap();
             *f = SharedFrame::default();
         }
-        self.host_prompt = Some(host_prompt::HostPromptOverlay::new());
+        self.open_start();
         self.login_prompt = None;
         self.creds = None; // a new host asks for the password again
         self.keychain_save = false;
@@ -1464,7 +1673,7 @@ impl App {
         recent::add(&new_target);
         self.host = new_target.clone();
         let shown = servers::display(&new_target);
-        self.title = format!("SCCM RC {} — {shown}", env!("CARGO_PKG_VERSION"));
+        self.title = window_title(&new_target, &shown);
         if let Some(w) = &self.window {
             w.set_title(&self.title);
         }
@@ -1661,7 +1870,7 @@ impl App {
                 }
             }
             ToolbarAction::ToggleFullscreen => {
-                self.fullscreen = !self.fullscreen;
+                self.fullscreen = !self.is_fullscreen();
                 if let Some(w) = &self.window {
                     let fs = self
                         .fullscreen
@@ -1739,6 +1948,25 @@ impl ApplicationHandler<UserEvent> for App {
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
         #[cfg(target_os = "macos")]
         set_dock_icon();
+        let proxy = self.proxy.clone();
+        self.native = mac_ui::NativeUi::install(
+            &window,
+            Box::new(move |ev| {
+                let _ = proxy.send_event(UserEvent::Native(ev));
+            }),
+        );
+        if self.native.is_some() {
+            info!("native macOS chrome active (menu bar + title-bar toolbar)");
+            // The first overlay was set up before the window existed; show
+            // the matching native sheet instead.
+            if self.login_prompt.take().is_some() {
+                self.window = Some(window.clone());
+                self.open_logon(self.host.clone(), initial_login_user(), None, true, None);
+            } else if self.host_prompt.take().is_some() {
+                self.window = Some(window.clone());
+                self.open_start();
+            }
+        }
         let context = softbuffer::Context::new(window.clone()).expect("softbuffer context");
         let surface =
             softbuffer::Surface::new(&context, window.clone()).expect("softbuffer surface");
@@ -1823,13 +2051,45 @@ impl ApplicationHandler<UserEvent> for App {
                     *f = SharedFrame::default();
                 }
                 let msg = t!("login.rejected", reason => reason).to_string();
-                self.login_prompt = Some(login_overlay(
+                self.open_logon(
                     self.host.clone(),
                     failed_user.or_else(initial_login_user),
                     Some(msg),
                     false,
                     Some(remember),
-                ));
+                );
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
+            // Only the sheet that is still open may answer: a late second
+            // event (double click, Enter twice) must not close the sheet
+            // that replaced it, or act on a session already started.
+            UserEvent::Native(NativeEvent::Quit) => {
+                if let Some(native) = self.native.as_ref() {
+                    native.close_sheet();
+                }
+                // Same graceful teardown as closing the window.
+                self.begin_shutdown();
+                let _ = self.done_rx.recv_timeout(std::time::Duration::from_secs(3));
+                event_loop.exit();
+            }
+            UserEvent::Native(NativeEvent::Start(outcome)) => {
+                let Some(native) = self.native.as_ref().filter(|n| n.start_open()) else {
+                    return;
+                };
+                native.close_sheet();
+                self.on_host_outcome(outcome, event_loop);
+            }
+            UserEvent::Native(NativeEvent::Logon(outcome)) => {
+                let Some(native) = self.native.as_ref().filter(|n| n.logon_open()) else {
+                    return;
+                };
+                native.close_sheet();
+                self.on_login_outcome(outcome);
+            }
+            UserEvent::Native(NativeEvent::Action(action)) => {
+                self.run_toolbar_action(action, event_loop);
                 if let Some(w) = &self.window {
                     w.request_redraw();
                 }
@@ -1846,6 +2106,8 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // Native macOS chrome mirrors the session state (cheap when unchanged).
+        self.update_native_chrome();
         // UI-thread heartbeat: write a log line every ~5s. If a hang
         // happens, the last heartbeat timestamp is the moment the main
         // thread last responded — the window between it and the Watson
@@ -1883,56 +2145,14 @@ impl ApplicationHandler<UserEvent> for App {
             .as_mut()
             .and_then(|p| p.take_outcome())
         {
-            match outcome {
-                host_prompt::PromptOutcome::Confirmed(target) => {
-                    if NEEDS_EXPLICIT_LOGON && self.creds.is_none() {
-                        self.host_prompt = None;
-                        self.login_prompt =
-                            Some(login_overlay(target, initial_login_user(), None, true, None));
-                        if let Some(w) = &self.window {
-                            w.request_redraw();
-                        }
-                    } else {
-                        self.start_session(target);
-                    }
-                }
-                host_prompt::PromptOutcome::Cancelled => {
-                    self.closed = Some(t!("status.disconnected").to_string());
-                    event_loop.exit();
-                    return;
-                }
+            if !self.on_host_outcome(outcome, event_loop) {
+                return;
             }
         }
         // Drain any pending logon outcome (Enter → connect, Esc → host picker).
         if let Some(outcome) = self.login_prompt.as_mut().and_then(|p| p.take_outcome()) {
             self.login_prompt = None;
-            match outcome {
-                login_prompt::LoginOutcome::Confirmed {
-                    target,
-                    creds,
-                    remember,
-                    from_keychain,
-                } => {
-                    recent::set_last_user(&creds.display_name());
-                    // Unticked box: the user doesn't want it saved (any more).
-                    if keychain::AVAILABLE && !remember {
-                        keychain::delete(&creds.display_name());
-                    }
-                    // Save only after a successful logon (SessionActive), and
-                    // only if it is not already the saved one.
-                    self.keychain_save = remember && !from_keychain;
-                    self.creds_in_keychain = remember && from_keychain;
-                    self.remember_choice = remember;
-                    self.creds = Some(creds);
-                    self.start_session(target);
-                }
-                login_prompt::LoginOutcome::Cancelled => {
-                    self.host_prompt = Some(host_prompt::HostPromptOverlay::new());
-                }
-            }
-            if let Some(w) = &self.window {
-                w.request_redraw();
-            }
+            self.on_login_outcome(outcome);
         }
         // Ctrl+V → UAC fallback: if V has been released AND at least
         // 100 ms elapsed since key-down (floor so a fast tap still gives
@@ -1994,7 +2214,7 @@ impl ApplicationHandler<UserEvent> for App {
             let f = self.shared.lock().unwrap();
             f.width != 0 && !f.rgba.is_empty()
         };
-        if !painted && self.closed.is_none() {
+        if !painted && self.closed.is_none() && !self.native_sheet_open() {
             if let Some(w) = &self.window {
                 w.request_redraw();
             }
@@ -2623,7 +2843,9 @@ impl App {
         let size = window.inner_size();
         let (win_w, win_h) = (size.width.max(1), size.height.max(1));
         let k = ui_scale_of(&window);
-        let bar_h = (toolbar::TOOLBAR_H * k).min(win_h);
+        let bar_h = (self.bar_h_logical() * k).min(win_h);
+        // A native sheet is open: plain background, no spinner or text.
+        let quiet = self.native_sheet_open();
         let mut frame = self.shared.lock().unwrap();
         let connected = frame.width != 0 && frame.height != 0 && !frame.rgba.is_empty();
         let (fb_w, fb_h) = (frame.width, frame.height);
@@ -2671,8 +2893,12 @@ impl App {
         // Overlay is drawn and uploaded at logical size (`ov_w × ov_h`); the GPU
         // stretches it over `dest` with nearest sampling (crisp pixel-doubling).
         let (lw, lh) = ((win_w / k).max(1), (win_h / k).max(1));
+        // With the native macOS toolbar (`bar_h == 0`) there is no strip:
+        // no overlay is drawn or uploaded while the desktop shows.
         let (ov_w, ov_h, dest) = if show_full_overlay {
             (lw, lh, gpu::OverlayDest::Full)
+        } else if bar_h == 0 {
+            (lw, 0, gpu::OverlayDest::TopStrip(0))
         } else {
             (
                 lw,
@@ -2689,6 +2915,8 @@ impl App {
             type_text::draw(&mut ov, ov_w, ov_h, self.font.as_ref(), prompt);
         } else if self.about_open {
             draw_about(&mut ov, ov_w, ov_h, self.font.as_ref());
+        } else if connected && ov_h == 0 {
+            // Native macOS toolbar: nothing to draw over the desktop.
         } else if connected {
             let mode = if self.view_only {
                 t!("mode.view_only")
@@ -2737,7 +2965,7 @@ impl App {
                 status_msg
             };
             let (cx, cy) = (ov_w / 2, ov_h / 2);
-            if self.closed.is_none() {
+            if self.closed.is_none() && !quiet {
                 draw_spinner(
                     &mut ov,
                     ov_w,
@@ -2747,7 +2975,8 @@ impl App {
                     self.connect_start.elapsed(),
                 );
             }
-            if let Some(f) = self.font.as_ref() {
+            if quiet {
+            } else if let Some(f) = self.font.as_ref() {
                 f.draw_centered(
                     &mut ov,
                     ov_w,
@@ -2833,7 +3062,7 @@ impl App {
             win_h,
             bar_h,
             desktop,
-            Some((ov_w, ov_h, &ov_rgba, dest)),
+            (ov_h > 0).then_some((ov_w, ov_h, ov_rgba.as_slice(), dest)),
             cursor_ref,
             desktop_uv,
         );
@@ -2853,6 +3082,9 @@ impl App {
         // Capture the monitor view before borrowing the surface `&mut self.surface`
         // (which then precludes any `&self` method call for the rest of render).
         let view = self.view;
+        let bar_logical = self.bar_h_logical();
+        // A native sheet is open: plain background, no spinner or text.
+        let quiet = self.native_sheet_open();
         let (Some(window), Some(surface)) = (self.window.as_ref(), self.surface.as_mut()) else {
             return;
         };
@@ -2902,7 +3134,7 @@ impl App {
         }
 
         // The remote desktop renders BELOW the toolbar strip (reserved at top).
-        let bar_h = (toolbar::TOOLBAR_H * k).min(win_h);
+        let bar_h = (bar_logical * k).min(win_h);
         let desk_h = win_h.saturating_sub(bar_h).max(1);
         let frame = self.shared.lock().unwrap();
         let frame_count = frame.frames;
@@ -2937,7 +3169,7 @@ impl App {
             let cx = win_w / 2;
             let cy = win_h / 2;
             // Animated spinner above the text (only while still connecting).
-            if self.closed.is_none() {
+            if self.closed.is_none() && !quiet {
                 draw_spinner(
                     &mut buffer[..],
                     win_w,
@@ -2947,7 +3179,8 @@ impl App {
                     self.connect_start.elapsed(),
                 );
             }
-            if let Some(f) = self.font.as_ref() {
+            if quiet {
+            } else if let Some(f) = self.font.as_ref() {
                 f.draw_centered(
                     &mut buffer[..],
                     win_w,
@@ -3164,7 +3397,9 @@ impl App {
             encrypted,
             monitor: monitor_label.as_deref(),
         };
-        if k == 1 {
+        if bar_h == 0 {
+            // Native macOS toolbar: nothing to draw over the desktop.
+        } else if k == 1 {
             toolbar::draw(&mut buffer[..], win_w, win_h, &status, self.font.as_ref());
         } else {
             let strip_h = toolbar::TOOLBAR_H.min(lh);

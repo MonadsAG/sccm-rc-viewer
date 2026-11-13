@@ -1,4 +1,7 @@
 status:
+  attaching_session: "Sessie koppelen…"
+  display_recovered: "Beeld hersteld — opnieuw verbinden…"
+  loading_desktop: "Bureaublad laden…"
   connecting_to: "Verbinden met %{target}…"
   connecting: "Verbinden…"
   existing_session: "Er is al een actieve sessie op %{target} (mogelijk je vorige sessie). Opnieuw proberen…"
@@ -51,6 +54,13 @@ about:
   dismiss: "Klik ergens of druk op Esc om te sluiten"
 
 prompt:
+  name_taken_native: "Naam al gebruikt voor %{host}. Nogmaals Opslaan vervangt die vermelding."
+  name_taken: "Naam al gebruikt voor %{host}. Nogmaals Enter vervangt die vermelding."
+  native_title: "Verbinden met computer"
+  save_dots: "Opslaan…"
+  rename_dots: "Hernoemen…"
+  quit: "Stop"
+  empty_native: "Nog geen doelen. Typ hierboven een naam of IP-adres."
   label: "Computernaam of IP-adres:"
   connect: "Verbinden"
   cancel: "Annuleren"
@@ -69,6 +79,7 @@ prompt:
   more: "nog %{n} – typ om te filteren"
 
 login:
+  log_on: "Aanmelden"
   title: "Aanmelden bij %{target}"
   user: "Gebruiker (DOMEIN\\gebruiker):"
   user_placeholder: "DOMEIN\\gebruiker"
@@ -79,3 +90,26 @@ login:
   hint: "Tab = ander veld · Enter = aanmelden · Esc = terug"
   rejected: "Aanmelding geweigerd: %{reason}"
   save_password: "Wachtwoord bewaren in sleutelhanger"
+
+menu:
+  about: "Over SCCM RC"
+  hide: "Verberg SCCM RC"
+  hide_others: "Verberg andere"
+  show_all: "Toon alles"
+  quit: "Stop SCCM RC"
+  connection: "Verbinding"
+  view: "Weergave"
+  control: "Bediening"
+  window: "Venster"
+  minimize: "Minimaliseer"
+  zoom: "Zoom"
+  help: "Help"
+  about_details: "Versie, licentie en beveiliging"
+  next_screen: "Volgend scherm"
+  edit: "Wijzig"
+  undo: "Herstel"
+  redo: "Opnieuw"
+  cut: "Knip"
+  copy: "Kopieer"
+  paste: "Plak"
+  select_all: "Selecteer alles"
