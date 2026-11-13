@@ -118,3 +118,4 @@ control:
   allow: "Allow Control by Claude"
   active: "Controlled by Claude"
   user_took_over: "User took over"
+  unavailable: "Claude control unavailable: %{reason}"

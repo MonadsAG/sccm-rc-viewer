@@ -421,9 +421,12 @@ impl NativeUi {
         // SAFETY: NSObject's init.
         let toolbar_delegate: Retained<ToolbarDelegate> =
             unsafe { msg_send![super(delegate_obj), init] };
+        // The identifier keys the autosaved layout. Bumped to v2 when the
+        // "Allow control by Claude" toggle was added, so existing users get
+        // the new default layout once instead of a saved one without it.
         let toolbar = NSToolbar::initWithIdentifier(
             NSToolbar::alloc(mtm),
-            &NSString::from_str("sccm-rc.session"),
+            &NSString::from_str("sccm-rc.session.v2"),
         );
         toolbar.setDisplayMode(NSToolbarDisplayMode::IconOnly);
         toolbar.setAllowsUserCustomization(true);

@@ -118,3 +118,4 @@ control:
   allow: "Besturing door Claude toestaan"
   active: "Bestuurd door Claude"
   user_took_over: "Gebruiker heeft overgenomen"
+  unavailable: "Besturing door Claude niet mogelijk: %{reason}"

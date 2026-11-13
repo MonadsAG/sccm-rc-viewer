@@ -15,7 +15,7 @@ use sccm_rc_core::agent::exec::{self, bad_args, Chunk, Held, STEP_GAP};
 use sccm_rc_core::agent::proto::{Command, ErrorCode, Reply};
 use sccm_rc_core::agent::shot::ShotSpace;
 use sccm_rc_core::agent::wait::FrameWatch;
-use sccm_rc_core::rdp::FastPathInputEvent;
+use sccm_rc_core::rdp::{FastPathInputEvent, PointerFlags};
 
 /// Commands are turned away this long after the user's last input.
 pub const COOLDOWN: Duration = Duration::from_secs(2);
@@ -78,6 +78,9 @@ pub trait Target {
     /// `Err` when there is no session (any more).
     fn alive(&self) -> Result<(), Reply>;
     fn send(&mut self, events: Vec<FastPathInputEvent>) -> Result<(), Reply>;
+    /// Let go of keys and buttons. Needs only the input channel: never
+    /// refused for view-only, or a button could stay pressed on the till.
+    fn release(&mut self, events: Vec<FastPathInputEvent>);
     fn watch(&self) -> FrameWatch;
     /// Already redacted text.
     fn audit(&mut self, action: &str);
@@ -223,7 +226,7 @@ impl Job {
     fn release(&mut self, t: &mut dyn Target) {
         let ev = self.held.release_all();
         if !ev.is_empty() {
-            let _ = t.send(ev);
+            t.release(ev);
         }
     }
 
@@ -342,6 +345,28 @@ impl Drop for Ticker {
 }
 
 /// Parse and check one request line. `None` for a blank line.
+/// Whether the user's input event takes over from Claude: anything but a
+/// plain pointer move.
+pub fn counts_as_takeover(ev: &FastPathInputEvent) -> bool {
+    !matches!(ev, FastPathInputEvent::MouseEvent(m) if m.flags == PointerFlags::MOVE)
+}
+
+/// The command's name, for logs (never its arguments).
+pub fn cmd_name(c: &Command) -> &'static str {
+    match c {
+        Command::Status => "status",
+        Command::Screenshot { .. } => "screenshot",
+        Command::Click { .. } => "click",
+        Command::Move { .. } => "move",
+        Command::Scroll { .. } => "scroll",
+        Command::TypeText { .. } => "type_text",
+        Command::Key { .. } => "key",
+        Command::Batch { .. } => "batch",
+        Command::Wait { .. } => "wait",
+        Command::Disconnect => "disconnect",
+    }
+}
+
 pub fn parse_request(line: &[u8]) -> Option<Result<Command, Reply>> {
     let Ok(text) = std::str::from_utf8(line) else {
         return Some(Err(bad_args("request is not valid UTF-8")));
@@ -352,14 +377,8 @@ pub fn parse_request(line: &[u8]) -> Option<Result<Command, Reply>> {
     }
     Some(
         serde_json::from_str::<Command>(text)
-            .map_err(|e| {
-                // serde's message can quote a value, which may be typed text.
-                if text.contains("type_text") {
-                    bad_args("invalid command")
-                } else {
-                    bad_args(format!("invalid command: {e}"))
-                }
-            })
+            // serde's message can quote a value, which may be typed text.
+            .map_err(|_| bad_args("invalid command"))
             .and_then(|c| exec::check(&c).map(|()| c)),
     )
 }
@@ -534,7 +553,7 @@ mod unix {
             } else {
                 super::parse_request(&buf).map(|r| match r {
                     Ok(cmd) => {
-                        debug!(?cmd, "control command");
+                        debug!(cmd = super::cmd_name(&cmd), "control command");
                         let (tx, rx) = mpsc::channel();
                         if !d(cmd, tx) {
                             session_err("the viewer is shutting down")
@@ -594,7 +613,7 @@ mod other {
 mod tests {
     use super::*;
     use sccm_rc_core::agent::proto::Button;
-    use sccm_rc_core::rdp::{KeyboardFlags, MousePdu, PointerFlags};
+    use sccm_rc_core::rdp::{KeyboardFlags, MousePdu};
     use std::sync::mpsc;
 
     fn ms(base: Instant, n: u64) -> Instant {
@@ -688,6 +707,9 @@ mod tests {
             }
             self.sent.extend(events);
             Ok(())
+        }
+        fn release(&mut self, events: Vec<FastPathInputEvent>) {
+            self.sent.extend(events);
         }
         fn watch(&self) -> FrameWatch {
             self.watch.clone()
@@ -949,6 +971,82 @@ mod tests {
             Some(Err(_))
         ));
         assert!(matches!(parse_request(b"\xff\xfe"), Some(Err(_))));
+    }
+
+    #[test]
+    fn release_bypasses_view_only() {
+        let t0 = Instant::now();
+        let mut f = Fake::new();
+        let mut j = Job::new(click(3.0, 4.0));
+        pending(j.poll(t0, &mut f)); // button down
+        f.refuse = true; // the user switched view-only on
+        j.abort(ErrorCode::ControlDisabled, "off", &mut f);
+        assert_eq!(
+            mouse_flags(&f.sent).last(),
+            Some(&PointerFlags::LEFT_BUTTON)
+        );
+        // Same when the next send is refused mid-command.
+        let mut f = Fake::new();
+        let mut j = Job::new(click(3.0, 4.0));
+        pending(j.poll(t0, &mut f));
+        f.refuse = true;
+        done(j.poll(ms(t0, 20), &mut f));
+        assert_eq!(
+            mouse_flags(&f.sent).last(),
+            Some(&PointerFlags::LEFT_BUTTON)
+        );
+    }
+
+    #[test]
+    fn mouse_move_alone_does_not_abort() {
+        let mv = exec::mouse(PointerFlags::MOVE, 5, 5);
+        assert!(!counts_as_takeover(&mv));
+        for ev in [
+            exec::mouse(PointerFlags::LEFT_BUTTON | PointerFlags::DOWN, 5, 5),
+            exec::mouse(PointerFlags::LEFT_BUTTON, 5, 5),
+            exec::mouse(PointerFlags::RIGHT_BUTTON, 5, 5),
+            FastPathInputEvent::MouseEvent(MousePdu {
+                flags: PointerFlags::VERTICAL_WHEEL,
+                number_of_wheel_rotation_units: 120,
+                x_position: 0,
+                y_position: 0,
+            }),
+            FastPathInputEvent::KeyboardEvent(KeyboardFlags::empty(), 0x1E),
+        ] {
+            assert!(counts_as_takeover(&ev), "{ev:?}");
+        }
+        // And a move therefore leaves a running command alone.
+        let t0 = Instant::now();
+        let mut a = Arbiter::default();
+        a.begin_command();
+        if counts_as_takeover(&mv) {
+            a.on_user_input(t0);
+        }
+        assert!(!a.should_abort(t0));
+    }
+
+    #[test]
+    fn parse_errors_are_generic() {
+        for line in [
+            &br#"{"cmd":"nosuch","x":"hunter2"}"#[..],
+            br#"{"cmd":"click","x":"hunter2"}"#,
+            b"not json",
+        ] {
+            match parse_request(line) {
+                Some(Err(Reply::Error { message, .. })) => assert_eq!(message, "invalid command"),
+                r => panic!("{r:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn cmd_name_has_no_arguments() {
+        let c = Command::TypeText {
+            text: "hunter2".into(),
+            secret: false,
+        };
+        assert_eq!(cmd_name(&c), "type_text");
+        assert_eq!(cmd_name(&Command::Batch { steps: vec![c] }), "batch");
     }
 
     #[test]

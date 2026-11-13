@@ -118,3 +118,4 @@ control:
   allow: "Steuerung durch Claude erlauben"
   active: "Von Claude gesteuert"
   user_took_over: "Benutzer hat übernommen"
+  unavailable: "Steuerung durch Claude nicht möglich: %{reason}"

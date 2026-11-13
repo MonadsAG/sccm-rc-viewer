@@ -864,6 +864,7 @@ fn main() -> anyhow::Result<()> {
         control_shot: None,
         control_seen: None,
         control_last_cmd: None,
+        control_error: None,
         user_input_at: std::cell::Cell::new(None),
     };
     event_loop.run_app(&mut app)?;
@@ -1361,6 +1362,8 @@ struct App {
     control_seen: Option<(std::time::Instant, bool)>,
     /// The previous Claude command, for `status`'s idle seconds.
     control_last_cmd: Option<std::time::Instant>,
+    /// Why switching control on failed, shown in the subtitle for a while.
+    control_error: Option<(std::time::Instant, String)>,
     /// Set when the user's own input went to the remote; picked up by
     /// `control_poll_user` (input handlers only have `&self`).
     user_input_at: std::cell::Cell<Option<std::time::Instant>>,
@@ -1418,6 +1421,12 @@ impl control::Target for LiveTarget<'_> {
             .map_err(|_| exec::session_err("could not hand the input to the session"))
     }
 
+    fn release(&mut self, events: Vec<FastPathInputEvent>) {
+        if let Some(tx) = self.tx {
+            let _ = tx.try_send(events);
+        }
+    }
+
     fn watch(&self) -> sccm_rc_core::agent::wait::FrameWatch {
         self.shared.lock().unwrap().watch.clone()
     }
@@ -1466,7 +1475,10 @@ impl App {
             return; // local view-only lock — don't control the remote
         }
         if let Some(tx) = &self.input_tx {
-            self.mark_user_input();
+            // A plain pointer move does not take over from Claude.
+            if control::counts_as_takeover(&ev) {
+                self.mark_user_input();
+            }
             let _ = tx.try_send(vec![ev]);
         }
     }
@@ -1701,6 +1713,11 @@ impl App {
 
     /// Subtitle note while Claude controls (or the user just took over).
     fn control_label(&self) -> Option<String> {
+        if let Some((at, reason)) = &self.control_error {
+            if at.elapsed() < CONTROL_SHOWN {
+                return Some(t!("control.unavailable", reason => reason).to_string());
+            }
+        }
         self.control.as_ref()?;
         if self.control_job.is_some() {
             return Some(t!("control.active").to_string());
@@ -1738,10 +1755,20 @@ impl App {
                 });
                 self.control = Some((server, ticker));
                 self.control_seen = None;
+                self.control_error = None;
                 audit::log_agent(&self.host, "control by Claude allowed");
                 info!("control by Claude allowed");
             }
-            Err(e) => warn!(error = %e, "could not open the control socket"),
+            Err(e) => {
+                warn!(error = %e, "could not open the control socket");
+                self.control_error = Some((std::time::Instant::now(), e.to_string()));
+                // Wake the loop once the note has expired, to clear it.
+                let proxy = self.proxy.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(CONTROL_SHOWN);
+                    let _ = proxy.send_event(UserEvent::Frame);
+                });
+            }
         }
     }
 
