@@ -15,13 +15,15 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use base64::Engine as _;
-use sccm_rc_core::agent::proto::{Button, Command, ErrorCode, Reply};
+use sccm_rc_core::agent::exec::{
+    self, bad_args, no_image, ok, session_err, Chunk, DEFAULT_MAX_WIDTH, STEP_GAP,
+};
+use sccm_rc_core::agent::proto::{Command, ErrorCode, Reply};
 use sccm_rc_core::agent::shot::{self, ShotError, ShotSpace};
-use sccm_rc_core::agent::wait::{FrameWatch, WaitResult};
-use sccm_rc_core::agent::{keys, text};
+use sccm_rc_core::agent::wait::FrameWatch;
 use sccm_rc_core::rdp::{
-    self, FastPathInputEvent, FrameView, InputReceiver, InputSender, MousePdu, PointerFlags,
-    RdpOptions, SessionSink, UpdateRegion,
+    self, FastPathInputEvent, FrameView, InputReceiver, InputSender, RdpOptions, SessionSink,
+    UpdateRegion,
 };
 use sccm_rc_core::{audit, Error as CoreError, LogonCredentials, SccmSession};
 use tokio::sync::oneshot;
@@ -40,15 +42,6 @@ const FIRST_FRAME_WAIT: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(45);
 const POLL: Duration = Duration::from_millis(50);
-const STEP_GAP: Duration = Duration::from_millis(100);
-const DEFAULT_MAX_WIDTH: u32 = 1280;
-/// Longest single `wait`: the MCP loop is serial, so a wait blocks every tool.
-const MAX_WAIT_MS: u64 = 5 * 60 * 1000;
-const MAX_SCROLL: i16 = 50;
-/// One wheel notch in RDP rotation units.
-const WHEEL_NOTCH: i16 = 120;
-/// Events per input batch for typed text.
-const TEXT_CHUNK: usize = 64;
 /// Requested desktop size; the shadowed till reports its own.
 const DESK_W: u16 = 1920;
 const DESK_H: u16 = 1080;
@@ -381,31 +374,8 @@ impl Headless {
     /// Map a point from the tool's coordinate space to desktop pixels.
     fn map_point(&self, x: f64, y: f64, relative: bool) -> Result<(u16, u16), Reply> {
         let (w, h) = self.desk_size();
-        if w == 0 || h == 0 {
-            return Err(no_image());
-        }
         let shot = self.conn.as_ref().and_then(|c| c.shot);
-        let r = if relative {
-            shot::relative_to_desktop(x, y, w, h)
-        } else if let Some(s) = shot {
-            s.to_desktop_checked(x, y, w, h)
-        } else {
-            // No screenshot yet: coordinates are desktop pixels.
-            if !(x.is_finite() && y.is_finite())
-                || x < 0.0
-                || y < 0.0
-                || x > (w - 1) as f64
-                || y > (h - 1) as f64
-            {
-                Err(ShotError::OutOfBounds)
-            } else {
-                Ok((x.round() as u16, y.round() as u16))
-            }
-        };
-        r.map_err(|e| match e {
-            ShotError::StaleShot => bad_args(format!("{e}; take a new screenshot")),
-            e => bad_args(e.to_string()),
-        })
+        exec::map_point(x, y, relative, shot.as_ref(), w, h)
     }
 
     fn session(&self) -> Result<&Session, Reply> {
@@ -462,10 +432,7 @@ impl Headless {
                     (f.rgba.clone(), f.w, f.h)
                 };
                 let mw = max_width.unwrap_or(DEFAULT_MAX_WIDTH);
-                self.audit(&match region {
-                    Some(r) => format!("screenshot region {},{} {}x{}", r.x, r.y, r.w, r.h),
-                    None => "screenshot".into(),
-                });
+                self.audit(&exec::screenshot_audit(region));
                 let (png, space) =
                     tokio::task::spawn_blocking(move || shot::take(&rgba, w, h, region, mw))
                         .await
@@ -484,108 +451,25 @@ impl Headless {
                     scale: space.scale(),
                 })
             }
-            Command::Click {
-                x,
-                y,
-                relative,
-                button,
-                double,
-            } => {
+            cmd @ (Command::Click { .. }
+            | Command::Move { .. }
+            | Command::Scroll { .. }
+            | Command::TypeText { .. }
+            | Command::Key { .. }) => {
                 self.session()?;
-                let (dx, dy) = self.map_point(x, y, relative)?;
-                let b = match button {
-                    Button::Left => PointerFlags::LEFT_BUTTON,
-                    Button::Right => PointerFlags::RIGHT_BUTTON,
-                    Button::Middle => PointerFlags::MIDDLE_BUTTON_OR_WHEEL,
-                };
-                let name = format!("{button:?}").to_lowercase();
-                let kind = if double { "double-click" } else { "click" };
-                self.audit(&format!("{kind} {name} at {dx},{dy}"));
+                let plan = exec::plan_input(&cmd, |x, y, r| self.map_point(x, y, r))?
+                    .ok_or_else(|| bad_args("not an input command"))?;
+                drop(cmd);
+                self.audit(&plan.audit);
                 let s = self.session()?;
-                s.send(vec![mouse(PointerFlags::MOVE, dx, dy)]).await?;
-                for i in 0..if double { 2 } else { 1 } {
-                    if i > 0 {
-                        tokio::time::sleep(Duration::from_millis(50)).await;
-                    }
-                    s.send(vec![mouse(b | PointerFlags::DOWN, dx, dy)]).await?;
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                    s.send(vec![mouse(b, dx, dy)]).await?;
-                }
-                Ok(ok(format!("{kind} at desktop {dx},{dy}")))
-            }
-            Command::Move { x, y, relative } => {
-                self.session()?;
-                let (dx, dy) = self.map_point(x, y, relative)?;
-                self.audit(&format!("move to {dx},{dy}"));
-                self.session()?
-                    .send(vec![mouse(PointerFlags::MOVE, dx, dy)])
-                    .await?;
-                Ok(ok(format!("moved to desktop {dx},{dy}")))
-            }
-            Command::Scroll {
-                x,
-                y,
-                amount,
-                relative,
-            } => {
-                self.session()?;
-                if amount == 0 || amount.abs() > MAX_SCROLL {
-                    return Err(bad_args(format!(
-                        "amount must be between -{MAX_SCROLL} and {MAX_SCROLL} and not 0"
-                    )));
-                }
-                let (dx, dy) = self.map_point(x, y, relative)?;
-                self.audit(&format!("scroll {amount} at {dx},{dy}"));
-                let units = if amount > 0 { WHEEL_NOTCH } else { -WHEEL_NOTCH };
-                let mut ev = vec![mouse(PointerFlags::MOVE, dx, dy)];
-                ev.extend((0..amount.unsigned_abs()).map(|_| {
-                    FastPathInputEvent::MouseEvent(MousePdu {
-                        flags: PointerFlags::VERTICAL_WHEEL,
-                        number_of_wheel_rotation_units: units,
-                        x_position: dx,
-                        y_position: dy,
-                    })
-                }));
-                self.session()?.send(ev).await?;
-                Ok(ok(format!("scrolled {amount} at desktop {dx},{dy}")))
-            }
-            Command::TypeText { text, secret } => {
-                self.session()?;
-                let n = text.chars().count();
-                let (events, skipped) = text::encode_text(&text);
-                self.audit(&if secret {
-                    format!("type_text (secret, {n} chars)")
-                } else {
-                    format!("type_text {text:?}")
-                });
-                drop(text);
-                let s = self.session()?;
-                for chunk in events.chunks(TEXT_CHUNK) {
-                    s.send(chunk.to_vec()).await?;
-                }
-                let sent = n - skipped.len();
-                let mut t = format!("typed {sent} characters");
-                if !skipped.is_empty() {
-                    if secret {
-                        t.push_str(&format!(
-                            "; skipped {} that cannot be sent",
-                            skipped.len()
-                        ));
-                    } else {
-                        t.push_str(&format!(
-                            "; skipped {} that cannot be sent: {skipped:?}",
-                            skipped.len()
-                        ));
+                for chunk in plan.chunks {
+                    match chunk {
+                        Chunk::Input(ev) => s.send(ev).await?,
+                        Chunk::Pause(d) => tokio::time::sleep(d).await,
+                        Chunk::Yield => {}
                     }
                 }
-                Ok(ok(t))
-            }
-            Command::Key { combo } => {
-                self.session()?;
-                let k = keys::parse_combo(&combo).map_err(|e| bad_args(e.to_string()))?;
-                self.audit(&format!("key {combo}"));
-                self.session()?.send(keys::press_combo(&k)).await?;
-                Ok(ok(format!("pressed {combo}")))
+                Ok(ok(plan.done))
             }
             Command::Wait {
                 change,
@@ -593,11 +477,7 @@ impl Headless {
                 timeout_ms,
             } => {
                 let shared = self.session()?.shared.clone();
-                if timeout_ms > MAX_WAIT_MS {
-                    return Err(bad_args(format!(
-                        "timeout_ms must be at most {MAX_WAIT_MS}"
-                    )));
-                }
+                exec::check_wait(timeout_ms)?;
                 let mark = lock(&shared.watch).mark();
                 let started = Instant::now();
                 let timeout = Duration::from_millis(timeout_ms);
@@ -611,12 +491,7 @@ impl Headless {
                         Instant::now(),
                     );
                     if let Some(r) = r {
-                        return Ok(ok(match r {
-                            WaitResult::Changed => "changed",
-                            WaitResult::Stable => "stable",
-                            WaitResult::Timeout => "timeout",
-                        }
-                        .into()));
+                        return Ok(exec::wait_reply(r));
                     }
                     if self.session()?.ended().is_some() {
                         return Err(session_ended());
@@ -705,21 +580,11 @@ impl Backend for Headless {
     }
 
     async fn run(&mut self, cmd: Command) -> Reply {
-        if let Err(e) = cmd.validate() {
-            return bad_args(e);
+        if let Err(e) = exec::check(&cmd) {
+            return e;
         }
         let idle_s = self.idle_s();
         self.touch();
-        if let Command::Batch { steps } = &cmd {
-            if steps.iter().any(|s| {
-                matches!(
-                    s,
-                    Command::Screenshot { .. } | Command::Status | Command::Disconnect
-                )
-            }) {
-                return bad_args("screenshot/status/disconnect are not allowed in batch");
-            }
-        }
         let reaped = self.reap().await;
         let r = match cmd {
             Command::Status | Command::Disconnect => self.step(cmd, idle_s).await,
@@ -740,19 +605,15 @@ impl Backend for Headless {
                     }
                     self.touch();
                     match self.step(s, idle_s).await {
-                        Reply::Error { code, message, .. } => {
+                        e @ Reply::Error { .. } => {
                             self.touch();
-                            return Reply::Error {
-                                code,
-                                message: format!("step {i}: {message}"),
-                                completed_steps: Some(i),
-                            };
+                            return exec::step_failed(i, e);
                         }
                         Reply::Ok { text } => notes.push(text),
                         _ => {}
                     }
                 }
-                ok(format!("batch done: {n} steps ({})", notes.join("; ")))
+                exec::batch_done(n, &notes)
             }
             cmd => self.step(cmd, idle_s).await,
         };
@@ -771,33 +632,8 @@ impl Backend for Headless {
     }
 }
 
-fn mouse(flags: PointerFlags, x: u16, y: u16) -> FastPathInputEvent {
-    FastPathInputEvent::MouseEvent(MousePdu {
-        flags,
-        number_of_wheel_rotation_units: 0,
-        x_position: x,
-        y_position: y,
-    })
-}
-
-fn ok(text: String) -> Reply {
-    Reply::Ok { text }
-}
-
 fn err(code: ErrorCode, message: impl Into<String>) -> Reply {
-    Reply::Error {
-        code,
-        message: message.into(),
-        completed_steps: None,
-    }
-}
-
-fn bad_args(m: impl Into<String>) -> Reply {
-    err(ErrorCode::BadArgs, m)
-}
-
-fn session_err(m: impl Into<String>) -> Reply {
-    err(ErrorCode::Session, m)
+    exec::err(code, message)
 }
 
 fn not_connected() -> Reply {
@@ -809,10 +645,6 @@ fn session_ended() -> Reply {
         ErrorCode::NotConnected,
         "the session has ended; connect again",
     )
-}
-
-fn no_image() -> Reply {
-    session_err("no desktop image yet; use wait (change=true) and try again")
 }
 
 /// A failed start: the reply, and whether the till rejected the logon.
@@ -1069,6 +901,8 @@ async fn session_thread(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sccm_rc_core::agent::proto::Button;
+    use sccm_rc_core::rdp::PointerFlags;
     use std::sync::atomic::AtomicUsize;
 
     type Audited = Arc<Mutex<Vec<String>>>;
@@ -1431,7 +1265,7 @@ mod tests {
                 timeout_ms: 5000,
             })
             .await;
-        assert_eq!(r, ok("changed".into()));
+        assert_eq!(r, ok("changed"));
         let r = hl
             .run(Command::Wait {
                 change: true,
@@ -1439,7 +1273,7 @@ mod tests {
                 timeout_ms: 100,
             })
             .await;
-        assert_eq!(r, ok("timeout".into()));
+        assert_eq!(r, ok("timeout"));
     }
 
     #[tokio::test]
