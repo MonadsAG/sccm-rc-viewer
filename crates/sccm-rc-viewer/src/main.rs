@@ -813,7 +813,6 @@ fn main() -> anyhow::Result<()> {
         gpu_dump: std::env::var("SCCM_RC_GPU_DUMP").ok(),
         title: window_title(&target, &servers::display(&target)),
         last_cursor: (0, 0),
-        cursor_on_desktop: false,
         buttons_down: 0,
         last_move: std::time::Instant::now(),
         cursor,
@@ -875,6 +874,7 @@ fn main() -> anyhow::Result<()> {
     // on the server). Then WAIT for the thread to confirm teardown is done — so we
     // don't exit mid-disconnect and leave the host stuck for the next connect
     // ("existing session"). Bounded, so a mid-connect thread can't block exit.
+    app.release_held_buttons(u8::MAX);
     app.running.store(false, Ordering::Relaxed);
     app.input_tx = None;
     let _ = app.done_rx.recv_timeout(std::time::Duration::from_secs(3));
@@ -1057,14 +1057,31 @@ fn desktop_rect(
     (x, y + bar_h, w, h)
 }
 
-/// Whether to forward a mouse button event: presses only on the desktop,
-/// releases only for buttons we sent as pressed (wherever the pointer is).
-fn forward_button(down: bool, on_desktop: bool, was_down: bool) -> bool {
-    if down {
-        on_desktop
-    } else {
-        was_down
+/// Bit used to track a held mouse button in `App::buttons_down`.
+fn button_bit(button: MouseButton) -> u8 {
+    match button {
+        MouseButton::Left => 1,
+        MouseButton::Right => 2,
+        _ => 4,
     }
+}
+
+/// The release events for every button held in `held` (bit 1 left, 2 right; other
+/// buttons carry no pointer flag and need none); clears `held`.
+fn release_pdus(held: &mut u8, x: u16, y: u16) -> Vec<MousePdu> {
+    let mut out = Vec::new();
+    for (bit, flag) in [(1u8, PointerFlags::LEFT_BUTTON), (2, PointerFlags::RIGHT_BUTTON)] {
+        if *held & bit != 0 {
+            out.push(MousePdu {
+                flags: flag,
+                number_of_wheel_rotation_units: 0,
+                x_position: x,
+                y_position: y,
+            });
+        }
+    }
+    *held = 0;
+    out
 }
 
 /// The point lies inside `rect` (`x, y, w, h` in window pixels).
@@ -1336,8 +1353,6 @@ struct App {
     gpu_dump: Option<String>,
     title: String,
     last_cursor: (u16, u16),
-    /// The pointer is over the desktop rect (not in a letterbox bar).
-    cursor_on_desktop: bool,
     /// Mouse buttons the viewer has sent as down (bit 1 left, 2 right, 4 other).
     buttons_down: u8,
     last_move: std::time::Instant,
@@ -1539,6 +1554,22 @@ impl App {
             force,
             "lock-key sync"
         );
+    }
+
+    /// The user's input can reach the remote (not view-only, channel present).
+    fn can_send_input(&self) -> bool {
+        !self.view_only && self.input_tx.is_some()
+    }
+
+    /// Send releases (at `last_cursor`) for the held buttons in `mask`, and
+    /// clear them from `buttons_down`.
+    fn release_held_buttons(&mut self, mask: u8) {
+        let mut held = self.buttons_down & mask;
+        self.buttons_down &= !mask;
+        let (x, y) = self.last_cursor;
+        for pdu in release_pdus(&mut held, x, y) {
+            self.send_input(FastPathInputEvent::MouseEvent(pdu));
+        }
     }
 
     /// Forward the user's own input to the remote.
@@ -2047,6 +2078,7 @@ impl App {
     /// Signal the session thread to stop and disconnect gracefully: clear
     /// `running` and drop the input sender (unblocks run_active_session).
     fn begin_shutdown(&mut self) {
+        self.release_held_buttons(u8::MAX);
         self.running.store(false, Ordering::Relaxed);
         self.input_tx = None;
     }
@@ -2114,6 +2146,7 @@ impl App {
             self.creds.clone(),
         );
         self.running = running;
+        self.buttons_down = 0;
         #[cfg(windows)]
         winhook::set_tx(Some(input_tx.clone()));
         self.input_tx = Some(input_tx);
@@ -2726,14 +2759,12 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 let Some((x, y)) = self.map_cursor(position.x, position.y) else {
                     // In the letterbox bars: nothing to forward.
-                    self.cursor_on_desktop = false;
                     if let Some(w) = &self.window {
                         w.set_cursor_visible(true);
                         w.request_redraw();
                     }
                     return;
                 };
-                self.cursor_on_desktop = true;
                 self.last_cursor = (x, y);
                 // Redraw so the client-side cursor follows the mouse instantly
                 // (winit coalesces these into one redraw per frame).
@@ -2767,6 +2798,18 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
+                // A release for a button we sent as down always goes out, wherever
+                // the pointer is now (bar, toolbar, overlay), so the remote never
+                // keeps a button held.
+                let bit = button_bit(button);
+                if state == ElementState::Released && self.buttons_down & bit != 0 {
+                    let at = self
+                        .map_cursor(self.mouse_win.0, self.mouse_win.1)
+                        .unwrap_or(self.last_cursor);
+                    self.last_cursor = at;
+                    self.release_held_buttons(bit);
+                    return;
+                }
                 // While the About overlay is open, a left click anywhere closes it
                 // and is neither hit-tested against the toolbar nor forwarded.
                 if self.about_open {
@@ -2825,24 +2868,16 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
                 let down = state == ElementState::Pressed;
-                let on_desktop = self
-                    .map_cursor(self.mouse_win.0, self.mouse_win.1)
-                    .is_some();
-                let bit = match button {
-                    MouseButton::Left => 1u8,
-                    MouseButton::Right => 2,
-                    _ => 4,
+                // Only presses reach here; they start on the desktop rect, at the
+                // freshly mapped position.
+                let Some((x, y)) = self.map_cursor(self.mouse_win.0, self.mouse_win.1) else {
+                    return;
                 };
-                // Presses only start on the desktop; a release always follows a
-                // press we sent, even when the pointer has since left for a bar.
-                if !forward_button(down, on_desktop, self.buttons_down & bit != 0) {
+                if !down || !self.can_send_input() {
                     return;
                 }
-                if down {
-                    self.buttons_down |= bit;
-                } else {
-                    self.buttons_down &= !bit;
-                }
+                self.last_cursor = (x, y);
+                self.buttons_down |= bit;
                 let mut flags = match button {
                     MouseButton::Left => PointerFlags::LEFT_BUTTON,
                     MouseButton::Right => PointerFlags::RIGHT_BUTTON,
@@ -2851,7 +2886,6 @@ impl ApplicationHandler<UserEvent> for App {
                 if down {
                     flags |= PointerFlags::DOWN;
                 }
-                let (x, y) = self.last_cursor;
                 self.send_input(FastPathInputEvent::MouseEvent(MousePdu {
                     flags,
                     number_of_wheel_rotation_units: 0,
@@ -2860,7 +2894,8 @@ impl ApplicationHandler<UserEvent> for App {
                 }));
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                if !self.cursor_on_desktop {
+                // Wheel over a letterbox bar (or the toolbar) is not forwarded.
+                if self.map_cursor(self.mouse_win.0, self.mouse_win.1).is_none() {
                     return;
                 }
                 // MS-RDPBCGR: a wheel event needs PTRFLAGS_VERTICAL_WHEEL
@@ -2918,6 +2953,9 @@ impl ApplicationHandler<UserEvent> for App {
                 // the OS shortcuts back to whichever window the user switched to.
                 #[cfg(windows)]
                 winhook::set_active(has_focus);
+                if !has_focus {
+                    self.release_held_buttons(u8::MAX);
+                }
                 #[cfg(not(windows))]
                 if !has_focus {
                     self.release_remote_modifiers();
@@ -3969,7 +4007,8 @@ mod ui_scale_tests {
 
 #[cfg(test)]
 mod aspect_tests {
-    use super::{fit_rect, forward_button, map_to_desktop};
+    use super::{fit_rect, map_to_desktop, release_pdus};
+    use super::PointerFlags;
 
     #[test]
     fn fit_rect_letterboxes_wide_window() {
@@ -4009,13 +4048,16 @@ mod aspect_tests {
     }
 
     #[test]
-    fn release_in_bar_is_still_sent() {
-        // Press on the desktop, drag into a bar, release: the release goes out.
-        assert!(forward_button(true, true, false));
-        assert!(forward_button(false, false, true));
-        // A press in a bar is dropped, and so is its release.
-        assert!(!forward_button(true, false, false));
-        assert!(!forward_button(false, true, false));
+    fn held_buttons_released_on_focus_loss() {
+        let mut held = 1 | 2 | 4;
+        let ev = release_pdus(&mut held, 10, 20);
+        assert_eq!(held, 0);
+        assert_eq!(ev.len(), 2);
+        assert_eq!(ev[0].flags, PointerFlags::LEFT_BUTTON);
+        assert_eq!(ev[1].flags, PointerFlags::RIGHT_BUTTON);
+        assert!(ev.iter().all(|e| e.x_position == 10 && e.y_position == 20));
+        // Nothing held: nothing to send.
+        assert!(release_pdus(&mut held, 0, 0).is_empty());
     }
 
     #[test]
