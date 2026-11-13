@@ -137,8 +137,14 @@ pub fn list() -> Vec<Value> {
 
 fn to_command(cmd: &str, mut obj: Map<String, Value>) -> Result<Command, String> {
     obj.insert("cmd".into(), Value::String(cmd.into()));
-    serde_json::from_value(Value::Object(obj))
-        .map_err(|e| format!("invalid arguments for {cmd}: {e}"))
+    serde_json::from_value(Value::Object(obj)).map_err(|e| {
+        if cmd == "type_text" {
+            // serde's message can quote the offending value, which may be a password.
+            format!("invalid arguments for {cmd}")
+        } else {
+            format!("invalid arguments for {cmd}: {e}")
+        }
+    })
 }
 
 /// Map a tool name and its arguments to a call. Errors become tool errors.
@@ -203,12 +209,24 @@ fn text_result(text: String) -> Value {
     json!({"content":[{"type":"text","text":text}], "isError": false})
 }
 
-/// Build the tool result. `secret_typed` is the character count of a secret
-/// type_text; its success message is ours, never the backend's.
-pub fn result(reply: Reply, secret_typed: Option<usize>) -> Value {
+/// Secret input carried by a command, so its result can be sanitized.
+#[derive(Clone, Copy)]
+pub enum Secret {
+    /// A top-level secret type_text of this many characters.
+    Text(usize),
+    /// A batch of this many steps containing a secret type_text.
+    Batch(usize),
+}
+
+/// Build the tool result. For secret input the success message is ours and
+/// error text from the backend is dropped, never passed through.
+pub fn result(reply: Reply, secret: Option<Secret>) -> Value {
     match reply {
-        Reply::Ok { text } => match secret_typed {
-            Some(n) => text_result(format!("typed {n} characters (secret)")),
+        Reply::Ok { text } => match secret {
+            Some(Secret::Text(n)) => text_result(format!("typed {n} characters (secret)")),
+            Some(Secret::Batch(n)) => {
+                text_result(format!("batch done: {n} steps (contains secret input)"))
+            }
             None => text_result(text),
         },
         Reply::Image {
@@ -247,7 +265,11 @@ pub fn result(reply: Reply, secret_typed: Option<usize>) -> Value {
                 .ok()
                 .and_then(|v| v.as_str().map(str::to_string))
                 .unwrap_or_default();
-            let mut t = format!("{message} ({code})");
+            let mut t = if secret.is_some() {
+                format!("failed ({code}); details withheld because the input was secret")
+            } else {
+                format!("{message} ({code})")
+            };
             if let Some(n) = completed_steps {
                 t.push_str(&format!("; {n} step(s) completed before the error"));
             }
@@ -256,10 +278,13 @@ pub fn result(reply: Reply, secret_typed: Option<usize>) -> Value {
     }
 }
 
-/// Character count if the command is a secret type_text.
-pub fn secret_len(cmd: &Command) -> Option<usize> {
+/// Whether the command carries secret input.
+pub fn secret_input(cmd: &Command) -> Option<Secret> {
     match cmd {
-        Command::TypeText { text, secret: true } => Some(text.chars().count()),
+        Command::TypeText { text, secret: true } => Some(Secret::Text(text.chars().count())),
+        Command::Batch { steps } if steps.iter().any(|s| secret_input(s).is_some()) => {
+            Some(Secret::Batch(steps.len()))
+        }
         _ => None,
     }
 }

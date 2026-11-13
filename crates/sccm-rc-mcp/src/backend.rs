@@ -4,6 +4,8 @@
 use async_trait::async_trait;
 use sccm_rc_core::agent::proto::{Command, ErrorCode, Reply};
 
+/// Replies must never echo typed text: a secret type_text may be part of any
+/// command, and the MCP layer cannot know what a backend put in free text.
 #[async_trait]
 pub trait Backend {
     async fn connect(&mut self, target: &str, force: bool) -> Reply;

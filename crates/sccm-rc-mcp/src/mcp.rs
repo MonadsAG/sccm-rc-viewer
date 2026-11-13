@@ -23,24 +23,34 @@ impl Server {
         R: AsyncBufRead + Unpin,
         W: AsyncWrite + Unpin,
     {
-        let mut line = String::new();
+        let r = self.run_loop(&mut input, &mut output).await;
+        self.backend.shutdown().await;
+        r
+    }
+
+    async fn run_loop<R, W>(&mut self, input: &mut R, output: &mut W) -> Result<()>
+    where
+        R: AsyncBufRead + Unpin,
+        W: AsyncWrite + Unpin,
+    {
+        let mut buf = Vec::new();
         loop {
-            line.clear();
-            if input.read_line(&mut line).await? == 0 {
-                break;
+            buf.clear();
+            if input.read_until(b'\n', &mut buf).await? == 0 {
+                return Ok(());
             }
-            if line.trim().is_empty() {
-                continue;
-            }
-            if let Some(resp) = self.handle_line(&line).await {
+            let resp = match std::str::from_utf8(&buf) {
+                Ok(line) if line.trim().is_empty() => continue,
+                Ok(line) => self.handle_line(line).await,
+                Err(_) => Some(rpc_error(Value::Null, -32700, "parse error: invalid UTF-8")),
+            };
+            if let Some(resp) = resp {
                 let mut s = resp.to_string();
                 s.push('\n');
                 output.write_all(s.as_bytes()).await?;
                 output.flush().await?;
             }
         }
-        self.backend.shutdown().await;
-        Ok(())
     }
 
     /// Handle one JSON-RPC message; `None` for notifications.
@@ -49,8 +59,12 @@ impl Server {
             Ok(v) => v,
             Err(e) => return Some(rpc_error(Value::Null, -32700, &format!("parse error: {e}"))),
         };
+        if !msg.is_object() {
+            return Some(rpc_error(Value::Null, -32600, "invalid request"));
+        }
+        // Notifications (no id) and stray responses (no method) get no reply.
         let id = msg.get("id").cloned()?;
-        let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
+        let method = msg.get("method").and_then(Value::as_str)?;
         let params = msg.get("params").cloned().unwrap_or(Value::Null);
         Some(match method {
             "initialize" => rpc_ok(
@@ -89,7 +103,7 @@ impl Server {
             Call::Run(cmd) => {
                 // Debug only: it redacts secret text; never serialize a Command here.
                 tracing::info!("tool {name}: {cmd:?}");
-                let secret = tools::secret_len(&cmd);
+                let secret = tools::secret_input(&cmd);
                 let reply = self.backend.run(cmd).await;
                 tools::result(reply, secret)
             }
@@ -318,6 +332,104 @@ mod tests {
         assert_eq!(r["result"]["isError"], true);
         let t = r["result"]["content"][0]["text"].as_str().unwrap();
         assert!(t.contains("no till") && t.contains('2'), "{t}");
+    }
+
+    struct Echo;
+
+    #[async_trait]
+    impl Backend for Echo {
+        async fn connect(&mut self, _: &str, _: bool) -> Reply {
+            ok()
+        }
+        async fn run(&mut self, cmd: Command) -> Reply {
+            let text = format!("{}", serde_json::to_string(&cmd).unwrap());
+            if matches!(cmd, Command::Batch { ref steps } if steps.len() == 3) {
+                Reply::Error {
+                    code: sccm_rc_core::agent::proto::ErrorCode::Session,
+                    message: text,
+                    completed_steps: Some(1),
+                }
+            } else {
+                Reply::Ok { text }
+            }
+        }
+        async fn shutdown(&mut self) {}
+    }
+
+    #[tokio::test]
+    async fn batch_secret_not_echoed() {
+        let mut s = Server::new(Box::new(Echo));
+        for steps in [
+            json!([{"type":"type_text","text":"hunter22","secret":true},{"type":"key","combo":"Enter"}]),
+            json!([{"type":"key","combo":"Tab"},{"type":"type_text","text":"hunter22","secret":true},{"type":"key","combo":"Enter"}]),
+        ] {
+            let r = rpc(&mut s, call("batch", json!({"steps": steps}))).await;
+            let out = r.to_string();
+            assert!(!out.contains("hunter22"), "{out}");
+        }
+        // non-secret batch is passed through
+        let r = rpc(
+            &mut s,
+            call("batch", json!({"steps":[{"type":"key","combo":"Tab"}]})),
+        )
+        .await;
+        assert!(r.to_string().contains("Tab"));
+    }
+
+    #[tokio::test]
+    async fn secret_type_text_parse_error_is_generic() {
+        let (mut s, _) = server(ok());
+        let r = rpc(
+            &mut s,
+            call("type_text", json!({"text":"hunter22","secret":"yes"})),
+        )
+        .await;
+        assert_eq!(r["result"]["isError"], true);
+        assert!(!r.to_string().contains("hunter22"));
+        let r = rpc(
+            &mut s,
+            call(
+                "batch",
+                json!({"steps":[{"type":"type_text","text":"hunter22","secret":"yes"}]}),
+            ),
+        )
+        .await;
+        assert_eq!(r["result"]["isError"], true);
+        assert!(!r.to_string().contains("hunter22"));
+    }
+
+    #[tokio::test]
+    async fn invalid_utf8_line_is_parse_error_and_loop_continues() {
+        let (mut s, _) = server(ok());
+        let mut input: Vec<u8> = b"\xff\xfe\n".to_vec();
+        input.extend_from_slice(b"{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"ping\"}\n");
+        let mut out = Vec::new();
+        s.serve(tokio::io::BufReader::new(&input[..]), &mut out)
+            .await
+            .unwrap();
+        let lines: Vec<Value> = String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0]["error"]["code"], -32700);
+        assert_eq!(lines[0]["id"], Value::Null);
+        assert_eq!(lines[1]["id"], 7);
+    }
+
+    #[tokio::test]
+    async fn non_object_is_invalid_request_and_responses_ignored() {
+        let (mut s, _) = server(ok());
+        for bad in ["[1,2]", "42"] {
+            let r = s.handle_line(bad).await.unwrap();
+            assert_eq!(r["error"]["code"], -32600);
+            assert_eq!(r["id"], Value::Null);
+        }
+        assert!(s
+            .handle_line(r#"{"jsonrpc":"2.0","id":5,"result":{}}"#)
+            .await
+            .is_none());
     }
 
     #[tokio::test]
