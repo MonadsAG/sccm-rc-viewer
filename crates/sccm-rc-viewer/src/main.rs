@@ -814,6 +814,7 @@ fn main() -> anyhow::Result<()> {
         title: window_title(&target, &servers::display(&target)),
         last_cursor: (0, 0),
         cursor_on_desktop: false,
+        buttons_down: 0,
         last_move: std::time::Instant::now(),
         cursor,
         mouse_win: (0.0, 0.0),
@@ -1030,9 +1031,6 @@ fn ui_scale_of(w: &Window) -> u32 {
     forced.unwrap_or_else(|| (w.scale_factor().floor() as u32).clamp(1, 4))
 }
 
-/// Nearest-neighbour upscale of a logical `lw × lh` buffer by `k` into a
-/// `pw × ph` physical buffer. Rows/columns past `lw*k` / `lh*k` (when the
-/// physical size is not a multiple of `k`) repeat the last logical pixel.
 /// Largest rect with the desktop's aspect ratio that fits (centred) inside the
 /// `area_w × area_h` area. Returns `(x, y, w, h)` relative to the area; the rest
 /// of the area is letterbox/pillarbox bars.
@@ -1057,6 +1055,16 @@ fn desktop_rect(
 ) -> (u32, u32, u32, u32) {
     let (x, y, w, h) = fit_rect(crop.2, crop.3, win_w, win_h.saturating_sub(bar_h));
     (x, y + bar_h, w, h)
+}
+
+/// Whether to forward a mouse button event: presses only on the desktop,
+/// releases only for buttons we sent as pressed (wherever the pointer is).
+fn forward_button(down: bool, on_desktop: bool, was_down: bool) -> bool {
+    if down {
+        on_desktop
+    } else {
+        was_down
+    }
 }
 
 /// The point lies inside `rect` (`x, y, w, h` in window pixels).
@@ -1089,6 +1097,9 @@ fn map_to_desktop(
     Some((dx as u16, dy as u16))
 }
 
+/// Nearest-neighbour upscale of a logical `lw × lh` buffer by `k` into a
+/// `pw × ph` physical buffer. Rows/columns past `lw*k` / `lh*k` (when the
+/// physical size is not a multiple of `k`) repeat the last logical pixel.
 fn upscale_into(src: &[u32], lw: u32, lh: u32, k: u32, dst: &mut [u32], pw: u32, ph: u32) {
     if lw == 0 || lh == 0 {
         return;
@@ -1327,6 +1338,8 @@ struct App {
     last_cursor: (u16, u16),
     /// The pointer is over the desktop rect (not in a letterbox bar).
     cursor_on_desktop: bool,
+    /// Mouse buttons the viewer has sent as down (bit 1 left, 2 right, 4 other).
+    buttons_down: u8,
     last_move: std::time::Instant,
     cursor: Arc<Mutex<CursorState>>,
     mouse_win: (f64, f64),
@@ -2811,10 +2824,25 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     return;
                 }
-                if !self.cursor_on_desktop {
+                let down = state == ElementState::Pressed;
+                let on_desktop = self
+                    .map_cursor(self.mouse_win.0, self.mouse_win.1)
+                    .is_some();
+                let bit = match button {
+                    MouseButton::Left => 1u8,
+                    MouseButton::Right => 2,
+                    _ => 4,
+                };
+                // Presses only start on the desktop; a release always follows a
+                // press we sent, even when the pointer has since left for a bar.
+                if !forward_button(down, on_desktop, self.buttons_down & bit != 0) {
                     return;
                 }
-                let down = state == ElementState::Pressed;
+                if down {
+                    self.buttons_down |= bit;
+                } else {
+                    self.buttons_down &= !bit;
+                }
                 let mut flags = match button {
                     MouseButton::Left => PointerFlags::LEFT_BUTTON,
                     MouseButton::Right => PointerFlags::RIGHT_BUTTON,
@@ -2832,6 +2860,9 @@ impl ApplicationHandler<UserEvent> for App {
                 }));
             }
             WindowEvent::MouseWheel { delta, .. } => {
+                if !self.cursor_on_desktop {
+                    return;
+                }
                 // MS-RDPBCGR: a wheel event needs PTRFLAGS_VERTICAL_WHEEL
                 // (0x0200) or PTRFLAGS_HORIZONTAL_WHEEL (0x0400), otherwise
                 // the server ignores the rotation units field. IronRDP adds
@@ -3938,7 +3969,7 @@ mod ui_scale_tests {
 
 #[cfg(test)]
 mod aspect_tests {
-    use super::{fit_rect, map_to_desktop};
+    use super::{fit_rect, forward_button, map_to_desktop};
 
     #[test]
     fn fit_rect_letterboxes_wide_window() {
@@ -3975,6 +4006,16 @@ mod aspect_tests {
             map_to_desktop(1166.9, 649.9, rect, crop, fb),
             Some((1023, 767))
         );
+    }
+
+    #[test]
+    fn release_in_bar_is_still_sent() {
+        // Press on the desktop, drag into a bar, release: the release goes out.
+        assert!(forward_button(true, true, false));
+        assert!(forward_button(false, false, true));
+        // A press in a bar is dropped, and so is its release.
+        assert!(!forward_button(true, false, false));
+        assert!(!forward_button(false, true, false));
     }
 
     #[test]
