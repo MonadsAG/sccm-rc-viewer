@@ -166,8 +166,20 @@ fn draw_about(buf: &mut [u32], w: u32, h: u32, font: Option<&text::TextRenderer>
     let lines: [(f32, String, u32, f32, u32); 7] = [
         (cy - 96.0, "sccm-rc".to_string(), 0x00FF_FFFF, 40.0, 3),
         (cy - 50.0, format!("v{VERSION}"), 0x00C8_D2DC, 20.0, 2),
-        (cy - 16.0, t!("about.tagline").to_string(), 0x00B0_C0D0, 19.0, 2),
-        (cy + 16.0, "MIT OR Apache-2.0".to_string(), 0x0090_9CA8, 17.0, 2),
+        (
+            cy - 16.0,
+            t!("about.tagline").to_string(),
+            0x00B0_C0D0,
+            19.0,
+            2,
+        ),
+        (
+            cy + 16.0,
+            "MIT OR Apache-2.0".to_string(),
+            0x0090_9CA8,
+            17.0,
+            2,
+        ),
         (
             cy + 44.0,
             "github.com/conocidotech/sccm-rc-viewer".to_string(),
@@ -175,18 +187,37 @@ fn draw_about(buf: &mut [u32], w: u32, h: u32, font: Option<&text::TextRenderer>
             17.0,
             2,
         ),
-        (cy + 76.0, t!("about.security").to_string(), 0x0070_C070, 17.0, 2),
-        (cy + 118.0, t!("about.dismiss").to_string(), 0x0070_7880, 15.0, 1),
+        (
+            cy + 76.0,
+            t!("about.security").to_string(),
+            0x0070_C070,
+            17.0,
+            2,
+        ),
+        (
+            cy + 118.0,
+            t!("about.dismiss").to_string(),
+            0x0070_7880,
+            15.0,
+            1,
+        ),
     ];
     for (y, text, color, size_px, scale) in lines {
         if let Some(f) = font {
             f.draw_centered(buf, w, h, y, &text, color, size_px);
         } else {
-            toolbar::draw_text_centered(buf, w, h, (y as u32).saturating_sub(4), &text, color, scale);
+            toolbar::draw_text_centered(
+                buf,
+                w,
+                h,
+                (y as u32).saturating_sub(4),
+                &text,
+                color,
+                scale,
+            );
         }
     }
 }
-
 
 /// Native file picker (PowerShell OpenFileDialog) → the selected path.
 #[cfg(windows)]
@@ -632,7 +663,10 @@ fn init_tracing() -> Option<tracing_appender::non_blocking::WorkerGuard> {
             Some(guard)
         }
         Err(e) => {
-            tracing_subscriber::registry().with(filter).with(console).init();
+            tracing_subscriber::registry()
+                .with(filter)
+                .with(console)
+                .init();
             tracing::warn!(error = %e, "could not open viewer.log; console-only logging");
             None
         }
@@ -857,7 +891,13 @@ fn main() -> anyhow::Result<()> {
         },
         type_prompt: None,
         login_prompt: if login_first {
-            Some(login_overlay(target.clone(), initial_login_user(), None, true, None))
+            Some(login_overlay(
+                target.clone(),
+                initial_login_user(),
+                None,
+                true,
+                None,
+            ))
         } else {
             None
         },
@@ -1430,7 +1470,7 @@ impl App {
         let ext = KeyboardFlags::EXTENDED;
         let up = KeyboardFlags::RELEASE;
         let seq = vec![
-            FastPathInputEvent::KeyboardEvent(ext, 0x5B),      // Win down (extended)
+            FastPathInputEvent::KeyboardEvent(ext, 0x5B), // Win down (extended)
             FastPathInputEvent::KeyboardEvent(ext | up, 0x5B), // Win up
         ];
         if let Some(tx) = &self.input_tx {
@@ -1938,11 +1978,7 @@ impl App {
                             let body = t!("report.dialog_body").to_string();
                             let dir_for_dialog = dir.clone();
                             std::thread::spawn(move || {
-                                if report::confirm_and_open(
-                                    &dir_for_dialog,
-                                    &title,
-                                    &body,
-                                ) {
+                                if report::confirm_and_open(&dir_for_dialog, &title, &body) {
                                     report::open_in_explorer(&dir_for_dialog);
                                 }
                             });
@@ -2153,11 +2189,7 @@ impl ApplicationHandler<UserEvent> for App {
             );
         }
         // Drain any pending type-text outcome (Enter → send, Esc → cancel).
-        if let Some(outcome) = self
-            .type_prompt
-            .as_mut()
-            .and_then(|p| p.take_outcome())
-        {
+        if let Some(outcome) = self.type_prompt.as_mut().and_then(|p| p.take_outcome()) {
             match outcome {
                 type_text::TypeOutcome::Confirmed(events) => {
                     if let Some(tx) = &self.input_tx {
@@ -2172,11 +2204,7 @@ impl ApplicationHandler<UserEvent> for App {
             }
         }
         // Drain any pending host-prompt outcome (Enter → connect, Esc → exit).
-        if let Some(outcome) = self
-            .host_prompt
-            .as_mut()
-            .and_then(|p| p.take_outcome())
-        {
+        if let Some(outcome) = self.host_prompt.as_mut().and_then(|p| p.take_outcome()) {
             if !self.on_host_outcome(outcome, event_loop) {
                 return;
             }

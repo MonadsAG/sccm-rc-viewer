@@ -1032,9 +1032,8 @@ pub async fn connect_rdp(
         connector = connector.with_static_channel(PassiveRdpsnd);
         // Real clipboard channel (SCCM_RC_CLIP=1), else a passive placeholder.
         if std::env::var("SCCM_RC_CLIP").as_deref() == Ok("1") {
-            connector = connector.with_static_channel(CliprdrChannel::with_counter(
-                cliprdr_req_counter.clone(),
-            ));
+            connector = connector
+                .with_static_channel(CliprdrChannel::with_counter(cliprdr_req_counter.clone()));
         } else {
             connector = connector.with_static_channel(PassiveCliprdr);
         }
@@ -1875,8 +1874,7 @@ pub async fn run_active_session(
                     // new ActiveStage can route SVC traffic — without this, any
                     // post-reactivation packet on rdpsnd/cliprdr/etc. trips an
                     // "unexpected channel ID" error and forces a reconnect.
-                    let arb_enabled_now =
-                        std::env::var("SCCM_RC_ARB").as_deref() == Ok("1");
+                    let arb_enabled_now = std::env::var("SCCM_RC_ARB").as_deref() == Ok("1");
                     new_result.static_channels = build_wlc_channel_set(
                         arb_enabled_now,
                         clip_enabled,
@@ -2592,7 +2590,6 @@ pub struct LoggingSink {
     pub updates: u64,
     pub total_pixels: u64,
 }
-
 
 impl SessionSink for LoggingSink {
     fn on_graphics_update(&mut self, image: &dyn FrameView, region: UpdateRegion) {

@@ -397,9 +397,8 @@ impl SspiSession {
         };
 
         // SAFETY: ctxt established; buffers live across the call. fQOP=0 => seal.
-        let status = hr_to_status(unsafe {
-            EncryptMessage(self.ctxt.as_mut() as *const _, 0, &desc, 0)
-        });
+        let status =
+            hr_to_status(unsafe { EncryptMessage(self.ctxt.as_mut() as *const _, 0, &desc, 0) });
         if status != SEC_E_OK_RAW {
             return Err(Error::Sspi(format!(
                 "EncryptMessage failed: 0x{status:08X}"

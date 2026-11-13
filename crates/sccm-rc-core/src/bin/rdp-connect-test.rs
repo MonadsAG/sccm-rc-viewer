@@ -34,20 +34,27 @@ async fn main() -> anyhow::Result<()> {
     info!(grant = ?session.grant(), "session established");
 
     let cliprdr_req_counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let (result, initial_buf, share_id) =
-        match rdp::connect_rdp(&mut session, cli.width, cli.height, &[], cliprdr_req_counter.clone()).await {
-            Ok(r) => {
-                info!(
+    let (result, initial_buf, share_id) = match rdp::connect_rdp(
+        &mut session,
+        cli.width,
+        cli.height,
+        &[],
+        cliprdr_req_counter.clone(),
+    )
+    .await
+    {
+        Ok(r) => {
+            info!(
                 desktop = format!("{}x{}", r.0.desktop_size.width, r.0.desktop_size.height),
                 "✅✅ RDP ACTIVE SESSION — full connection sequence completed over SCCM transport"
             );
-                r
-            }
-            Err(e) => {
-                error!(error = %e, "RDP connection sequence failed");
-                return Err(e.into());
-            }
-        };
+            r
+        }
+        Err(e) => {
+            error!(error = %e, "RDP connection sequence failed");
+            return Err(e.into());
+        }
+    };
 
     // Process the live graphics stream headless to prove decoding works.
     info!("entering active session — processing graphics updates (Ctrl+C to stop)");
