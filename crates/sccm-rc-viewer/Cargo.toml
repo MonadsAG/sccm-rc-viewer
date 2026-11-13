@@ -38,6 +38,8 @@ pollster = "0.3"
 rust-i18n = "3"
 # Detect the Windows UI language at startup (reads the user locale).
 sys-locale = "0.3"
+serde_json = "1"
+base64 = "0.22"
 
 # Low-level keyboard hook (WH_KEYBOARD_LL) for Win-key passthrough in windowed
 # mode + MessageBox for the bug-report confirmation dialog. Workspace `windows`

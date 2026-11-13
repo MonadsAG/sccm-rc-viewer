@@ -113,3 +113,8 @@ menu:
   copy: "Kopieren"
   paste: "Einsetzen"
   select_all: "Alles auswählen"
+
+control:
+  allow: "Steuerung durch Claude erlauben"
+  active: "Von Claude gesteuert"
+  user_took_over: "Benutzer hat übernommen"

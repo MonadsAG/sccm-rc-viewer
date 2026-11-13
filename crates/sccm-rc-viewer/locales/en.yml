@@ -113,3 +113,8 @@ menu:
   copy: "Copy"
   paste: "Paste"
   select_all: "Select All"
+
+control:
+  allow: "Allow Control by Claude"
+  active: "Controlled by Claude"
+  user_took_over: "User took over"

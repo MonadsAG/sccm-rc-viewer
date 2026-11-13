@@ -113,3 +113,8 @@ menu:
   copy: "Kopieer"
   paste: "Plak"
   select_all: "Selecteer alles"
+
+control:
+  allow: "Besturing door Claude toestaan"
+  active: "Bestuurd door Claude"
+  user_took_over: "Gebruiker heeft overgenomen"

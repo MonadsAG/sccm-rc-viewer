@@ -13,6 +13,7 @@ pub struct Chrome {
     pub recording: bool,
     pub fullscreen: bool,
     pub monitor: Option<String>,
+    pub agent_control: bool,
 }
 
 pub struct NativeUi;

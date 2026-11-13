@@ -24,8 +24,12 @@ use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::platform::scancode::PhysicalKeyExtScancode;
 use winit::window::{Window, WindowId};
 
+use sccm_rc_core::agent::exec;
+use sccm_rc_core::agent::proto::{Command, ErrorCode, Reply};
+use sccm_rc_core::agent::shot::{self, ShotSpace};
 use sccm_rc_core::{audit, keychain, paths};
 
+mod control;
 mod gpu;
 mod host_prompt;
 mod keymap;
@@ -369,6 +373,11 @@ enum UserEvent {
     Closed(String),
     /// From the native macOS chrome (menu bar / title-bar toolbar).
     Native(NativeEvent),
+    /// A request from the control socket ("Allow control by Claude"), with
+    /// where to send its one reply.
+    Control(Command, std::sync::mpsc::Sender<Reply>),
+    /// The control ticker: run the next due piece of a Claude command.
+    ControlTick,
 }
 
 /// What the native macOS UI (`mac_ui`) asks the App to do. Built on the main
@@ -414,6 +423,8 @@ struct SharedFrame {
     /// GPU path: a full-frame copy happened since the last paint (first frame,
     /// size change, or periodic resync) — the whole texture must be re-uploaded.
     full_resync: bool,
+    /// Graphics updates as seen by Claude's `wait` (control socket).
+    watch: sccm_rc_core::agent::wait::FrameWatch,
 }
 
 /// The remote cursor shape, drawn client-side at the local mouse position so it
@@ -493,6 +504,7 @@ impl SessionSink for FrameSink {
                 });
             }
             f.frames = f.frames.wrapping_add(1);
+            f.watch.on_update(std::time::Instant::now());
             f.status.clear(); // first/any frame painted — hide the progress text
         }
         // winit coalesces multiple request_redraw() into a single RedrawRequested,
@@ -846,6 +858,13 @@ fn main() -> anyhow::Result<()> {
         paste_pending: None,
         locks_sent: None,
         native: None,
+        control: None,
+        arbiter: control::Arbiter::default(),
+        control_job: None,
+        control_shot: None,
+        control_seen: None,
+        control_last_cmd: None,
+        user_input_at: std::cell::Cell::new(None),
     };
     event_loop.run_app(&mut app)?;
     // Window closed: stop the session and close the input channel, which unblocks
@@ -1329,6 +1348,83 @@ struct App {
     /// Native macOS chrome (menu bar + title-bar toolbar); `None` elsewhere or
     /// with `SCCM_RC_NATIVE_UI=0`, where the drawn toolbar strip is used.
     native: Option<mac_ui::NativeUi>,
+    /// "Allow control by Claude" (native macOS chrome only): the control
+    /// socket and its ticker while the toggle is on. Off on every start.
+    control: Option<(control::Server, control::Ticker)>,
+    arbiter: control::Arbiter,
+    /// The Claude command running now and where its reply goes.
+    control_job: Option<(control::Job, std::sync::mpsc::Sender<Reply>)>,
+    /// Geometry of the last screenshot Claude got (maps its coordinates).
+    control_shot: Option<ShotSpace>,
+    /// When a Claude command last ran, and whether the user took over from
+    /// it: drives the subtitle for [`CONTROL_SHOWN`].
+    control_seen: Option<(std::time::Instant, bool)>,
+    /// The previous Claude command, for `status`'s idle seconds.
+    control_last_cmd: Option<std::time::Instant>,
+    /// Set when the user's own input went to the remote; picked up by
+    /// `control_poll_user` (input handlers only have `&self`).
+    user_input_at: std::cell::Cell<Option<std::time::Instant>>,
+}
+
+/// How long the subtitle says "Controlled by Claude" after a command.
+const CONTROL_SHOWN: std::time::Duration = std::time::Duration::from_secs(5);
+const MSG_VIEW_ONLY: &str = "the viewer is in view-only mode";
+
+/// The viewer session as a Claude command sees it.
+struct LiveTarget<'a> {
+    tx: Option<&'a InputSender>,
+    running: bool,
+    view_only: bool,
+    shared: &'a Mutex<SharedFrame>,
+    shot: Option<ShotSpace>,
+    host: &'a str,
+}
+
+impl control::Target for LiveTarget<'_> {
+    fn desk_size(&self) -> (u16, u16) {
+        let f = self.shared.lock().unwrap();
+        if f.rgba.is_empty() {
+            return (0, 0);
+        }
+        (
+            u16::try_from(f.width).unwrap_or(0),
+            u16::try_from(f.height).unwrap_or(0),
+        )
+    }
+
+    fn shot(&self) -> Option<ShotSpace> {
+        self.shot
+    }
+
+    fn alive(&self) -> Result<(), Reply> {
+        if self.tx.is_some() && self.running {
+            Ok(())
+        } else {
+            Err(exec::err(
+                ErrorCode::NotConnected,
+                "the viewer's session has ended",
+            ))
+        }
+    }
+
+    fn send(&mut self, events: Vec<FastPathInputEvent>) -> Result<(), Reply> {
+        if self.view_only {
+            return Err(exec::session_err(MSG_VIEW_ONLY));
+        }
+        let tx = self
+            .tx
+            .ok_or_else(|| exec::err(ErrorCode::NotConnected, "the viewer's session has ended"))?;
+        tx.try_send(events)
+            .map_err(|_| exec::session_err("could not hand the input to the session"))
+    }
+
+    fn watch(&self) -> sccm_rc_core::agent::wait::FrameWatch {
+        self.shared.lock().unwrap().watch.clone()
+    }
+
+    fn audit(&mut self, action: &str) {
+        audit::log_agent(self.host, action);
+    }
 }
 
 struct PastePending {
@@ -1352,7 +1448,9 @@ impl App {
         if !force && self.locks_sent == Some(flags) {
             return;
         }
-        self.send_input(FastPathInputEvent::SyncEvent(flags));
+        if let Some(tx) = &self.input_tx {
+            let _ = tx.try_send(vec![FastPathInputEvent::SyncEvent(flags)]);
+        }
         self.locks_sent = Some(flags);
         tracing::debug!(
             caps = flags.contains(sccm_rc_core::rdp::SynchronizeFlags::CAPS_LOCK),
@@ -1362,13 +1460,21 @@ impl App {
         );
     }
 
+    /// Forward the user's own input to the remote.
     fn send_input(&self, ev: FastPathInputEvent) {
         if self.view_only {
             return; // local view-only lock — don't control the remote
         }
         if let Some(tx) = &self.input_tx {
+            self.mark_user_input();
             let _ = tx.try_send(vec![ev]);
         }
+    }
+
+    /// The user's own input reached the remote: a running Claude command
+    /// must stop (see `control_poll_user`).
+    fn mark_user_input(&self) {
+        self.user_input_at.set(Some(std::time::Instant::now()));
     }
 
     /// Inject the Secure Attention Sequence (Ctrl+Alt+Del) to the remote as one
@@ -1391,6 +1497,7 @@ impl App {
             FastPathInputEvent::KeyboardEvent(up, 0x1D),   // Ctrl up
         ];
         if let Some(tx) = &self.input_tx {
+            self.mark_user_input();
             let _ = tx.try_send(seq);
         }
         info!("sent Ctrl+Alt+Del (SAS) to remote");
@@ -1411,6 +1518,7 @@ impl App {
             FastPathInputEvent::KeyboardEvent(ext | up, 0x5B), // Win up
         ];
         if let Some(tx) = &self.input_tx {
+            self.mark_user_input();
             let _ = tx.try_send(seq);
         }
         info!("sent Windows-key tap to remote");
@@ -1573,6 +1681,11 @@ impl App {
         } else {
             String::new()
         };
+        let subtitle = match self.control_label() {
+            Some(c) if subtitle.is_empty() => c,
+            Some(c) => format!("{subtitle} \u{00b7} {c}"),
+            None => subtitle,
+        };
         native.update(&mac_ui::Chrome {
             subtitle,
             connected,
@@ -1582,7 +1695,210 @@ impl App {
             recording: self.recorder.is_some(),
             fullscreen: self.is_fullscreen(),
             monitor: if connected { self.monitor_label() } else { None },
+            agent_control: self.control.is_some(),
         });
+    }
+
+    /// Subtitle note while Claude controls (or the user just took over).
+    fn control_label(&self) -> Option<String> {
+        self.control.as_ref()?;
+        if self.control_job.is_some() {
+            return Some(t!("control.active").to_string());
+        }
+        let (at, took_over) = self.control_seen?;
+        (at.elapsed() < CONTROL_SHOWN).then(|| {
+            if took_over {
+                t!("control.user_took_over").to_string()
+            } else {
+                t!("control.active").to_string()
+            }
+        })
+    }
+
+    /// "Allow control by Claude" on/off. Off aborts a running command
+    /// (keys and buttons released) and closes the socket.
+    fn toggle_agent_control(&mut self) {
+        if self.control.is_some() {
+            self.control_abort(
+                ErrorCode::ControlDisabled,
+                "control by Claude was switched off in the viewer",
+            );
+            if let Some((mut server, _ticker)) = self.control.take() {
+                server.stop();
+            }
+            audit::log_agent(&self.host, "control by Claude switched off");
+            info!("control by Claude switched off");
+            return;
+        }
+        match control::Server::start(&paths::data_dir(), self.proxy.clone()) {
+            Ok(server) => {
+                let proxy = self.proxy.clone();
+                let ticker = control::Ticker::new(move || {
+                    let _ = proxy.send_event(UserEvent::ControlTick);
+                });
+                self.control = Some((server, ticker));
+                self.control_seen = None;
+                audit::log_agent(&self.host, "control by Claude allowed");
+                info!("control by Claude allowed");
+            }
+            Err(e) => warn!(error = %e, "could not open the control socket"),
+        }
+    }
+
+    /// Pick up the user's input since the last call: it starts the
+    /// cooldown and aborts a running Claude command.
+    fn control_poll_user(&mut self) {
+        let Some(at) = self.user_input_at.take() else {
+            return;
+        };
+        self.arbiter.on_user_input(at);
+        if self.arbiter.should_abort(std::time::Instant::now()) {
+            info!("user input during a Claude command: aborting it");
+            self.control_abort(ErrorCode::UserTookOver, control::MSG_TOOK_OVER);
+            self.control_seen = Some((std::time::Instant::now(), true));
+        }
+    }
+
+    /// Stop the running Claude command, if any, and answer it with `code`.
+    fn control_abort(&mut self, code: ErrorCode, message: &str) {
+        let Some((mut job, reply)) = self.control_job.take() else {
+            return;
+        };
+        let mut t = LiveTarget {
+            tx: self.input_tx.as_ref(),
+            running: self.running.load(Ordering::Relaxed),
+            view_only: self.view_only,
+            shared: &self.shared,
+            shot: self.control_shot,
+            host: &self.host,
+        };
+        let r = job.abort(code, message, &mut t);
+        let _ = reply.send(r);
+        self.arbiter.end_command();
+    }
+
+    /// Run the due part of the Claude command; reply once it is done.
+    fn control_run(&mut self) {
+        let now = std::time::Instant::now();
+        let Some((job, _)) = self.control_job.as_mut() else {
+            return;
+        };
+        let mut t = LiveTarget {
+            tx: self.input_tx.as_ref(),
+            running: self.running.load(Ordering::Relaxed),
+            view_only: self.view_only,
+            shared: &self.shared,
+            shot: self.control_shot,
+            host: &self.host,
+        };
+        match job.poll(now, &mut t) {
+            control::Poll::Pending(at) => {
+                if let Some((_, ticker)) = &self.control {
+                    ticker.schedule(at);
+                }
+            }
+            control::Poll::Done(r) => {
+                if let Some((_, reply)) = self.control_job.take() {
+                    let _ = reply.send(r);
+                }
+                self.arbiter.end_command();
+                self.control_seen = Some((now, false));
+            }
+        }
+    }
+
+    /// A request from the control socket. Commands run one at a time on
+    /// this thread; long ones are paced by the ticker.
+    fn control_command(&mut self, cmd: Command, reply: std::sync::mpsc::Sender<Reply>) {
+        let now = std::time::Instant::now();
+        self.control_poll_user();
+        if self.control.is_none() {
+            let _ = reply.send(exec::err(
+                ErrorCode::ControlDisabled,
+                "control by Claude is switched off in the viewer",
+            ));
+            return;
+        }
+        if self.control_job.is_some() {
+            let _ = reply.send(exec::session_err(
+                "busy: the previous command is still running",
+            ));
+            return;
+        }
+        let idle_s = self
+            .control_last_cmd
+            .map_or(0, |t| now.saturating_duration_since(t).as_secs());
+        self.control_last_cmd = Some(now);
+        let has_session = self.input_tx.is_some() && self.running.load(Ordering::Relaxed);
+        let (desk_w, desk_h) = {
+            let t = LiveTarget {
+                tx: self.input_tx.as_ref(),
+                running: has_session,
+                view_only: self.view_only,
+                shared: &self.shared,
+                shot: None,
+                host: &self.host,
+            };
+            control::Target::desk_size(&t)
+        };
+        let r = match cmd {
+            Command::Disconnect => exec::ok("control handed back"),
+            _ if !has_session => exec::err(
+                ErrorCode::NotConnected,
+                "the viewer is not connected to a till; connect in the viewer first",
+            ),
+            Command::Status => Reply::Status {
+                connected: true,
+                target: Some(self.host.clone()),
+                desk_w,
+                desk_h,
+                mode: "live".into(),
+                idle_s,
+            },
+            _ if !self.arbiter.accepts_commands(now) => {
+                exec::err(ErrorCode::UserTookOver, control::MSG_COOLDOWN)
+            }
+            Command::Screenshot { region, max_width } => self.control_screenshot(region, max_width),
+            // Waiting sends nothing, so it works in view-only mode too.
+            ref c if self.view_only && !matches!(c, Command::Wait { .. }) => {
+                exec::session_err(MSG_VIEW_ONLY)
+            }
+            cmd => {
+                self.arbiter.begin_command();
+                self.control_job = Some((control::Job::new(cmd), reply));
+                self.control_seen = Some((now, false));
+                self.control_run();
+                return;
+            }
+        };
+        let _ = reply.send(r);
+    }
+
+    /// Claude's screenshot of the viewer's framebuffer.
+    fn control_screenshot(&mut self, region: Option<shot::Rect>, max_width: Option<u32>) -> Reply {
+        let (rgba, w, h) = {
+            let f = self.shared.lock().unwrap();
+            match (u16::try_from(f.width), u16::try_from(f.height)) {
+                (Ok(w), Ok(h)) if w > 0 && h > 0 && !f.rgba.is_empty() => (f.rgba.clone(), w, h),
+                _ => return exec::no_image(),
+            }
+        };
+        audit::log_agent(&self.host, &exec::screenshot_audit(region));
+        let mw = max_width.unwrap_or(exec::DEFAULT_MAX_WIDTH);
+        match shot::take(&rgba, w, h, region, mw) {
+            Ok((png, space)) => {
+                use base64::Engine as _;
+                self.control_shot = Some(space);
+                Reply::Image {
+                    png_base64: base64::engine::general_purpose::STANDARD.encode(png),
+                    desk_w: w,
+                    desk_h: h,
+                    scale: space.scale(),
+                }
+            }
+            Err(e @ shot::ShotError::BadRegion) => exec::bad_args(e.to_string()),
+            Err(e) => exec::session_err(format!("screenshot failed: {e}")),
+        }
     }
 
     /// Window size in logical (UI-scale) pixels plus the scale itself, for
@@ -1641,6 +1957,7 @@ impl App {
     /// overlay (Esc) the app exits — matches the old prompt-cancelled path.
     fn switch_host(&mut self, _event_loop: &ActiveEventLoop) {
         self.locks_sent = None;
+        self.control_shot = None;
         self.begin_shutdown();
         // Let the old session confirm teardown before we reconnect — otherwise
         // reconnecting (especially to the same host) trips "existing session".
@@ -1669,6 +1986,7 @@ impl App {
     /// can also kick off a session from inside the event loop.
     fn start_session(&mut self, new_target: String) {
         self.locks_sent = None;
+        self.control_shot = None;
         recent::add(&new_target);
         self.host = new_target.clone();
         let shown = servers::display(&new_target);
@@ -1854,6 +2172,7 @@ impl App {
                 self.view_only = !self.view_only;
                 info!(view_only = self.view_only, "toggled view-only");
             }
+            ToolbarAction::ToggleAgentControl => self.toggle_agent_control(),
             ToolbarAction::MonitorCycle => self.cycle_view(),
             ToolbarAction::ToggleRecord => {
                 if self.recorder.is_some() {
@@ -1993,6 +2312,10 @@ impl ApplicationHandler<UserEvent> for App {
     /// app menu, which terminates without a CloseRequested. Run the same
     /// graceful teardown so the SCCM host is released (no stale session).
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        if let Some((mut server, _ticker)) = self.control.take() {
+            self.control_abort(ErrorCode::ControlDisabled, "the viewer is quitting");
+            server.stop();
+        }
         if self.running.load(Ordering::Relaxed) || self.input_tx.is_some() {
             self.begin_shutdown();
             let _ = self.done_rx.recv_timeout(std::time::Duration::from_secs(3));
@@ -2093,6 +2416,11 @@ impl ApplicationHandler<UserEvent> for App {
                     w.request_redraw();
                 }
             }
+            UserEvent::Control(cmd, reply) => self.control_command(cmd, reply),
+            UserEvent::ControlTick => {
+                self.control_poll_user();
+                self.control_run();
+            }
             UserEvent::Closed(reason) => {
                 warn!(%reason, "session closed");
                 self.closed = Some(reason);
@@ -2105,6 +2433,14 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // The user's input wins over a running Claude command.
+        self.control_poll_user();
+        // Wake again when the "Controlled by Claude" subtitle expires.
+        if let (Some((_, ticker)), Some((at, _))) = (&self.control, self.control_seen) {
+            if at.elapsed() < CONTROL_SHOWN {
+                ticker.schedule(at + CONTROL_SHOWN);
+            }
+        }
         // Native macOS chrome mirrors the session state (cheap when unchanged).
         self.update_native_chrome();
         // UI-thread heartbeat: write a log line every ~5s. If a hang
@@ -2128,6 +2464,7 @@ impl ApplicationHandler<UserEvent> for App {
             match outcome {
                 type_text::TypeOutcome::Confirmed(events) => {
                     if let Some(tx) = &self.input_tx {
+                        self.mark_user_input();
                         let _ = tx.try_send(events);
                     }
                 }
@@ -2174,6 +2511,7 @@ impl ApplicationHandler<UserEvent> for App {
                     let events = type_text::encode_string(&p.clip);
                     if !events.is_empty() {
                         if let Some(tx) = &self.input_tx {
+                            self.mark_user_input();
                             let _ = tx.try_send(events);
                         }
                         info!(
@@ -2714,6 +3052,7 @@ impl ApplicationHandler<UserEvent> for App {
                             let events = type_text::encode_string(&clip);
                             if !events.is_empty() {
                                 if let Some(tx) = &self.input_tx {
+                                    self.mark_user_input();
                                     let _ = tx.try_send(events);
                                 }
                                 info!(

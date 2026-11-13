@@ -40,7 +40,7 @@ use crate::toolbar::ToolbarAction;
 use crate::NativeEvent;
 
 /// Every action the native chrome can trigger; the index is the item tag.
-const ACTIONS: [ToolbarAction; 12] = [
+const ACTIONS: [ToolbarAction; 13] = [
     ToolbarAction::CtrlAltDel,
     ToolbarAction::SendWin,
     ToolbarAction::SendKeys,
@@ -53,11 +53,12 @@ const ACTIONS: [ToolbarAction; 12] = [
     ToolbarAction::MonitorCycle,
     ToolbarAction::BugReport,
     ToolbarAction::About,
+    ToolbarAction::ToggleAgentControl,
 ];
 
 /// Toolbar order (left to right), after a flexible space; `None` = separator
 /// space. About and Bug report live in the menus only.
-const TOOLBAR_ITEMS: [Option<ToolbarAction>; 12] = [
+const TOOLBAR_ITEMS: [Option<ToolbarAction>; 13] = [
     Some(ToolbarAction::CtrlAltDel),
     Some(ToolbarAction::SendKeys),
     Some(ToolbarAction::SendWin),
@@ -68,6 +69,7 @@ const TOOLBAR_ITEMS: [Option<ToolbarAction>; 12] = [
     Some(ToolbarAction::ToggleCurtain),
     Some(ToolbarAction::ToggleRecord),
     Some(ToolbarAction::ToggleFullscreen),
+    Some(ToolbarAction::ToggleAgentControl),
     None,
     Some(ToolbarAction::Disconnect),
 ];
@@ -91,6 +93,7 @@ fn ident_of(a: ToolbarAction) -> &'static str {
         ToolbarAction::MonitorCycle => "rc.screen",
         ToolbarAction::BugReport => "rc.report",
         ToolbarAction::About => "rc.about",
+        ToolbarAction::ToggleAgentControl => "rc.claude-control",
     }
 }
 
@@ -113,6 +116,7 @@ fn label_of(a: ToolbarAction) -> String {
         ToolbarAction::BugReport => t!("toolbar.bug_report"),
         ToolbarAction::About => t!("toolbar.about"),
         ToolbarAction::MonitorCycle => t!("menu.next_screen"),
+        ToolbarAction::ToggleAgentControl => t!("control.allow"),
     }
     .to_string()
 }
@@ -136,6 +140,8 @@ fn symbol_of(a: ToolbarAction, on: bool) -> &'static str {
         (ToolbarAction::MonitorCycle, _) => "display.2",
         (ToolbarAction::BugReport, _) => "ladybug",
         (ToolbarAction::About, _) => "info.circle",
+        (ToolbarAction::ToggleAgentControl, false) => "cpu",
+        (ToolbarAction::ToggleAgentControl, true) => "cpu.fill",
     }
 }
 
@@ -160,6 +166,8 @@ pub struct Chrome {
     pub fullscreen: bool,
     /// Screen switcher label for multi-monitor targets, else disabled.
     pub monitor: Option<String>,
+    /// "Allow control by Claude" is on (the control socket listens).
+    pub agent_control: bool,
 }
 
 impl Chrome {
@@ -169,6 +177,7 @@ impl Chrome {
             ToolbarAction::ToggleCurtain => self.curtain,
             ToolbarAction::ToggleRecord => self.recording,
             ToolbarAction::ToggleFullscreen => self.fullscreen,
+            ToolbarAction::ToggleAgentControl => self.agent_control,
             _ => false,
         }
     }
@@ -176,7 +185,7 @@ impl Chrome {
     fn enabled(&self, a: ToolbarAction) -> bool {
         match a {
             ToolbarAction::About | ToolbarAction::BugReport => true,
-            ToolbarAction::ToggleFullscreen => true,
+            ToolbarAction::ToggleFullscreen | ToolbarAction::ToggleAgentControl => true,
             ToolbarAction::Disconnect => self.has_session,
             ToolbarAction::MonitorCycle => self.connected && self.monitor.is_some(),
             _ => self.connected,
@@ -717,6 +726,13 @@ fn install_menu(mtm: MainThreadMarker, target: &ActionTarget) -> MenuItems {
         &control,
         ToolbarAction::ToggleRecord,
         label_of(ToolbarAction::ToggleRecord),
+        "",
+    );
+    control.addItem(&NSMenuItem::separatorItem(mtm));
+    add_action(
+        &control,
+        ToolbarAction::ToggleAgentControl,
+        label_of(ToolbarAction::ToggleAgentControl),
         "",
     );
 
