@@ -1200,7 +1200,7 @@ pub async fn connect_rdp_with(
 }
 
 /// A graphics-update region (inclusive pixel rectangle) on the framebuffer.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UpdateRegion {
     pub left: u16,
     pub top: u16,

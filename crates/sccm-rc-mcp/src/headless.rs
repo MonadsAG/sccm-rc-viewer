@@ -16,11 +16,12 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use base64::Engine as _;
 use sccm_rc_core::agent::exec::{
-    self, bad_args, no_image, ok, session_err, Chunk, DEFAULT_MAX_WIDTH, STEP_GAP,
+    self, bad_args, no_image, ok, session_err, Chunk, Held, DEFAULT_MAX_WIDTH, STEP_GAP,
 };
 use sccm_rc_core::agent::proto::{Command, ErrorCode, Reply};
 use sccm_rc_core::agent::shot::{self, ShotError, ShotSpace};
 use sccm_rc_core::agent::wait::FrameWatch;
+use sccm_rc_core::frame::{Copied, FrameCopier};
 use sccm_rc_core::rdp::{
     self, FastPathInputEvent, FrameView, InputReceiver, InputSender, RdpOptions, SessionSink,
     UpdateRegion,
@@ -88,35 +89,27 @@ impl Shared {
     }
 }
 
-/// Copies graphics updates into `Shared`.
+/// Copies graphics updates into `Shared`: the dirty region, and the whole
+/// image every 300 ms like the viewer (see `sccm_rc_core::frame`).
 struct Sink {
     shared: Arc<Shared>,
+    copier: FrameCopier,
 }
 
 impl SessionSink for Sink {
     fn on_graphics_update(&mut self, frame: &dyn FrameView, r: UpdateRegion) {
         let (w, h, data) = (frame.width(), frame.height(), frame.data());
+        let now = Instant::now();
         {
             let mut f = lock(&self.shared.frame);
-            if f.w != w || f.h != h || f.rgba.len() != data.len() {
-                f.rgba = data.to_vec();
+            let dst = (u32::from(f.w), u32::from(f.h));
+            let src = (u32::from(w), u32::from(h));
+            if self.copier.copy(&mut f.rgba, dst, data, src, r, now) == Copied::Full {
                 f.w = w;
                 f.h = h;
-            } else if w > 0 && h > 0 {
-                let stride = w as usize * 4;
-                let right = (r.right as usize).min(w as usize - 1);
-                let bottom = (r.bottom as usize).min(h as usize - 1);
-                let left = (r.left as usize).min(right);
-                for row in r.top as usize..=bottom {
-                    let a = row * stride + left * 4;
-                    let b = row * stride + (right + 1) * 4;
-                    if b <= data.len() {
-                        f.rgba[a..b].copy_from_slice(&data[a..b]);
-                    }
-                }
             }
         }
-        lock(&self.shared.watch).on_update(Instant::now());
+        lock(&self.shared.watch).on_update(now);
     }
 
     fn on_terminate(&mut self, reason: String) {
@@ -129,6 +122,9 @@ impl SessionSink for Sink {
 /// A running session as the backend sees it.
 pub struct Session {
     input: Arc<Mutex<Option<InputSender>>>,
+    /// Keys and buttons that sent input left pressed (a cancelled command);
+    /// released before the session is stopped.
+    held: Arc<Mutex<Held>>,
     shared: Arc<Shared>,
     done: Option<oneshot::Receiver<()>>,
     view_only: bool,
@@ -155,6 +151,7 @@ impl Session {
     ) -> Self {
         Self {
             input: Arc::new(Mutex::new(Some(input))),
+            held: Arc::default(),
             shared,
             done,
             view_only,
@@ -179,10 +176,11 @@ impl Session {
         s
     }
 
-    /// Ask the session to end: closing the input channel ends the active
-    /// session, then the session thread disconnects.
+    /// Ask the session to end: let go of held keys and buttons, then close
+    /// the input channel, which ends the active session; the session thread
+    /// then disconnects.
     fn stop(&self) {
-        lock(&self.input).take();
+        release_and_close(&self.input, &self.held);
     }
 
     fn stopped(&self) -> bool {
@@ -218,8 +216,25 @@ impl Session {
         let Some(tx) = tx else {
             return Err(session_ended());
         };
+        // Tracked before the await: if the call is cancelled, a press that
+        // may have been queued is still released on stop (releasing a key
+        // that never went down is harmless).
+        lock(&self.held).track(&events);
         tx.send(events).await.map_err(|_| session_ended())
     }
+}
+
+/// Close a session's input channel. Whatever is still held is released first
+/// (queued ahead of the close), so nothing stays pressed on the till.
+fn release_and_close(input: &Mutex<Option<InputSender>>, held: &Mutex<Held>) -> bool {
+    let Some(tx) = lock(input).take() else {
+        return false;
+    };
+    let release = lock(held).release_all();
+    if !release.is_empty() && tx.try_send(release).is_err() {
+        warn!("could not queue the release of held keys/buttons");
+    }
+    true
 }
 
 pub type ConnectFuture = Pin<Box<dyn Future<Output = Result<Session, Reply>> + Send>>;
@@ -342,8 +357,9 @@ impl Headless {
 
     fn spawn_watchdog(&self, target: String, session: &Session) -> tokio::task::JoinHandle<()> {
         let (idle, last) = (self.idle, self.last_call.clone());
-        let (input, shared, audit) = (
+        let (input, held, shared, audit) = (
             session.input.clone(),
+            session.held.clone(),
             session.shared.clone(),
             self.audit.clone(),
         );
@@ -351,7 +367,7 @@ impl Headless {
             loop {
                 let since = lock(&last).elapsed();
                 if since >= idle {
-                    if lock(&input).take().is_some() {
+                    if release_and_close(&input, &held) {
                         let mins = idle.as_secs() / 60;
                         warn!(%target, "idle timeout: disconnecting");
                         shared.end(format!("disconnected after {mins} min without a tool call"));
@@ -376,6 +392,10 @@ impl Headless {
         let (w, h) = self.desk_size();
         let shot = self.conn.as_ref().and_then(|c| c.shot);
         exec::map_point(x, y, relative, shot.as_ref(), w, h)
+    }
+
+    fn view_only(&self) -> bool {
+        self.conn.as_ref().is_some_and(|c| c.session.view_only)
     }
 
     fn session(&self) -> Result<&Session, Reply> {
@@ -456,7 +476,9 @@ impl Headless {
             | Command::Scroll { .. }
             | Command::TypeText { .. }
             | Command::Key { .. }) => {
-                self.session()?;
+                if self.session()?.view_only {
+                    return Err(exec::view_only());
+                }
                 let plan = exec::plan_input(&cmd, |x, y, r| self.map_point(x, y, r))?
                     .ok_or_else(|| bad_args("not an input command"))?;
                 drop(cmd);
@@ -564,7 +586,7 @@ impl Backend for Headless {
             text.push_str(" with force (no logged-on user was reported)");
         }
         if session.view_only {
-            text.push_str("; view only: the till grants no control, input will be ignored");
+            text.push_str("; view only: the till grants no control, input commands are refused");
         }
         if !session.has_frame() {
             text.push_str("; no desktop image yet, use wait before screenshot");
@@ -596,6 +618,8 @@ impl Backend for Headless {
                 },
                 None => not_connected(),
             },
+            // As in live mode: no input at all, and no batch (it may hold any).
+            ref c if exec::sends_input(c) && self.view_only() => exec::view_only(),
             Command::Batch { steps } => {
                 let n = steps.len();
                 let mut notes = Vec::new();
@@ -856,6 +880,7 @@ async fn session_thread(
         }
         let mut sink = Sink {
             shared: shared.clone(),
+            copier: FrameCopier::new(),
         };
         rdp::run_active_session_with(
             &mut session,
@@ -1387,6 +1412,7 @@ mod tests {
         let shared = Arc::new(Shared::default());
         let mut sink = Sink {
             shared: shared.clone(),
+            copier: FrameCopier::new(),
         };
         let full = UpdateRegion {
             left: 0,
@@ -1546,6 +1572,136 @@ mod tests {
             .ok()
             .unwrap();
         assert!(!s.took_over);
+    }
+
+    /// A backend whose only session is `s`.
+    fn backend_with(s: Session) -> Headless {
+        let slot = Arc::new(Mutex::new(Some(s)));
+        Headless::with_connector(move |_t, _f, _slot| {
+            let s = lock(&slot).take().unwrap();
+            Box::pin(async move { Ok(s) })
+        })
+        .with_audit(|_, _| {})
+    }
+
+    #[tokio::test]
+    async fn view_only_session_refuses_input() {
+        let shared = Arc::new(Shared::default());
+        {
+            let mut f = lock(&shared.frame);
+            f.rgba = vec![0; 100 * 100 * 4];
+            f.w = 100;
+            f.h = 100;
+        }
+        let (tx, mut rx) = tokio::sync::mpsc::channel(256);
+        let mut hl = backend_with(Session::new(tx, shared, None, true));
+        match hl.connect("t", false).await {
+            Reply::Ok { text } => assert!(text.contains("view only"), "{text}"),
+            r => panic!("{r:?}"),
+        }
+        for c in [
+            click(1.0, 1.0, false),
+            Command::TypeText {
+                text: "x".into(),
+                secret: false,
+            },
+            Command::Batch {
+                steps: vec![
+                    Command::Wait {
+                        change: false,
+                        stable_ms: Some(1),
+                        timeout_ms: 10,
+                    },
+                    Command::Key {
+                        combo: "Enter".into(),
+                    },
+                ],
+            },
+        ] {
+            assert_eq!(hl.run(c).await, exec::view_only());
+        }
+        assert!(rx.try_recv().is_err(), "nothing was sent");
+        // Looking and waiting still work.
+        assert!(matches!(
+            hl.run(Command::Screenshot {
+                region: None,
+                max_width: None
+            })
+            .await,
+            Reply::Image { .. }
+        ));
+        assert!(is_ok(
+            &hl.run(Command::Wait {
+                change: true,
+                stable_ms: None,
+                timeout_ms: 10,
+            })
+            .await
+        ));
+    }
+
+    /// Whether `ev` leaves no key or button pressed.
+    fn nothing_held(ev: &[FastPathInputEvent]) -> bool {
+        let mut h = exec::Held::new();
+        h.track(ev);
+        h.is_empty()
+    }
+
+    #[tokio::test]
+    async fn shutdown_releases_a_button_held_by_a_cancelled_click() {
+        let (mut hl, rxs, _a, _c) = backend(100, 100);
+        hl.connect("t", false).await;
+        // A signal cancels the click between button down and up.
+        let r =
+            tokio::time::timeout(Duration::from_millis(5), hl.run(click(5.0, 5.0, false))).await;
+        assert!(r.is_err(), "click must still be running");
+        let sent = drain(&rxs);
+        assert!(!nothing_held(&sent), "button is down");
+        hl.shutdown().await;
+        let after = drain(&rxs);
+        assert_eq!(
+            mouse_pos(&after),
+            vec![(PointerFlags::LEFT_BUTTON, 5, 5)],
+            "released before the session stops"
+        );
+        let all: Vec<_> = sent.into_iter().chain(after).collect();
+        assert!(nothing_held(&all));
+    }
+
+    #[tokio::test]
+    async fn disconnect_releases_held_keys() {
+        let (mut hl, rxs, _a, _c) = backend(100, 100);
+        hl.connect("t", false).await;
+        let s = &hl.conn.as_ref().unwrap().session;
+        s.send(vec![FastPathInputEvent::KeyboardEvent(
+            sccm_rc_core::rdp::KeyboardFlags::empty(),
+            0x1D,
+        )])
+        .await
+        .unwrap();
+        assert!(is_ok(&hl.run(Command::Disconnect).await));
+        assert!(nothing_held(&drain(&rxs)));
+        // Nothing held: nothing extra is sent.
+        let (mut hl, rxs, _a, _c) = backend(100, 100);
+        hl.connect("t", false).await;
+        assert!(is_ok(&hl.run(click(1.0, 1.0, false)).await));
+        let n = drain(&rxs).len();
+        hl.run(Command::Disconnect).await;
+        assert_eq!(n, 3);
+        assert!(drain(&rxs).is_empty());
+    }
+
+    #[tokio::test]
+    async fn idle_timeout_releases_held_input() {
+        let (hl, rxs, _a, _c) = backend(100, 100);
+        let mut hl = hl.with_idle(Duration::from_millis(100));
+        hl.connect("t", false).await;
+        let r =
+            tokio::time::timeout(Duration::from_millis(5), hl.run(click(5.0, 5.0, false))).await;
+        assert!(r.is_err());
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(hl.conn.as_ref().unwrap().session.stopped());
+        assert!(nothing_held(&drain(&rxs)));
     }
 
     #[tokio::test]

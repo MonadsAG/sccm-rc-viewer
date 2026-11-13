@@ -61,6 +61,23 @@ pub fn session_err(m: impl Into<String>) -> Reply {
     err(ErrorCode::Session, m)
 }
 
+/// Input refused in a view-only session (the viewer's view-only lock, or a
+/// till that grants no control). Same reply in live and headless mode.
+pub const MSG_VIEW_ONLY: &str = "the viewer is in view-only mode";
+
+pub fn view_only() -> Reply {
+    session_err(MSG_VIEW_ONLY)
+}
+
+/// Whether `cmd` sends input to the till (an input command, or a batch,
+/// which may hold any): refused in view-only sessions. `wait` sends nothing.
+pub fn sends_input(cmd: &Command) -> bool {
+    !matches!(
+        cmd,
+        Command::Status | Command::Screenshot { .. } | Command::Wait { .. } | Command::Disconnect
+    )
+}
+
 pub fn no_image() -> Reply {
     session_err("no desktop image yet; use wait (change=true) and try again")
 }
@@ -538,6 +555,40 @@ mod tests {
             steps: vec![Command::Key { combo: "a".into() }]
         })
         .is_ok());
+    }
+
+    #[test]
+    fn view_only_refuses_input_and_batches_only() {
+        for c in [
+            Command::Status,
+            Command::Disconnect,
+            Command::Screenshot {
+                region: None,
+                max_width: None,
+            },
+            Command::Wait {
+                change: true,
+                stable_ms: None,
+                timeout_ms: 1,
+            },
+        ] {
+            assert!(!sends_input(&c), "{c:?}");
+        }
+        for c in [
+            Command::Key { combo: "a".into() },
+            Command::Move {
+                x: 1.0,
+                y: 1.0,
+                relative: false,
+            },
+            Command::Batch { steps: vec![] },
+        ] {
+            assert!(sends_input(&c), "{c:?}");
+        }
+        assert_eq!(
+            view_only(),
+            err(ErrorCode::Session, "the viewer is in view-only mode")
+        );
     }
 
     #[test]

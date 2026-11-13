@@ -706,7 +706,7 @@ mod tests {
         }
         fn send(&mut self, events: Vec<FastPathInputEvent>) -> Result<(), Reply> {
             if self.refuse {
-                return Err(exec::session_err("the viewer is in view-only mode"));
+                return Err(exec::view_only());
             }
             self.sent.extend(events);
             Ok(())

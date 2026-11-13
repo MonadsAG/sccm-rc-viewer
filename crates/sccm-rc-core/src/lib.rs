@@ -16,6 +16,7 @@ use tracing::{debug, info, warn};
 
 pub mod agent;
 pub mod audit;
+pub mod frame;
 pub mod keychain;
 pub mod paths;
 pub mod rdp;

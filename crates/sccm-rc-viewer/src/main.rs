@@ -448,10 +448,11 @@ struct FrameSink {
     shared: Arc<Mutex<SharedFrame>>,
     cursor: Arc<Mutex<CursorState>>,
     proxy: EventLoopProxy<UserEvent>,
-    /// Last time we did a full-frame resync copy. The incremental dirty-region
-    /// copy is fast but can drift from the (always-correct) composite if a region
-    /// is ever under-reported; a periodic full copy self-heals any such drift.
-    last_full: std::time::Instant,
+    /// Dirty-region copy plus a periodic full resync copy: the incremental
+    /// copy is fast but can drift from the (always-correct) composite if a
+    /// region is ever under-reported; the full copy self-heals any such drift.
+    /// Shared with the headless MCP backend.
+    copier: sccm_rc_core::frame::FrameCopier,
 }
 
 impl SessionSink for FrameSink {
@@ -461,47 +462,35 @@ impl SessionSink for FrameSink {
         let src = image.data();
         {
             let mut f = self.shared.lock().unwrap();
+            let f = &mut *f;
             // Full copy on first frame, size change, or as a periodic resync that
             // heals any drift from the incremental path (cheap at ~3/sec).
-            let resync = self.last_full.elapsed() >= std::time::Duration::from_millis(300);
-            if f.width != iw || f.height != ih || f.rgba.len() != src.len() || resync {
-                // First frame or size change (reactivation): full copy.
-                f.width = iw;
-                f.height = ih;
-                f.rgba.clear();
-                f.rgba.extend_from_slice(src);
-                self.last_full = std::time::Instant::now();
-                f.full_resync = true; // GPU path: re-upload the whole texture.
-            } else {
-                // Copy only the dirty region's rows.
-                let w = iw as usize;
-                let left = region.left as usize;
-                let right = (region.right as usize).min(w.saturating_sub(1));
-                let bottom = (region.bottom as usize).min((ih as usize).saturating_sub(1));
-                let top = (region.top as usize).min(bottom);
-                for y in top..=bottom {
-                    let a = (y * w + left) * 4;
-                    let b = (y * w + right + 1) * 4;
-                    if b <= f.rgba.len() && b <= src.len() {
-                        f.rgba[a..b].copy_from_slice(&src[a..b]);
-                    }
+            let copied = self.copier.copy(
+                &mut f.rgba,
+                (f.width, f.height),
+                src,
+                (iw, ih),
+                region,
+                std::time::Instant::now(),
+            );
+            match copied {
+                sccm_rc_core::frame::Copied::Full => {
+                    f.width = iw;
+                    f.height = ih;
+                    f.full_resync = true; // GPU path: re-upload the whole texture.
                 }
                 // GPU path: accumulate the dirty band (union) since the last paint.
-                let acc = UpdateRegion {
-                    left: left as u16,
-                    top: top as u16,
-                    right: right as u16,
-                    bottom: bottom as u16,
-                };
-                f.dirty = Some(match f.dirty.take() {
-                    Some(d) => UpdateRegion {
-                        left: d.left.min(acc.left),
-                        top: d.top.min(acc.top),
-                        right: d.right.max(acc.right),
-                        bottom: d.bottom.max(acc.bottom),
-                    },
-                    None => acc,
-                });
+                sccm_rc_core::frame::Copied::Region(acc) => {
+                    f.dirty = Some(match f.dirty.take() {
+                        Some(d) => UpdateRegion {
+                            left: d.left.min(acc.left),
+                            top: d.top.min(acc.top),
+                            right: d.right.max(acc.right),
+                            bottom: d.bottom.max(acc.bottom),
+                        },
+                        None => acc,
+                    });
+                }
             }
             f.frames = f.frames.wrapping_add(1);
             f.watch.on_update(std::time::Instant::now());
@@ -1291,7 +1280,7 @@ async fn run_session(
             shared,
             cursor,
             proxy,
-            last_full: std::time::Instant::now(),
+            copier: sccm_rc_core::frame::FrameCopier::new(),
         };
         rdp::run_active_session(
             &mut session,
@@ -1458,7 +1447,6 @@ struct App {
 
 /// How long the subtitle says "Controlled by Claude" after a command.
 const CONTROL_SHOWN: std::time::Duration = std::time::Duration::from_secs(5);
-const MSG_VIEW_ONLY: &str = "the viewer is in view-only mode";
 
 /// The viewer session as a Claude command sees it.
 struct LiveTarget<'a> {
@@ -1499,7 +1487,7 @@ impl control::Target for LiveTarget<'_> {
 
     fn send(&mut self, events: Vec<FastPathInputEvent>) -> Result<(), Reply> {
         if self.view_only {
-            return Err(exec::session_err(MSG_VIEW_ONLY));
+            return Err(exec::view_only());
         }
         let tx = self
             .tx
@@ -1990,9 +1978,7 @@ impl App {
             }
             Command::Screenshot { region, max_width } => self.control_screenshot(region, max_width),
             // Waiting sends nothing, so it works in view-only mode too.
-            ref c if self.view_only && !matches!(c, Command::Wait { .. }) => {
-                exec::session_err(MSG_VIEW_ONLY)
-            }
+            ref c if self.view_only && exec::sends_input(c) => exec::view_only(),
             cmd => {
                 self.arbiter.begin_command();
                 self.control_job = Some((control::Job::new(cmd), reply));
