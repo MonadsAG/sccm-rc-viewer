@@ -52,9 +52,22 @@ fn utc_string(secs: u64) -> String {
     format!("{y:04}-{m:02}-{d:02} {h:02}:{mi:02}:{s:02}")
 }
 
-/// Escape the few characters that would break a JSON string value.
+/// Escape a value for a JSON string: `\\`, `"` and every control character,
+/// so text from the agent (e.g. typed newlines) cannot split or break a line.
 fn esc(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// Append one audit event. `duration_s` is set on the "disconnect" event.
@@ -126,5 +139,26 @@ mod tests {
         assert!(text.contains("\"event\":\"agent\""), "{text}");
         assert!(text.contains("\"target\":\"till-01\""), "{text}");
         assert!(text.contains("\"action\":\"click \\\"OK\\\"\""), "{text}");
+    }
+
+    #[test]
+    fn esc_escapes_control_characters() {
+        assert_eq!(esc("a\nb\rc\td"), "a\\nb\\rc\\td");
+        assert_eq!(esc("x\u{7}y\u{1f}"), "x\\u0007y\\u001f");
+        assert_eq!(esc("q\"\\"), "q\\\"\\\\");
+        assert_eq!(esc("äü"), "äü");
+    }
+
+    #[test]
+    fn agent_line_with_newline_stays_one_line() {
+        let dir = std::env::temp_dir().join(format!("sccm-rc-audit-nl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        log_agent_to(&dir, "till\n01", "type_text \"a\nb\u{1b}\"");
+        let text = std::fs::read_to_string(dir.join("audit.jsonl")).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(text.lines().count(), 1, "{text}");
+        assert!(!text.contains('\u{1b}'), "{text}");
+        assert!(text.contains("a\\nb\\u001b"), "{text}");
     }
 }
