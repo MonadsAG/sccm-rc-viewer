@@ -71,8 +71,12 @@ impl Router {
         }
     }
 
+    /// A failed connect leaves the active mode as it was.
     async fn connect_live(&mut self, target: &str, force: bool, note: Option<String>) -> Reply {
         let reply = self.live.connect(target, force).await;
+        if !live_connected(&reply) {
+            return reply;
+        }
         self.active = Some(ConnectMode::Live);
         let mut extra = Vec::new();
         if let Some(n) = note {
@@ -195,6 +199,19 @@ impl Backend for Router {
     }
 }
 
+/// Whether a live connect worked: the viewer answers `status` with
+/// `connected: false` when it has no session, and with an error when its
+/// control is off.
+fn live_connected(reply: &Reply) -> bool {
+    matches!(
+        reply,
+        Reply::Status {
+            connected: true,
+            ..
+        } | Reply::Ok { .. }
+    )
+}
+
 /// Same till, as far as the names tell: case and a trailing dot ignored, and
 /// a short name matches the first label of an FQDN. No DNS lookup, so an IP
 /// and a name never match.
@@ -233,7 +250,7 @@ mod tests {
         name: &'static str,
         log: Log,
         status: Arc<Mutex<Reply>>,
-        connect: Reply,
+        connect: Arc<Mutex<Reply>>,
     }
 
     #[async_trait]
@@ -243,7 +260,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(format!("{} connect {target} {force}", self.name));
-            self.connect.clone()
+            self.connect.lock().unwrap().clone()
         }
         async fn run(&mut self, cmd: Command) -> Reply {
             let name = match cmd {
@@ -289,6 +306,7 @@ mod tests {
         router: Router,
         log: Log,
         headless_status: Arc<Mutex<Reply>>,
+        live_connect: Arc<Mutex<Reply>>,
     }
 
     fn setup(viewer: Reply, headless_connect: Reply) -> Setup {
@@ -298,18 +316,20 @@ mod tests {
             name: "headless",
             log: log.clone(),
             status: headless_status.clone(),
-            connect: headless_connect,
+            connect: Arc::new(Mutex::new(headless_connect)),
         };
+        let live_connect = Arc::new(Mutex::new(viewer.clone()));
         let live = Fake {
             name: "live",
             log: log.clone(),
-            status: Arc::new(Mutex::new(viewer.clone())),
-            connect: viewer,
+            status: Arc::new(Mutex::new(viewer)),
+            connect: live_connect.clone(),
         };
         Setup {
             router: Router::new(Box::new(headless), Box::new(live)),
             log,
             headless_status,
+            live_connect,
         }
     }
 
@@ -501,6 +521,131 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    fn key() -> Command {
+        Command::Key {
+            combo: "Enter".into(),
+            secret: false,
+        }
+    }
+
+    fn is_not_connected(r: &Reply) -> bool {
+        matches!(
+            r,
+            Reply::Error {
+                code: ErrorCode::NotConnected,
+                ..
+            }
+        )
+    }
+
+    #[tokio::test]
+    async fn a_failed_live_connect_leaves_no_active_backend() {
+        let mut s = setup(off(), connected_ok());
+        let r = s
+            .router
+            .connect_as("till-1", false, Some(ConnectMode::Live))
+            .await;
+        assert_eq!(r, off());
+        let r = s
+            .router
+            .run(Command::Screenshot {
+                region: None,
+                max_width: None,
+            })
+            .await;
+        assert!(is_not_connected(&r), "{r:?}");
+        match s.router.run(Command::Status).await {
+            Reply::Status {
+                connected, mode, ..
+            } => {
+                assert!(!connected);
+                assert_eq!(mode, "both (viewer control is off)");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(calls(&s.log), ["live connect till-1 false", "live status"]);
+    }
+
+    #[tokio::test]
+    async fn a_live_connect_to_a_viewer_without_session_fails() {
+        let mut s = setup(status(false, None, "live"), connected_ok());
+        match s
+            .router
+            .connect_as("till-1", false, Some(ConnectMode::Live))
+            .await
+        {
+            Reply::Status { connected, .. } => assert!(!connected),
+            other => panic!("{other:?}"),
+        }
+        let r = s.router.run(key()).await;
+        assert!(is_not_connected(&r), "{r:?}");
+    }
+
+    #[tokio::test]
+    async fn headless_connect_works_after_a_failed_live_connect() {
+        let mut s = setup(off(), connected_ok());
+        s.router
+            .connect_as("till-1", false, Some(ConnectMode::Live))
+            .await;
+        let r = s
+            .router
+            .connect_as("till-1", false, Some(ConnectMode::Headless))
+            .await;
+        assert!(matches!(r, Reply::Ok { .. }), "{r:?}");
+        s.router.run(key()).await;
+        assert_eq!(
+            calls(&s.log),
+            [
+                "live connect till-1 false",
+                "headless connect till-1 false",
+                "headless input"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_live_connect_keeps_the_running_live_session() {
+        let mut s = setup(status(true, Some("till-1"), "live"), connected_ok());
+        s.router
+            .connect_as("till-1", false, Some(ConnectMode::Live))
+            .await;
+        *s.live_connect.lock().unwrap() = off();
+        let r = s
+            .router
+            .connect_as("till-2", false, Some(ConnectMode::Live))
+            .await;
+        assert_eq!(r, off());
+        s.router.run(key()).await;
+        assert_eq!(
+            calls(&s.log),
+            [
+                "live connect till-1 false",
+                "live connect till-2 false",
+                "live input"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_successful_live_connect_activates_live() {
+        let mut s = setup(status(true, Some("till-1"), "live"), connected_ok());
+        match s
+            .router
+            .connect_as("till-1", true, Some(ConnectMode::Live))
+            .await
+        {
+            Reply::Status {
+                connected, mode, ..
+            } => {
+                assert!(connected);
+                assert_eq!(mode, "live (force is ignored in live mode)");
+            }
+            other => panic!("{other:?}"),
+        }
+        s.router.run(key()).await;
+        assert_eq!(calls(&s.log), ["live connect till-1 true", "live input"]);
     }
 
     #[tokio::test]
