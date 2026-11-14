@@ -535,6 +535,10 @@ impl Default for Headless {
 
 #[async_trait]
 impl Backend for Headless {
+    fn mode(&self) -> Option<crate::backend::ConnectMode> {
+        Some(crate::backend::ConnectMode::Headless)
+    }
+
     async fn connect(&mut self, target: &str, force: bool) -> Reply {
         self.touch();
         self.reap().await;
@@ -1230,12 +1234,15 @@ mod tests {
                 steps: vec![
                     Command::Key {
                         combo: "Enter".into(),
+                        secret: false,
                     },
                     Command::Key {
                         combo: "NoSuchKey".into(),
+                        secret: false,
                     },
                     Command::Key {
                         combo: "Tab".into(),
+                        secret: false,
                     },
                 ],
             })
@@ -1614,6 +1621,7 @@ mod tests {
                     },
                     Command::Key {
                         combo: "Enter".into(),
+                        secret: false,
                     },
                 ],
             },
@@ -1721,6 +1729,7 @@ mod tests {
                     steps: vec![
                         Command::Key {
                             combo: "Enter".into(),
+                            secret: false,
                         },
                         bad,
                     ],

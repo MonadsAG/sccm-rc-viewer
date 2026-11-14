@@ -209,14 +209,25 @@ and register it with Claude Code:
 ```sh
 cargo build --release -p sccm-rc-mcp
 
+# both modes in one server (connect picks, see below):
+claude mcp add sccm-rc --scope user -- /path/to/sccm-rc-mcp --mode both
+# or only one of them:
 claude mcp add sccm-rc -- /path/to/sccm-rc-mcp --mode headless
-# or, to watch along in the viewer:
 claude mcp add sccm-rc -- /path/to/sccm-rc-mcp --mode live
 ```
 
 `SCCM RC.app` from `bundle.sh` already contains the binary, at
-`SCCM RC.app/Contents/MacOS/sccm-rc-mcp`. The mode is fixed in the
-registration; there is no automatic switching.
+`SCCM RC.app/Contents/MacOS/sccm-rc-mcp`.
+
+**Both modes** (`--mode both`): one session at a time, chosen per `connect`.
+`connect` takes an optional `mode` (`live` or `headless`). Without it, the
+server uses live when the viewer allows control by Claude and is connected to
+that till (host names compared without case and domain; no DNS lookup, so an
+IP never matches a name), otherwise headless. The result names the mode and
+why. An explicit mode never falls back to the other one. All later tools go
+to the session of the last `connect` until `disconnect`; while a headless
+session runs, a new `connect` is refused. `--mode headless` (the default) and
+`--mode live` stay fixed and refuse a `connect` that asks for the other mode.
 
 **Headless mode** (the default) opens its own session, without a window. It
 never asks for anything, so the logon data must already be there:
@@ -248,14 +259,14 @@ fractions from 0 to 1 of the desktop with `relative: true`.
 
 | Tool | What it does |
 |---|---|
-| `connect` | Headless: connect to a till by host name or IP (`target`); refuses if a user is logged on, unless `force: true`. Live: never dials a till; reports the viewer's session (and notes it if the viewer is connected to another till). |
+| `connect` | Headless: connect to a till by host name or IP (`target`); refuses if a user is logged on, unless `force: true`. Live: never dials a till; reports the viewer's session (and notes it if the viewer is connected to another till). Optional `mode` (`live`, `headless`) picks the session with `--mode both`; see above. |
 | `disconnect` | Headless: release the till. Live: only hands control back; the viewer stays connected. |
 | `screenshot` | PNG of the desktop, scaled down to `max_width` (default 1280). Optional `region` in desktop pixels. |
 | `click` | Click at `x`, `y`. `button` left (default), right or middle; `double` for a double click. |
 | `move` | Move the pointer without clicking, for hover effects. |
 | `scroll` | Mouse wheel at `x`, `y`. `amount` in notches, positive up, negative down. |
 | `type_text` | Type text, independent of the till's keyboard layout. `secret: true` for passwords. |
-| `key` | Press a key or combination: `Enter`, `Esc`, `Tab`, `F5`, `Ctrl+A`, `Ctrl+Alt+Del`, `Num0` to `Num9`, `NumEnter`. |
+| `key` | Press a key or combination: `Enter`, `Esc`, `Tab`, `F5`, `Ctrl+A`, `Ctrl+Alt+Del`, `0` to `9`, `a` to `z`, `Num0` to `Num9`, `NumEnter`. `secret: true` when the key is part of a password typed key by key. |
 | `batch` | Run several steps in order in one call. Steps are `click`, `move`, `scroll`, `type_text`, `key` and `wait`, with the arguments of that tool. Stops at the first failing step. No `screenshot`, `status`, `disconnect` or nested `batch` inside. |
 | `wait` | Wait until the screen changes (`change: true`) and/or has stayed unchanged for `stable_ms`; gives up after `timeout_ms` (required, at most 5 minutes). At least one of `change` and `stable_ms` is required. |
 | `status` | Connection state, target, desktop size, mode and idle time. In live mode the state of the viewer's session. |
@@ -274,8 +285,8 @@ fractions from 0 to 1 of the desktop with `relative: true`.
   hard kill (SIGKILL) leaves it occupied until the till times the session out.
   In live mode the session belongs to the viewer and is never released by the
   server.
-- **Secrets stay out.** Text typed with `secret: true` is never logged and not
-  echoed in the result or in error messages. The server logs to stderr only;
+- **Secrets stay out.** Text typed and keys pressed with `secret: true` are
+  never logged and not echoed in the result or in error messages. The server logs to stderr only;
   stdout carries the protocol.
 - **Audit log.** `connect`, `disconnect` and every action go to the viewer's
   `audit.jsonl` (on macOS in `~/Library/Application Support/sccm-rc/`), as

@@ -169,11 +169,17 @@ So:
   `disconnect`, on MCP shutdown, on SIGINT/SIGTERM, and after an idle timeout
   (default 10 minutes without a tool call) so a forgotten session doesn't
   block a till.
-- **Mode selection (my call):** fixed in the MCP configuration
-  (`sccm-rc-mcp --mode headless` or `--mode live`). No automatic switching or
-  fallback: in live mode with the viewer's toggle off (no socket), every tool
-  returns "control not enabled in the viewer" and the server never connects
-  to a till by itself.
+- **Mode selection:** fixed in the MCP configuration
+  (`sccm-rc-mcp --mode headless` or `--mode live`): in live mode with the
+  viewer's toggle off (no socket), every tool returns "control not enabled in
+  the viewer" and the server never connects to a till by itself.
+  **Update 2026-11-14 (user's decision):** `--mode both` offers both in one
+  server, one session at a time. `connect` takes an optional `mode`; without
+  it the server uses live when the viewer allows control by Claude and is
+  connected to that till, otherwise headless (the result says which and why).
+  An explicit mode never falls back. Registering `--mode both` is the user's
+  consent that the server may dial a till headless when the viewer is not in
+  control.
 - **The user's input wins (my call):** in live mode, local keyboard/mouse
   input during a Claude command aborts that command at once; the viewer
   releases any keys/buttons the command had pressed, and the tool returns

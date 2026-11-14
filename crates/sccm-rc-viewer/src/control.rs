@@ -863,7 +863,10 @@ mod tests {
     }
 
     fn key(c: &str) -> Command {
-        Command::Key { combo: c.into() }
+        Command::Key {
+            combo: c.into(),
+            secret: false,
+        }
     }
 
     fn mouse_flags(ev: &[FastPathInputEvent]) -> Vec<PointerFlags> {

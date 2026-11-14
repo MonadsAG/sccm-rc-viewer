@@ -292,12 +292,27 @@ pub fn plan_input(
                 done,
             }
         }
-        Command::Key { combo } => {
-            let k = keys::parse_combo(combo).map_err(|e| bad_args(e.to_string()))?;
+        Command::Key { combo, secret } => {
+            let k = keys::parse_combo(combo).map_err(|e| {
+                // The error names the key; withhold it for secret input.
+                bad_args(if *secret {
+                    "unknown key (secret)".to_string()
+                } else {
+                    e.to_string()
+                })
+            })?;
+            let (audit, done) = if *secret {
+                (
+                    "key (secret)".to_string(),
+                    "pressed a key (secret)".to_string(),
+                )
+            } else {
+                (format!("key {combo}"), format!("pressed {combo}"))
+            };
             InputPlan {
-                audit: format!("key {combo}"),
+                audit,
                 chunks: vec![Chunk::Input(keys::press_combo(&k))],
-                done: format!("pressed {combo}"),
+                done,
             }
         }
         _ => return Ok(None),
@@ -458,6 +473,41 @@ mod tests {
     }
 
     #[test]
+    fn secret_key_never_in_audit_or_reply() {
+        let plan = plan_input(
+            &Command::Key {
+                combo: "7".into(),
+                secret: true,
+            },
+            px,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(plan.audit, "key (secret)");
+        assert_eq!(plan.done, "pressed a key (secret)");
+        let bad = plan_input(
+            &Command::Key {
+                combo: "Secret4711".into(),
+                secret: true,
+            },
+            px,
+        )
+        .err()
+        .unwrap();
+        assert!(!format!("{bad:?}").contains("4711"), "{bad:?}");
+        let plain = plan_input(
+            &Command::Key {
+                combo: "Enter".into(),
+                secret: false,
+            },
+            px,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(plain.audit, "key Enter");
+    }
+
+    #[test]
     fn secret_text_never_in_audit_or_reply() {
         let p = plan_input(
             &Command::TypeText {
@@ -552,7 +602,10 @@ mod tests {
         }
         assert!(check(&Command::Batch { steps: vec![] }).is_err());
         assert!(check(&Command::Batch {
-            steps: vec![Command::Key { combo: "a".into() }]
+            steps: vec![Command::Key {
+                combo: "a".into(),
+                secret: false,
+            }]
         })
         .is_ok());
     }
@@ -575,7 +628,10 @@ mod tests {
             assert!(!sends_input(&c), "{c:?}");
         }
         for c in [
-            Command::Key { combo: "a".into() },
+            Command::Key {
+                combo: "a".into(),
+                secret: false,
+            },
             Command::Move {
                 x: 1.0,
                 y: 1.0,
@@ -630,6 +686,7 @@ mod tests {
             },
             Command::Key {
                 combo: "ctrl+alt+del".into(),
+                secret: false,
             },
             Command::TypeText {
                 text: "Grüezi\n".into(),

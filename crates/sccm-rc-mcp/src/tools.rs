@@ -3,9 +3,15 @@
 use sccm_rc_core::agent::proto::{Command, Reply};
 use serde_json::{json, Map, Value};
 
+use crate::backend::ConnectMode;
+
 /// A validated tool invocation.
 pub enum Call {
-    Connect { target: String, force: bool },
+    Connect {
+        target: String,
+        force: bool,
+        mode: Option<ConnectMode>,
+    },
     Run(Command),
 }
 
@@ -42,10 +48,11 @@ pub fn list() -> Vec<Value> {
     vec![
         tool(
             "connect",
-            "Connect to a till by hostname or IP. Fails if a user is logged on unless force=true, which takes the till over from that user.",
+            "Connect to a till by hostname or IP. Headless: fails if a user is logged on unless force=true, which takes the till over from that user. Live: uses the session of the viewer the user is watching (force is ignored).",
             json!({
                 "target": {"type":"string","description":"Hostname or IP of the till"},
-                "force": {"type":"boolean","description":"Take over a till where a user is logged on (default false)"}
+                "force": {"type":"boolean","description":"Take over a till where a user is logged on (default false, headless only)"},
+                "mode": {"type":"string","enum":["live","headless"],"description":"Which session to use. Omitted: live if the viewer allows control by Claude and is connected to this till, otherwise headless. A server registered with a single mode refuses the other one."}
             }),
             &["target"],
         ),
@@ -108,8 +115,11 @@ pub fn list() -> Vec<Value> {
         ),
         tool(
             "key",
-            "Press a key or key combination. Names like Enter, Esc, Tab, F5, Ctrl+A, Ctrl+Alt+Del, Num0 to Num9, NumEnter.",
-            json!({"combo": {"type":"string","description":"For example Enter, Ctrl+A, Ctrl+Alt+Del"}}),
+            "Press a key or key combination. Names like Enter, Esc, Tab, F5, Ctrl+A, Ctrl+Alt+Del, 0 to 9, a to z, Num0 to Num9, NumEnter. Set secret=true when the key is part of a password (e.g. typed digit by digit) so it is never logged or echoed.",
+            json!({
+                "combo": {"type":"string","description":"For example Enter, Ctrl+A, Ctrl+Alt+Del"},
+                "secret": {"type":"boolean","description":"Part of a password (default false)"}
+            }),
             &["combo"],
         ),
         tool(
@@ -143,7 +153,7 @@ pub fn list() -> Vec<Value> {
 fn to_command(cmd: &str, mut obj: Map<String, Value>) -> Result<Command, String> {
     obj.insert("cmd".into(), Value::String(cmd.into()));
     serde_json::from_value(Value::Object(obj)).map_err(|e| {
-        if cmd == "type_text" {
+        if cmd == "type_text" || cmd == "key" {
             // serde's message can quote the offending value, which may be a password.
             format!("invalid arguments for {cmd}")
         } else {
@@ -168,9 +178,16 @@ pub fn parse(name: &str, args: &Value) -> Result<Call, String> {
                 .filter(|t| !t.is_empty())
                 .ok_or("connect needs a non-empty target")?;
             let force = obj.get("force").and_then(Value::as_bool).unwrap_or(false);
+            let mode = match obj.get("mode") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(m)) if m == "live" => Some(ConnectMode::Live),
+                Some(Value::String(m)) if m == "headless" => Some(ConnectMode::Headless),
+                Some(other) => return Err(format!("mode must be live or headless, not {other}")),
+            };
             return Ok(Call::Connect {
                 target: target.to_string(),
                 force,
+                mode,
             });
         }
         "disconnect" => Command::Disconnect,
@@ -220,6 +237,8 @@ pub enum Secret {
     /// A top-level secret type_text: characters typed, and skipped
     /// because they cannot be sent (counts only, never the characters).
     Text { typed: usize, skipped: usize },
+    /// A top-level secret key press.
+    Key,
     /// A batch of this many steps containing a secret type_text.
     Batch(usize),
 }
@@ -236,6 +255,7 @@ pub fn result(reply: Reply, secret: Option<Secret>) -> Value {
                 }
                 text_result(t)
             }
+            Some(Secret::Key) => text_result("pressed a key (secret)".into()),
             Some(Secret::Batch(n)) => {
                 text_result(format!("batch done: {n} steps (contains secret input)"))
             }
@@ -300,6 +320,7 @@ pub fn secret_input(cmd: &Command) -> Option<Secret> {
                 skipped,
             })
         }
+        Command::Key { secret: true, .. } => Some(Secret::Key),
         Command::Batch { steps } if steps.iter().any(|s| secret_input(s).is_some()) => {
             Some(Secret::Batch(steps.len()))
         }
@@ -310,6 +331,65 @@ pub fn secret_input(cmd: &Command) -> Option<Secret> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn connect_mode(args: Value) -> Result<Option<ConnectMode>, String> {
+        match parse("connect", &args)? {
+            Call::Connect { mode, .. } => Ok(mode),
+            Call::Run(_) => panic!("not a connect"),
+        }
+    }
+
+    #[test]
+    fn secret_key_is_never_echoed() {
+        let call = parse("key", &json!({"combo":"7","secret":true})).unwrap();
+        let Call::Run(cmd) = call else { panic!() };
+        assert!(!format!("{cmd:?}").contains('7'), "{cmd:?}");
+        let secret = secret_input(&cmd);
+        let ok = result(
+            Reply::Ok {
+                text: "pressed 7".into(),
+            },
+            secret,
+        );
+        assert_eq!(ok_text(&ok), "pressed a key (secret)");
+        let e = result(
+            Reply::Error {
+                code: sccm_rc_core::agent::proto::ErrorCode::BadArgs,
+                message: "unknown key 7".into(),
+                completed_steps: None,
+            },
+            secret,
+        );
+        assert!(!e.to_string().contains('7'), "{e}");
+        // Wrong type for combo: serde's message must not quote the value.
+        let bad = parse("key", &json!({"combo":4711,"secret":true}))
+            .err()
+            .unwrap();
+        assert!(!bad.contains("4711"), "{bad}");
+        // In a batch the whole result is ours.
+        let call = parse(
+            "batch",
+            &json!({"steps":[{"type":"key","combo":"4","secret":true},{"type":"key","combo":"Enter"}]}),
+        )
+        .unwrap();
+        let Call::Run(cmd) = call else { panic!() };
+        assert!(matches!(secret_input(&cmd), Some(Secret::Batch(2))));
+    }
+
+    #[test]
+    fn connect_parses_the_mode() {
+        assert_eq!(connect_mode(json!({"target":"t"})), Ok(None));
+        assert_eq!(
+            connect_mode(json!({"target":"t","mode":"live"})),
+            Ok(Some(ConnectMode::Live))
+        );
+        assert_eq!(
+            connect_mode(json!({"target":"t","mode":"headless"})),
+            Ok(Some(ConnectMode::Headless))
+        );
+        assert!(connect_mode(json!({"target":"t","mode":"both"})).is_err());
+        assert!(connect_mode(json!({"target":"t","mode":1})).is_err());
+    }
 
     fn ok_text(v: &Value) -> &str {
         assert_eq!(v["isError"], false, "{v}");
