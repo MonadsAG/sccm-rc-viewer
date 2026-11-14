@@ -457,7 +457,10 @@ fn build_wlc_channel_set(
     } else {
         set.insert(PassiveCurtain);
     }
-    set.insert(ArbitrationChannel::new(opts.takeover, opts.host_in_use.clone()));
+    set.insert(ArbitrationChannel::new(
+        opts.takeover,
+        opts.host_in_use.clone(),
+    ));
     set.insert(PassiveDynres);
     set.insert(PassiveDskcfg);
     set.insert(PassiveDrdynvc);
@@ -513,10 +516,7 @@ impl Default for RdpOptions {
 }
 
 impl ArbitrationChannel {
-    pub fn new(
-        takeover: bool,
-        host_in_use: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    ) -> Self {
+    pub fn new(takeover: bool, host_in_use: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Self {
         Self {
             replies_sent: 0,
             takeover_sent: false,
@@ -1095,9 +1095,8 @@ pub async fn connect_rdp_with(
         connector = connector.with_static_channel(PassiveRdpsnd);
         // Real clipboard channel (SCCM_RC_CLIP=1), else a passive placeholder.
         if std::env::var("SCCM_RC_CLIP").as_deref() == Ok("1") {
-            connector = connector.with_static_channel(CliprdrChannel::with_counter(
-                cliprdr_req_counter.clone(),
-            ));
+            connector = connector
+                .with_static_channel(CliprdrChannel::with_counter(cliprdr_req_counter.clone()));
         } else {
             connector = connector.with_static_channel(PassiveCliprdr);
         }
@@ -1345,7 +1344,7 @@ pub trait SessionSink: Send {
     fn on_terminate(&mut self, reason: String);
 }
 
-/// Connection-progress phases reported through [`FrameSink::on_status`].
+/// Connection-progress phases reported through [`SessionSink::on_status`].
 /// The core stays language-neutral; the viewer localizes them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusPhase {
@@ -1970,8 +1969,7 @@ pub async fn run_active_session_with(
                     // new ActiveStage can route SVC traffic — without this, any
                     // post-reactivation packet on rdpsnd/cliprdr/etc. trips an
                     // "unexpected channel ID" error and forces a reconnect.
-                    let arb_enabled_now =
-                        std::env::var("SCCM_RC_ARB").as_deref() == Ok("1");
+                    let arb_enabled_now = std::env::var("SCCM_RC_ARB").as_deref() == Ok("1");
                     new_result.static_channels = build_wlc_channel_set(
                         arb_enabled_now,
                         clip_enabled,
@@ -2688,7 +2686,6 @@ pub struct LoggingSink {
     pub updates: u64,
     pub total_pixels: u64,
 }
-
 
 impl SessionSink for LoggingSink {
     fn on_graphics_update(&mut self, image: &dyn FrameView, region: UpdateRegion) {

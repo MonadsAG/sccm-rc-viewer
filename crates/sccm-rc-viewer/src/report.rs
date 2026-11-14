@@ -147,8 +147,8 @@ fn save_png(dst: &Path, width: u32, height: u32, rgba: &[u8]) -> std::io::Result
     let needed = width as usize * height as usize * 4;
     let buf: ImageBuffer<Rgba<u8>, &[u8]> = ImageBuffer::from_raw(width, height, &rgba[..needed])
         .ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "rgba size mismatch")
-        })?;
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "rgba size mismatch")
+    })?;
     buf.save(dst)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
 }

@@ -44,7 +44,7 @@ define_class!(
         /// Action of every button/checkbox; the sender's tag picks the closure.
         #[unsafe(method(fire:))]
         fn fire(&self, sender: &AnyObject) {
-            // SAFETY: NSButton answers `tag`.
+            // SAFETY: every sender is an NSControl, which answers `tag`.
             let tag: isize = unsafe { msg_send![sender, tag] };
             let buttons = self.ivars().buttons.borrow();
             if let Some(f) = usize::try_from(tag).ok().and_then(|i| buttons.get(i)) {
@@ -97,15 +97,16 @@ impl SheetTarget {
         }
     }
 
-    /// Register `f` and wire `button` to it.
-    pub fn on_click(&self, button: &NSButton, f: Box<dyn Fn()>) {
+    /// Register `f` and wire `control`'s action (a button click, a search
+    /// field's search) to it.
+    pub fn on_click(&self, control: &NSControl, f: Box<dyn Fn()>) {
         let mut buttons = self.ivars().buttons.borrow_mut();
-        button.setTag(buttons.len() as isize);
+        control.setTag(buttons.len() as isize);
         buttons.push(f);
-        // SAFETY: the target outlives the button (the sheet keeps both).
+        // SAFETY: the target outlives the control (the sheet keeps both).
         unsafe {
-            button.setTarget(Some(self));
-            button.setAction(Some(sel!(fire:)));
+            control.setTarget(Some(self));
+            control.setAction(Some(sel!(fire:)));
         }
     }
 

@@ -37,7 +37,7 @@ use rust_i18n::t;
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 use crate::toolbar::ToolbarAction;
-use crate::NativeEvent;
+use crate::{Chrome, NativeEvent};
 
 /// Every action the native chrome can trigger; the index is the item tag.
 const ACTIONS: [ToolbarAction; 13] = [
@@ -152,24 +152,6 @@ fn symbol(name: &str, label: &str) -> Option<Retained<NSImage>> {
     )
 }
 
-/// State the App pushes into the chrome; `update` skips identical states.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Chrome {
-    pub subtitle: String,
-    /// A remote desktop is showing (session controls enabled).
-    pub connected: bool,
-    /// A session exists or is being set up (Disconnect enabled).
-    pub has_session: bool,
-    pub view_only: bool,
-    pub curtain: bool,
-    pub recording: bool,
-    pub fullscreen: bool,
-    /// Screen switcher label for multi-monitor targets, else disabled.
-    pub monitor: Option<String>,
-    /// "Allow control by Claude" is on (the control socket listens).
-    pub agent_control: bool,
-}
-
 impl Chrome {
     fn toggled(&self, a: ToolbarAction) -> bool {
         match a {
@@ -184,7 +166,10 @@ impl Chrome {
 
     fn enabled(&self, a: ToolbarAction) -> bool {
         match a {
-            ToolbarAction::About | ToolbarAction::BugReport => true,
+            // The drawn About panel is dismissed by a click in the window,
+            // which a sheet blocks.
+            ToolbarAction::About => !self.sheet,
+            ToolbarAction::BugReport => true,
             ToolbarAction::ToggleFullscreen | ToolbarAction::ToggleAgentControl => true,
             ToolbarAction::Disconnect => self.has_session,
             ToolbarAction::MonitorCycle => self.connected && self.monitor.is_some(),
@@ -792,6 +777,11 @@ mod tests {
         assert!(!idle.enabled(ToolbarAction::CtrlAltDel));
         assert!(!idle.enabled(ToolbarAction::Disconnect));
         assert!(idle.enabled(ToolbarAction::About));
+        let sheet = Chrome {
+            sheet: true,
+            ..Chrome::default()
+        };
+        assert!(!sheet.enabled(ToolbarAction::About), "not dismissable");
         let connecting = Chrome {
             has_session: true,
             ..Chrome::default()
