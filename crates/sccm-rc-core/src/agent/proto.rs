@@ -56,6 +56,10 @@ pub enum Command {
     },
     Key {
         combo: String,
+        /// Part of a password (e.g. digit by digit): the combo is never
+        /// logged, audited or echoed.
+        #[serde(default)]
+        secret: bool,
     },
     Batch {
         steps: Vec<Command>,
@@ -150,7 +154,15 @@ impl fmt::Debug for Command {
                 }
                 d.field("secret", secret).finish()
             }
-            Command::Key { combo } => f.debug_struct("Key").field("combo", combo).finish(),
+            Command::Key { combo, secret } => {
+                let mut d = f.debug_struct("Key");
+                if *secret {
+                    d.field("combo", &format_args!("<secret>"));
+                } else {
+                    d.field("combo", combo);
+                }
+                d.field("secret", secret).finish()
+            }
             Command::Batch { steps } => f.debug_struct("Batch").field("steps", steps).finish(),
             Command::Wait {
                 change,
@@ -251,12 +263,14 @@ mod tests {
             },
             Command::Key {
                 combo: "ctrl+c".into(),
+                secret: false,
             },
             Command::Batch {
                 steps: vec![
                     Command::Status,
                     Command::Key {
                         combo: "enter".into(),
+                        secret: false,
                     },
                 ],
             },

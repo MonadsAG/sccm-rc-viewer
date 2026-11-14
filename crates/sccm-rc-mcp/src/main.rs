@@ -4,6 +4,7 @@ mod headless;
 #[cfg(unix)]
 mod live;
 mod mcp;
+mod router;
 mod tools;
 
 use std::future::Future;
@@ -19,6 +20,8 @@ use tokio::sync::Notify;
 enum Mode {
     Headless,
     Live,
+    /// Live and headless in one server; `connect` picks (see router.rs).
+    Both,
 }
 
 #[derive(Parser)]
@@ -91,12 +94,17 @@ async fn run(mode: Mode) -> anyhow::Result<()> {
         mode = match mode {
             Mode::Headless => "headless",
             Mode::Live => "live",
+            Mode::Both => "both",
         },
         "sccm-rc-mcp starting"
     );
     let backend: Box<dyn backend::Backend + Send> = match mode {
         Mode::Headless => Box::new(headless::Headless::new()),
         Mode::Live => live_backend(),
+        Mode::Both => Box::new(router::Router::new(
+            Box::new(headless::Headless::new()),
+            live_backend(),
+        )),
     };
     let mut server = mcp::Server::new(backend);
     // stdin EOF ends serve(), which shuts the backend down itself. On a

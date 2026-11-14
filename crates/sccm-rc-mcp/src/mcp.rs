@@ -101,9 +101,13 @@ impl Server {
             Err(e) => return tools::error_result(e),
         };
         match call {
-            Call::Connect { target, force } => {
-                tracing::info!(target, force, "tool connect");
-                let reply = self.backend.connect(&target, force).await;
+            Call::Connect {
+                target,
+                force,
+                mode,
+            } => {
+                tracing::info!(target, force, mode = mode.map(|m| m.name()), "tool connect");
+                let reply = self.backend.connect_as(&target, force, mode).await;
                 tools::result(reply, None)
             }
             Call::Run(cmd) => {
@@ -302,7 +306,8 @@ mod tests {
             [Command::Batch {
                 steps: vec![
                     Command::Key {
-                        combo: "Enter".into()
+                        combo: "Enter".into(),
+                        secret: false,
                     },
                     Command::Wait {
                         change: false,

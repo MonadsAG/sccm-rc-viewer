@@ -142,6 +142,10 @@ fn reply_timeout(cmd: &Command, slack: Duration) -> Duration {
 
 #[async_trait]
 impl Backend for Live {
+    fn mode(&self) -> Option<crate::backend::ConnectMode> {
+        Some(crate::backend::ConnectMode::Live)
+    }
+
     async fn connect(&mut self, target: &str, _force: bool) -> Reply {
         match self.exchange(&Command::Status).await {
             Reply::Status {
@@ -262,7 +266,7 @@ mod tests {
         let accepted = Arc::new(AtomicUsize::new(0));
         let _srv = serve(&path, accepted.clone(), None, |line| {
             let cmd: Command = serde_json::from_str(line).unwrap();
-            assert!(matches!(cmd, Command::Key { ref combo } if combo == "ctrl+a"));
+            assert!(matches!(cmd, Command::Key { ref combo, .. } if combo == "ctrl+a"));
             Some(Reply::Ok {
                 text: "pressed".into(),
             })
@@ -272,6 +276,7 @@ mod tests {
             let r = live
                 .run(Command::Key {
                     combo: "ctrl+a".into(),
+                    secret: false,
                 })
                 .await;
             assert_eq!(
@@ -393,7 +398,13 @@ mod tests {
         };
         assert_eq!(reply_timeout(&w, s), Duration::from_secs(15));
         let b = Command::Batch {
-            steps: vec![w.clone(), Command::Key { combo: "a".into() }],
+            steps: vec![
+                w.clone(),
+                Command::Key {
+                    combo: "a".into(),
+                    secret: false,
+                },
+            ],
         };
         assert_eq!(reply_timeout(&b, s), Duration::from_millis(5000 + 200) + s);
     }
@@ -414,7 +425,13 @@ mod tests {
         );
         // In a batch the text's time adds to the steps' budget.
         let b = Command::Batch {
-            steps: vec![text(3200), Command::Key { combo: "a".into() }],
+            steps: vec![
+                text(3200),
+                Command::Key {
+                    combo: "a".into(),
+                    secret: false,
+                },
+            ],
         };
         assert_eq!(
             reply_timeout(&b, s),
