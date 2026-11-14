@@ -41,8 +41,7 @@ fn embed_win_resource() {
     // Application manifest: enables Common Controls 6.0 so buttons / combobox
     // / edit controls in our native prompt dialog get the modern Aero look
     // instead of the Windows-95 classic style.
-    let app_manifest =
-        format!("{manifest_dir}/assets/sccm-rc-viewer.manifest").replace('\\', "/");
+    let app_manifest = format!("{manifest_dir}/assets/sccm-rc-viewer.manifest").replace('\\', "/");
     println!("cargo:rerun-if-changed=assets/app.ico");
     println!("cargo:rerun-if-changed=assets/sccm-rc-viewer.manifest");
     println!("cargo:rerun-if-changed=build.rs");
@@ -58,7 +57,13 @@ fn embed_win_resource() {
     let quad: Vec<&str> = parts
         .iter()
         .take(4)
-        .map(|p| if p.chars().all(|c| c.is_ascii_digit()) && !p.is_empty() { *p } else { "0" })
+        .map(|p| {
+            if p.chars().all(|c| c.is_ascii_digit()) && !p.is_empty() {
+                *p
+            } else {
+                "0"
+            }
+        })
         .collect();
     let fileversion = quad.join(",");
 

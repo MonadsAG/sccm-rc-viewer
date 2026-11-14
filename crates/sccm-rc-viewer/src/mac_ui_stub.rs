@@ -1,19 +1,7 @@
 //! Non-macOS stand-in for `mac_ui`: there is no native chrome, so `install`
 //! returns `None` and the self-drawn toolbar (`toolbar.rs`) stays in use.
 
-use crate::NativeEvent;
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Chrome {
-    pub subtitle: String,
-    pub connected: bool,
-    pub has_session: bool,
-    pub view_only: bool,
-    pub curtain: bool,
-    pub recording: bool,
-    pub fullscreen: bool,
-    pub monitor: Option<String>,
-}
+use crate::{Chrome, NativeEvent};
 
 pub struct NativeUi;
 

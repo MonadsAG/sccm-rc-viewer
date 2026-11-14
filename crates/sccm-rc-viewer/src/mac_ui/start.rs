@@ -288,9 +288,20 @@ impl Ctl {
                 }
             }),
         );
+        let warned: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+        {
+            // A different name: drop the warning (and warn again if that
+            // one is taken too), as the drawn start screen does.
+            let (warned, warning) = (warned.clone(), warning.clone());
+            target.on_text(Box::new(move |_obj, ended| {
+                if !ended && warned.borrow_mut().take().is_some() {
+                    sheet::set_text(&warning, "");
+                }
+            }));
+            target.watch(&field);
+        }
         let me = Rc::downgrade(self);
         let f = field.clone();
-        let warned: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
         target.on_click(
             &ok,
             Box::new(move || {
@@ -399,6 +410,9 @@ pub fn build(mtm: MainThreadMarker, emit: Rc<dyn Fn(NativeEvent)>) -> StartSheet
     let title = sheet::title_label(mtm, &t!("prompt.native_title"), rect(m, H - 42.0, fw, 22.0));
     let search_field =
         NSSearchField::initWithFrame(NSSearchField::alloc(mtm), rect(m, H - 80.0, fw, 28.0));
+    // Typing filters through `controlTextDidChange:`; the action is only for
+    // the clear (x) button, which posts no text-change notification.
+    search_field.setSendsWholeSearchString(true);
     let search: Retained<NSTextField> = Retained::into_super(search_field);
     search.setPlaceholderString(Some(&NSString::from_str(&t!("prompt.placeholder"))));
 
@@ -555,6 +569,15 @@ pub fn build(mtm: MainThreadMarker, emit: Rc<dyn Fn(NativeEvent)>) -> StartSheet
         );
     }
     {
+        let me = weak(&ctl);
+        target.on_click(
+            &search,
+            Box::new(move || {
+                if let Some(c) = me.upgrade() {
+                    c.refresh(None);
+                }
+            }),
+        );
         let me = weak(&ctl);
         target.on_text(Box::new(move |_obj, ended| {
             if let (false, Some(c)) = (ended, me.upgrade()) {

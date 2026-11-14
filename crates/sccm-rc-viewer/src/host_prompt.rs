@@ -187,12 +187,18 @@ impl HostPromptOverlay {
 
     fn select(&mut self, sel: Option<usize>) {
         self.selected = sel;
+        let scroll = self.scroll;
         if let Some(i) = sel {
             if i < self.scroll {
                 self.scroll = i;
             } else if i >= self.scroll + MAX_ROWS_SHOWN {
                 self.scroll = i + 1 - MAX_ROWS_SHOWN;
             }
+        }
+        if self.scroll != scroll {
+            // The rows moved under the mouse: the hovered index is stale
+            // until the next mouse move.
+            self.hover = None;
         }
         self.bump_caret();
     }
@@ -316,7 +322,9 @@ impl HostPromptOverlay {
             self.input.clear();
             pos = self.position_of(host);
         }
+        // The list was rebuilt and scrolled to the top.
         self.scroll = 0;
+        self.hover = None;
         self.select(pos);
     }
 
