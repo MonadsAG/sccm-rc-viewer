@@ -38,6 +38,8 @@ pollster = "0.3"
 rust-i18n = "3"
 # Detect the Windows UI language at startup (reads the user locale).
 sys-locale = "0.3"
+serde_json = "1"
+base64 = "0.22"
 
 # Low-level keyboard hook (WH_KEYBOARD_LL) for Win-key passthrough in windowed
 # mode + MessageBox for the bug-report confirmation dialog. Workspace `windows`
@@ -60,4 +62,3 @@ arboard = { version = "3", default-features = false }
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSImage", "NSResponder", "NSView", "NSWindow", "NSToolbar", "NSToolbarItem", "NSMenu", "NSMenuItem", "NSEvent", "NSControl", "NSCell", "NSUserInterfaceItemIdentification", "NSUserInterfaceValidation", "NSGraphics", "NSButton", "NSTextField", "NSSecureTextField", "NSFont", "NSColor", "NSText", "NSTextContent", "NSButtonCell", "NSActionCell", "NSTextFieldCell", "block2", "objc2-core-foundation", "NSTableView", "NSTableColumn", "NSScrollView", "NSSearchField", "NSClipView", "NSTextView", "NSSearchFieldCell", "NSTableHeaderView"] }
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSData", "NSString", "NSArray", "NSObject", "NSGeometry", "NSNotification", "NSIndexSet", "NSAppleEventManager", "NSAppleEventDescriptor"] }
-security-framework = "3.7"

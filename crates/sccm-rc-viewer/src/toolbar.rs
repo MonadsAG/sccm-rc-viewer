@@ -83,6 +83,9 @@ pub enum ToolbarAction {
     BugReport,
     /// Toggle the in-app About overlay (version, license, repo, security model).
     About,
+    /// "Allow control by Claude": the control socket on/off. Native macOS
+    /// chrome only; not a button of the drawn toolbar.
+    ToggleAgentControl,
 }
 
 /// Dynamic status shown on the left of the bar.
@@ -150,6 +153,7 @@ fn button_label(action: ToolbarAction) -> String {
         ToolbarAction::SendKeys => t!("toolbar.send_keys"),
         ToolbarAction::BugReport => t!("toolbar.bug_report"),
         ToolbarAction::About => t!("toolbar.about"),
+        ToolbarAction::ToggleAgentControl => t!("control.allow"),
         // Dynamic label supplied via Status.monitor / buttons_with; never resolved
         // here, but the match must be exhaustive.
         ToolbarAction::MonitorCycle => t!("monitor.all"),

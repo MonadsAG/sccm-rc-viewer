@@ -6,6 +6,7 @@ members = [
     "crates/sccm-rc-diag",
     "crates/sccm-rc-viewer",
     "crates/sccm-rc-orders",
+    "crates/sccm-rc-mcp",
 ]
 
 # Redirect ironrdp-connector to our patched copy for ALL dependents

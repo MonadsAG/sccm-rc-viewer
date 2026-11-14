@@ -40,7 +40,7 @@ use crate::toolbar::ToolbarAction;
 use crate::{Chrome, NativeEvent};
 
 /// Every action the native chrome can trigger; the index is the item tag.
-const ACTIONS: [ToolbarAction; 12] = [
+const ACTIONS: [ToolbarAction; 13] = [
     ToolbarAction::CtrlAltDel,
     ToolbarAction::SendWin,
     ToolbarAction::SendKeys,
@@ -53,11 +53,12 @@ const ACTIONS: [ToolbarAction; 12] = [
     ToolbarAction::MonitorCycle,
     ToolbarAction::BugReport,
     ToolbarAction::About,
+    ToolbarAction::ToggleAgentControl,
 ];
 
 /// Toolbar order (left to right), after a flexible space; `None` = separator
 /// space. About and Bug report live in the menus only.
-const TOOLBAR_ITEMS: [Option<ToolbarAction>; 12] = [
+const TOOLBAR_ITEMS: [Option<ToolbarAction>; 13] = [
     Some(ToolbarAction::CtrlAltDel),
     Some(ToolbarAction::SendKeys),
     Some(ToolbarAction::SendWin),
@@ -68,6 +69,7 @@ const TOOLBAR_ITEMS: [Option<ToolbarAction>; 12] = [
     Some(ToolbarAction::ToggleCurtain),
     Some(ToolbarAction::ToggleRecord),
     Some(ToolbarAction::ToggleFullscreen),
+    Some(ToolbarAction::ToggleAgentControl),
     None,
     Some(ToolbarAction::Disconnect),
 ];
@@ -91,6 +93,7 @@ fn ident_of(a: ToolbarAction) -> &'static str {
         ToolbarAction::MonitorCycle => "rc.screen",
         ToolbarAction::BugReport => "rc.report",
         ToolbarAction::About => "rc.about",
+        ToolbarAction::ToggleAgentControl => "rc.claude-control",
     }
 }
 
@@ -113,6 +116,7 @@ fn label_of(a: ToolbarAction) -> String {
         ToolbarAction::BugReport => t!("toolbar.bug_report"),
         ToolbarAction::About => t!("toolbar.about"),
         ToolbarAction::MonitorCycle => t!("menu.next_screen"),
+        ToolbarAction::ToggleAgentControl => t!("control.allow"),
     }
     .to_string()
 }
@@ -136,6 +140,8 @@ fn symbol_of(a: ToolbarAction, on: bool) -> &'static str {
         (ToolbarAction::MonitorCycle, _) => "display.2",
         (ToolbarAction::BugReport, _) => "ladybug",
         (ToolbarAction::About, _) => "info.circle",
+        (ToolbarAction::ToggleAgentControl, false) => "cpu",
+        (ToolbarAction::ToggleAgentControl, true) => "cpu.fill",
     }
 }
 
@@ -153,6 +159,7 @@ impl Chrome {
             ToolbarAction::ToggleCurtain => self.curtain,
             ToolbarAction::ToggleRecord => self.recording,
             ToolbarAction::ToggleFullscreen => self.fullscreen,
+            ToolbarAction::ToggleAgentControl => self.agent_control,
             _ => false,
         }
     }
@@ -163,7 +170,7 @@ impl Chrome {
             // which a sheet blocks.
             ToolbarAction::About => !self.sheet,
             ToolbarAction::BugReport => true,
-            ToolbarAction::ToggleFullscreen => true,
+            ToolbarAction::ToggleFullscreen | ToolbarAction::ToggleAgentControl => true,
             ToolbarAction::Disconnect => self.has_session,
             ToolbarAction::MonitorCycle => self.connected && self.monitor.is_some(),
             _ => self.connected,
@@ -399,9 +406,12 @@ impl NativeUi {
         // SAFETY: NSObject's init.
         let toolbar_delegate: Retained<ToolbarDelegate> =
             unsafe { msg_send![super(delegate_obj), init] };
+        // The identifier keys the autosaved layout. Bumped to v2 when the
+        // "Allow control by Claude" toggle was added, so existing users get
+        // the new default layout once instead of a saved one without it.
         let toolbar = NSToolbar::initWithIdentifier(
             NSToolbar::alloc(mtm),
-            &NSString::from_str("sccm-rc.session"),
+            &NSString::from_str("sccm-rc.session.v2"),
         );
         toolbar.setDisplayMode(NSToolbarDisplayMode::IconOnly);
         toolbar.setAllowsUserCustomization(true);
@@ -704,6 +714,13 @@ fn install_menu(mtm: MainThreadMarker, target: &ActionTarget) -> MenuItems {
         &control,
         ToolbarAction::ToggleRecord,
         label_of(ToolbarAction::ToggleRecord),
+        "",
+    );
+    control.addItem(&NSMenuItem::separatorItem(mtm));
+    add_action(
+        &control,
+        ToolbarAction::ToggleAgentControl,
+        label_of(ToolbarAction::ToggleAgentControl),
         "",
     );
 

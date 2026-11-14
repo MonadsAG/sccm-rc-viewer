@@ -45,6 +45,7 @@ export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-15.0}"
 
 APP_NAME="SCCM RC"
 BIN="sccm-rc-viewer"
+MCP_BIN="sccm-rc-mcp"
 BUNDLE_ID="${MACOS_BUNDLE_ID:-io.github.conocidotech.sccm-rc-viewer}"
 PKGID="$(cargo pkgid -p sccm-rc-viewer)"
 VERSION="${PKGID##*[#@]}"
@@ -65,13 +66,17 @@ echo "==> $APP_NAME $VERSION, build $BUILD ($BUNDLE_ID)"
 if [ "$UNIVERSAL" = 1 ]; then
   TARGETS=(aarch64-apple-darwin x86_64-apple-darwin)
   for t in "${TARGETS[@]}"; do
-    cargo build --release -p sccm-rc-viewer --target "$t"
+    cargo build --release -p sccm-rc-viewer -p sccm-rc-mcp --target "$t"
   done
-  BIN_PATHS=()
-  for t in "${TARGETS[@]}"; do BIN_PATHS+=("target/$t/release/$BIN"); done
+  BIN_PATHS=(); MCP_PATHS=()
+  for t in "${TARGETS[@]}"; do
+    BIN_PATHS+=("target/$t/release/$BIN")
+    MCP_PATHS+=("target/$t/release/$MCP_BIN")
+  done
 else
-  cargo build --release -p sccm-rc-viewer
+  cargo build --release -p sccm-rc-viewer -p sccm-rc-mcp
   BIN_PATHS=("target/release/$BIN")
+  MCP_PATHS=("target/release/$MCP_BIN")
 fi
 
 # --- assemble the bundle -----------------------------------------------------
@@ -82,6 +87,12 @@ if [ "${#BIN_PATHS[@]}" -gt 1 ]; then
   lipo -create -output "$APP/Contents/MacOS/$BIN" "${BIN_PATHS[@]}"
 else
   cp "${BIN_PATHS[0]}" "$APP/Contents/MacOS/$BIN"
+fi
+# The MCP server (see README, "Letting Claude operate a till").
+if [ "${#MCP_PATHS[@]}" -gt 1 ]; then
+  lipo -create -output "$APP/Contents/MacOS/$MCP_BIN" "${MCP_PATHS[@]}"
+else
+  cp "${MCP_PATHS[0]}" "$APP/Contents/MacOS/$MCP_BIN"
 fi
 
 sed -e "s/@VERSION@/$VERSION/g" -e "s/@BUILD@/$BUILD/g" -e "s/@BUNDLE_ID@/$BUNDLE_ID/g" \
@@ -110,10 +121,14 @@ rm -rf "$(dirname "$ICONSET")"
 # --- sign --------------------------------------------------------------------
 if [ -n "${MACOS_SIGN_IDENTITY:-}" ]; then
   echo "==> signing with Developer ID (hardened runtime)"
+  # Nested binary first, explicitly (no --deep), then the bundle.
+  codesign --force --timestamp --options runtime \
+    --sign "$MACOS_SIGN_IDENTITY" "$APP/Contents/MacOS/$MCP_BIN"
   codesign --force --timestamp --options runtime \
     --sign "$MACOS_SIGN_IDENTITY" "$APP"
 else
   echo "==> ad-hoc signing (no MACOS_SIGN_IDENTITY set)"
+  codesign --force --sign - "$APP/Contents/MacOS/$MCP_BIN"
   codesign --force --sign - "$APP"
 fi
 codesign --verify --strict --verbose=2 "$APP"

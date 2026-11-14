@@ -303,6 +303,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "async-trait"
+version = "0.1.92"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "82f6aeea286b8eb4dd3431a1be1b59d290ace00f5bfd8e2a159bc2a05e2c1667"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.10",
+]
+
+[[package]]
 name = "atomic-polyfill"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3720,6 +3731,7 @@ version = "0.9.13"
 dependencies = [
  "anyhow",
  "arboard",
+ "base64",
  "bytes",
  "clap",
  "clipboard-win",
@@ -3733,6 +3745,9 @@ dependencies = [
  "ironrdp-svc",
  "sccm-rc-orders",
  "sccm-rc-protocol",
+ "security-framework",
+ "serde",
+ "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -3752,6 +3767,22 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "windows 0.61.3",
+]
+
+[[package]]
+name = "sccm-rc-mcp"
+version = "0.9.13"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64",
+ "clap",
+ "sccm-rc-core",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -3789,6 +3820,7 @@ dependencies = [
  "ab_glyph",
  "anyhow",
  "arboard",
+ "base64",
  "bytemuck",
  "clap",
  "clipboard-win",
@@ -3800,7 +3832,7 @@ dependencies = [
  "pollster",
  "rust-i18n",
  "sccm-rc-core",
- "security-framework",
+ "serde_json",
  "softbuffer",
  "sys-locale",
  "tokio",
@@ -4339,6 +4371,17 @@ name = "syn"
 version = "2.0.117"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e665b8803e7b1d2a727f4023456bbbbe74da67099c585258af0ad9c5013b9b99"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "unicode-ident",
+]
+
+[[package]]
+name = "syn"
+version = "3.0.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4ae9ccbea3a7b0b09443036490c8f34a8b1b760fd345e5c0dae0aac718faea79"
 dependencies = [
  "proc-macro2",
  "quote",
