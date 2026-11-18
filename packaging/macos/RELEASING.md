@@ -85,7 +85,7 @@ notarization until a new key is entered.
 The viewer's auto-update reads `ghcr.io/monadsag/sccm-rc-viewer:latest`.
 Publishing a draft release starts `.github/workflows/publish-ghcr.yml`, which
 pushes the release's `.dmg` there as an OCI artifact (tag = release label,
-e.g. `0.9.13-m1`) and moves `latest` to it if its build number is higher.
+e.g. `0.9.13-m1`) and moves `latest` to it if its label is newer.
 Users see the update only after this step, so checking the `.dmg` before
 publishing the draft is the gate.
 
@@ -103,6 +103,8 @@ publishing the draft is the gate.
 - **Withdraw a release:** point `latest` back at the previous label, e.g.
   `oras tag ghcr.io/monadsag/sccm-rc-viewer:0.9.13-m1 latest`
   (after `oras login ghcr.io`). Viewers that already installed it keep it.
+- **`latest` follows the release label**, not the build number: publishing
+  an older release (or a rebuild of one) never moves it back.
 - **Trust:** the viewer installs only an app signed by team `97H6W5B7MN`
   with its own bundle identifier, accepted by Gatekeeper (notarized), whose
   `.dmg` matches the manifest's SHA-256. A new Developer ID certificate of

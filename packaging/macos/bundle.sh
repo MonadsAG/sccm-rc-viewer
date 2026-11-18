@@ -161,7 +161,7 @@ if [ "$DMG" = 1 ]; then
   fi
   # Facts the release feed needs (publish-ghcr.yml): label, build, checksum.
   DMG_SHA="$(shasum -a 256 "$DMG_PATH" | cut -d' ' -f1)"
-  printf '{"label":"%s","build":%s,"file":"%s","sha256":"%s"}\n' \
+  printf '{"label":"%s","build":"%s","file":"%s","sha256":"%s"}\n' \
     "$DMG_LABEL" "$BUILD" "$(basename "$DMG_PATH")" "$DMG_SHA" > "$DIST/release.json"
   echo "==> $DMG_PATH"
 fi

@@ -478,6 +478,9 @@ struct Updater {
     /// Build whose offer was already shown unasked in this run.
     offered: Option<u64>,
     checking: bool,
+    /// A manual check was asked for while another check ran: answer the
+    /// running one as manual.
+    manual_waiting: bool,
     installing: bool,
 }
 
@@ -1900,6 +1903,7 @@ impl App {
             offer: None,
             offered: None,
             checking: false,
+            manual_waiting: false,
             installing: false,
         });
         let proxy = self.proxy.clone();
@@ -1915,12 +1919,17 @@ impl App {
         let Some(u) = self.updater.as_mut() else {
             return;
         };
-        if u.checking || u.installing {
+        if u.installing {
+            return;
+        }
+        if u.checking {
+            // The running check answers this click too.
+            u.manual_waiting |= manual;
             return;
         }
         u.checking = true;
         let proxy = self.proxy.clone();
-        update::spawn_check(u.installed.clone(), manual, move |ev| {
+        update::spawn_check(manual, move |ev| {
             let _ = proxy.send_event(UserEvent::Update(ev));
         });
     }
@@ -2055,6 +2064,13 @@ impl App {
                     return;
                 };
                 u.checking = false;
+                let manual = manual || std::mem::take(&mut u.manual_waiting);
+                if u.installing {
+                    // Keep the busy update sheet; the install answers.
+                    return;
+                }
+                let skipped = if manual { None } else { u.state.skipped_build };
+                let result = result.map(|latest| update::offer(latest, &u.installed, skipped));
                 match result {
                     Ok(Some(r)) => {
                         info!(label = %r.label, build = r.build, "update available");

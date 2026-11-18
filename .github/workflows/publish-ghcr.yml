@@ -4,7 +4,7 @@ name: Publish to ghcr.io (update feed)
 # the GitHub Container Registry, where the viewer's auto-update looks for it:
 #
 #   ghcr.io/<owner>/<repo>:<label>   e.g. :0.9.13-m1
-#   ghcr.io/<owner>/<repo>:latest    moved only to a higher build
+#   ghcr.io/<owner>/<repo>:latest    moved only to a newer label (or its rebuild)
 #
 # The artifact is an OCI manifest with one layer (the .dmg) and the
 # annotations the viewer reads (src/update/registry.rs): release label,
@@ -99,15 +99,17 @@ jobs:
             --annotation "org.opencontainers.image.created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             "$FILE:application/x-apple-diskimage"
 
-          # Move `latest` only forward: publishing an older release later
-          # must not offer a downgrade.
+          # Move `latest` only forward, by release label (version order:
+          # 0.9.13 < 0.9.13-m1 < 0.9.13-m2 < 0.9.14), or to a rebuild of the
+          # same label. Not by build number: rebuilding an old tag gives it
+          # the newest run number, and viewers would install it as an update.
           CURRENT="$(oras manifest fetch "$IMAGE:latest" 2>/dev/null \
-            | jq -r '.annotations["ch.monads.sccm-rc.build"] // "0"' || echo 0)"
-          case "$CURRENT" in ''|*[!0-9]*) CURRENT=0 ;; esac
-          if [ "$BUILD" -gt "$CURRENT" ]; then
+            | jq -r '.annotations["org.opencontainers.image.version"] // ""' || true)"
+          NEWEST="$(printf '%s\n%s\n' "$CURRENT" "$LABEL" | sed '/^$/d' | sort -V | tail -n1)"
+          if [ -z "$CURRENT" ] || [ "$NEWEST" = "$LABEL" ]; then
             oras tag "$IMAGE:$LABEL" latest
             echo "latest → $LABEL (build $BUILD)" >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "latest stays at build $CURRENT (this is build $BUILD)" >> "$GITHUB_STEP_SUMMARY"
+            echo "latest stays at $CURRENT ($LABEL is older)" >> "$GITHUB_STEP_SUMMARY"
           fi
           oras logout ghcr.io

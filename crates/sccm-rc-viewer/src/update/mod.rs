@@ -38,11 +38,11 @@ pub struct Installed {
 /// Results of background work, delivered to the App.
 #[derive(Debug, Clone)]
 pub enum UpdateEvent {
-    /// A check finished. `manual`: started from the menu (answer even when
-    /// there is nothing new).
+    /// A check finished with what the feed offers. `manual`: started from
+    /// the menu (answer even when there is nothing new).
     Checked {
         manual: bool,
-        result: Result<Option<Release>, String>,
+        result: Result<Release, String>,
     },
     /// The release is staged; quit and run the script.
     Staged(PathBuf),
@@ -60,10 +60,12 @@ pub fn installed() -> Option<Installed> {
     }
     let exe = std::env::current_exe().ok()?.canonicalize().ok()?;
     let bundle = install::bundle_of(&exe)?;
-    let build = info_plist_value(&bundle, "CFBundleVersion")?.parse().ok()?;
-    let bundle_id = info_plist_value(&bundle, "CFBundleIdentifier")?;
-    let label = info_plist_value(&bundle, "SCCMRCReleaseLabel")
-        .or_else(|| info_plist_value(&bundle, "CFBundleShortVersionString"))
+    // One `plutil` run on the main thread at start, not one per key.
+    let plist = info_plist(&bundle)?;
+    let build = plist_string(&plist, "CFBundleVersion")?.parse().ok()?;
+    let bundle_id = plist_string(&plist, "CFBundleIdentifier")?;
+    let label = plist_string(&plist, "SCCMRCReleaseLabel")
+        .or_else(|| plist_string(&plist, "CFBundleShortVersionString"))
         .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
     Some(Installed {
         bundle,
@@ -73,19 +75,24 @@ pub fn installed() -> Option<Installed> {
     })
 }
 
-/// A string from `<app>/Contents/Info.plist`.
-pub fn info_plist_value(app: &Path, key: &str) -> Option<String> {
+/// `<app>/Contents/Info.plist` as JSON (one `plutil` run).
+pub fn info_plist(app: &Path) -> Option<serde_json::Value> {
     let plist = app.join("Contents").join("Info.plist");
     let out = std::process::Command::new("/usr/bin/plutil")
-        .args(["-extract", key, "raw", "-o", "-"])
+        .args(["-convert", "json", "-o", "-"])
         .arg(&plist)
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .output()
         .ok()?;
     out.status.success().then_some(())?;
-    let v = String::from_utf8(out.stdout).ok()?.trim().to_string();
-    (!v.is_empty() && !v.starts_with('@')).then_some(v)
+    serde_json::from_slice(&out.stdout).ok()
+}
+
+/// A string from an [`info_plist`]; empty or unfilled (`@KEY@`) is none.
+pub fn plist_string(plist: &serde_json::Value, key: &str) -> Option<String> {
+    let v = plist.get(key)?.as_str()?.trim();
+    (!v.is_empty() && !v.starts_with('@')).then(|| v.to_string())
 }
 
 fn curl_get(url: &str, headers: &[String]) -> Result<String> {
@@ -124,27 +131,19 @@ pub fn fetch_latest() -> Result<Release> {
     registry::parse_manifest(&body)
 }
 
-/// The release to offer, if any. `manual` checks ignore a skipped build.
-pub fn check(installed: &Installed, manual: bool) -> Result<Option<Release>> {
-    let latest = fetch_latest()?;
-    let skipped = if manual {
-        None
-    } else {
-        State::load().skipped_build
-    };
-    Ok(registry::is_offer(&latest, installed.build, skipped).then_some(latest))
+/// The release to offer to `installed`, if any. `skipped` is the build the
+/// user chose to skip (pass `None` for a manual check, which ignores it).
+pub fn offer(latest: Release, installed: &Installed, skipped: Option<u64>) -> Option<Release> {
+    registry::is_offer(&latest, installed.build, skipped).then_some(latest)
 }
 
-/// Check in the background; the answer arrives through `send`.
-pub fn spawn_check(
-    installed: Installed,
-    manual: bool,
-    send: impl Fn(UpdateEvent) + Send + 'static,
-) {
+/// Read the feed in the background; the answer arrives through `send`.
+/// Whether to offer it is decided by the App ([`offer`]), from its own state.
+pub fn spawn_check(manual: bool, send: impl Fn(UpdateEvent) + Send + 'static) {
     std::thread::Builder::new()
         .name("update-check".into())
         .spawn(move || {
-            let result = check(&installed, manual).map_err(|e| format!("{e:#}"));
+            let result = fetch_latest().map_err(|e| format!("{e:#}"));
             if let Err(e) = &result {
                 tracing::warn!(error = %e, "update check failed");
             }
@@ -203,13 +202,27 @@ pub fn finish(script: &Path) -> Result<()> {
     }
 }
 
-/// Wake the App every [`INTERVAL`] for the next automatic check.
+/// Wake the App every [`INTERVAL`] for the next automatic check. Counted on
+/// the wall clock in short steps: `sleep` alone stands still while the Mac
+/// sleeps, so a laptop closed overnight would rarely reach the interval.
 pub fn spawn_timer(tick: impl Fn() + Send + 'static) {
     std::thread::Builder::new()
         .name("update-timer".into())
-        .spawn(move || loop {
-            std::thread::sleep(INTERVAL);
-            tick();
+        .spawn(move || {
+            let mut last = std::time::SystemTime::now();
+            loop {
+                std::thread::sleep(Duration::from_secs(60));
+                let now = std::time::SystemTime::now();
+                match now.duration_since(last) {
+                    Ok(d) if d >= INTERVAL => {
+                        last = now;
+                        tick();
+                    }
+                    Ok(_) => {}
+                    // The clock was set backwards: restart the interval.
+                    Err(_) => last = now,
+                }
+            }
         })
         .ok();
 }

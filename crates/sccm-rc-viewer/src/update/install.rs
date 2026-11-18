@@ -61,7 +61,11 @@ NEW={new}
 i=0
 while kill -0 {pid} 2>/dev/null; do
   i=$((i + 1))
-  [ "$i" -gt 600 ] && exit 1
+  if [ "$i" -gt 600 ]; then
+    rm -rf "$NEW"
+    rm -f "$0"
+    exit 1
+  fi
   sleep 0.2
 done
 rm -rf "$APP.old"
@@ -113,7 +117,7 @@ mod mac {
     use tracing::info;
 
     use super::super::registry::{self, Release};
-    use super::super::{info_plist_value, Installed};
+    use super::super::{info_plist, plist_string, Installed};
     use super::{check_identity, swap_script, writable, Prepared};
 
     fn run(cmd: &mut Command) -> Result<std::process::Output> {
@@ -157,6 +161,8 @@ mod mac {
 
     impl Mount {
         fn attach(image: &Path, at: &Path) -> Result<Self> {
+            // A mount left by an attempt that crashed would block this one.
+            detach(at);
             let _ = std::fs::create_dir_all(at);
             run(Command::new("/usr/bin/hdiutil")
                 .args(["attach", "-nobrowse", "-readonly", "-noautoopen", "-quiet"])
@@ -175,14 +181,23 @@ mod mac {
         }
     }
 
-    impl Drop for Mount {
-        fn drop(&mut self) {
+    /// Best effort: detach whatever is mounted at `at` and remove the folder.
+    fn detach(at: &Path) {
+        if at.exists() {
             let _ = Command::new("/usr/bin/hdiutil")
                 .args(["detach", "-quiet", "-force"])
-                .arg(&self.0)
+                .arg(at)
                 .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
                 .status();
-            let _ = std::fs::remove_dir(&self.0);
+            let _ = std::fs::remove_dir(at);
+        }
+    }
+
+    impl Drop for Mount {
+        fn drop(&mut self) {
+            detach(&self.0);
         }
     }
 
@@ -198,7 +213,8 @@ mod mac {
             .args(["--assess", "--type", "execute"])
             .arg(app))
         .context("Gatekeeper rejects the new version (not notarized?)")?;
-        let build = info_plist_value(app, "CFBundleVersion")
+        let build = info_plist(app)
+            .and_then(|p| plist_string(&p, "CFBundleVersion"))
             .and_then(|b| b.parse::<u64>().ok())
             .ok_or_else(|| anyhow!("the new version has no build number"))?;
         if build != r.build {
@@ -216,8 +232,17 @@ mod mac {
         let image = dir.join(format!("SCCM-RC-{}.dmg", r.label));
         info!(label = %r.label, build = r.build, "downloading update");
         download(&repo, r, &token, &image)?;
+        let staged = stage(installed, r, &dir, &image);
+        if !matches!(staged, Ok(Prepared::OpenImage(_))) {
+            // Staged, or refused: the image is of no further use.
+            let _ = std::fs::remove_file(&image);
+        }
+        staged
+    }
 
-        let mount = Mount::attach(&image, &dir.join("mnt"))?;
+    /// Mount, verify and copy the downloaded `image`.
+    fn stage(installed: &Installed, r: &Release, dir: &Path, image: &Path) -> Result<Prepared> {
+        let mount = Mount::attach(image, &dir.join("mnt"))?;
         let new_app = mount.app()?;
         verify(&new_app, installed, r)?;
         info!("update verified (signature, notarization, identity, build)");
@@ -228,16 +253,18 @@ mod mac {
             .ok_or_else(|| anyhow!("app has no parent folder"))?;
         if !writable(parent) {
             drop(mount);
-            return Ok(Prepared::OpenImage(image));
+            return Ok(Prepared::OpenImage(image.to_path_buf()));
         }
         let mut staged = installed.bundle.clone().into_os_string();
         staged.push(".new");
         let staged = PathBuf::from(staged);
         let _ = std::fs::remove_dir_all(&staged);
-        run(Command::new("/usr/bin/ditto").arg(&new_app).arg(&staged))
-            .context("could not copy the new version")?;
+        if let Err(e) = run(Command::new("/usr/bin/ditto").arg(&new_app).arg(&staged)) {
+            // No half-copied bundle left next to the app.
+            let _ = std::fs::remove_dir_all(&staged);
+            return Err(e.context("could not copy the new version"));
+        }
         drop(mount);
-        let _ = std::fs::remove_file(&image);
 
         let script = dir.join("finish-update.sh");
         std::fs::write(
