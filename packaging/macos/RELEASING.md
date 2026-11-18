@@ -79,3 +79,34 @@ Developer → Certificates). Before it runs out, create a new one and replace
 after the certificate expires. The App Store Connect API key for
 notarization does not expire; revoking it in App Store Connect stops
 notarization until a new key is entered.
+
+## Update feed (ghcr.io)
+
+The viewer's auto-update reads `ghcr.io/monadsag/sccm-rc-viewer:latest`.
+Publishing a draft release starts `.github/workflows/publish-ghcr.yml`, which
+pushes the release's `.dmg` there as an OCI artifact (tag = release label,
+e.g. `0.9.13-m1`) and moves `latest` to it if its label is newer.
+Users see the update only after this step, so checking the `.dmg` before
+publishing the draft is the gate.
+
+- **Once, after the first push:** GitHub → the organization's *Packages* →
+  `sccm-rc-viewer` → *Package settings* → *Change visibility* → **Public**.
+  The viewer reads the feed anonymously; while the package is private every
+  check fails.
+- **Build numbers decide.** The viewer offers a build when its
+  `CFBundleVersion` (the GitHub run number) is higher than its own. Releases
+  carry `release.json` (label, build, SHA-256), written by `bundle.sh`;
+  releases built before it existed must be rebuilt (Run workflow on the tag)
+  before they can be published to the feed.
+- **Publish an existing release again:** Actions → *Publish to ghcr.io* →
+  Run workflow, with the tag.
+- **Withdraw a release:** point `latest` back at the previous label, e.g.
+  `oras tag ghcr.io/monadsag/sccm-rc-viewer:0.9.13-m1 latest`
+  (after `oras login ghcr.io`). Viewers that already installed it keep it.
+- **`latest` follows the release label**, not the build number: publishing
+  an older release (or a rebuild of one) never moves it back.
+- **Trust:** the viewer installs only an app signed by team `97H6W5B7MN`
+  with its own bundle identifier, accepted by Gatekeeper (notarized), whose
+  `.dmg` matches the manifest's SHA-256. A new Developer ID certificate of
+  the same team needs no change; a different team needs a viewer update
+  first (`TEAM_ID` in `src/update/install.rs`).

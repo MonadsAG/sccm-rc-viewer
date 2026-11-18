@@ -23,6 +23,7 @@ use std::rc::Rc;
 mod logon;
 mod sheet;
 mod start;
+mod update;
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, Sel};
@@ -37,7 +38,7 @@ use rust_i18n::t;
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 use crate::toolbar::ToolbarAction;
-use crate::{Chrome, NativeEvent};
+use crate::{Chrome, NativeEvent, UpdateCmd, UpdateSheet};
 
 /// Every action the native chrome can trigger; the index is the item tag.
 const ACTIONS: [ToolbarAction; 13] = [
@@ -203,6 +204,18 @@ define_class!(
             }
         }
 
+        /// App menu › Check for Updates…
+        #[unsafe(method(checkForUpdates:))]
+        fn check_for_updates(&self, _sender: Option<&AnyObject>) {
+            (self.ivars().on_event)(NativeEvent::Update(UpdateCmd::Check));
+        }
+
+        /// App menu › Check Automatically (a checkmark item).
+        #[unsafe(method(toggleAutoUpdate:))]
+        fn toggle_auto_update(&self, _sender: Option<&AnyObject>) {
+            (self.ivars().on_event)(NativeEvent::Update(UpdateCmd::ToggleAuto));
+        }
+
         /// Quit from the app menu (Cmd+Q).
         #[unsafe(method(performQuit:))]
         fn perform_quit(&self, _sender: Option<&AnyObject>) {
@@ -366,6 +379,8 @@ pub struct NativeUi {
     emit: Rc<dyn Fn(NativeEvent)>,
     /// The open sheet.
     sheet: RefCell<Option<OpenSheet>>,
+    /// App menu › Check Automatically (checkmark).
+    auto_update_item: Retained<NSMenuItem>,
 }
 
 /// An open sheet: its window, plus whatever must live as long as it (the
@@ -373,7 +388,14 @@ pub struct NativeUi {
 struct OpenSheet {
     window: Retained<NSWindow>,
     _target: Retained<sheet::SheetTarget>,
-    start: Option<Rc<start::Ctl>>,
+    kind: SheetKind,
+}
+
+/// Which sheet is open, with its controller where it has one.
+enum SheetKind {
+    Logon,
+    Start(Rc<start::Ctl>),
+    Update(Rc<update::Ctl>),
 }
 
 impl NativeUi {
@@ -397,7 +419,7 @@ impl NativeUi {
         let emit: Rc<dyn Fn(NativeEvent)> = Rc::from(on_event);
         let target = ActionTarget::new(mtm, emit.clone());
         install_quit_handler(&target);
-        let (menu_items, edit_items) = install_menu(mtm, &target);
+        let (menu_items, edit_items, auto_update_item) = install_menu(mtm, &target);
 
         let delegate_obj = ToolbarDelegate::alloc(mtm).set_ivars(ToolbarIvars {
             target: target.clone(),
@@ -432,6 +454,7 @@ impl NativeUi {
             last: RefCell::new(None),
             emit,
             sheet: RefCell::new(None),
+            auto_update_item,
         })
     }
 
@@ -455,7 +478,7 @@ impl NativeUi {
         *self.sheet.borrow_mut() = Some(OpenSheet {
             window: s.window,
             _target: s.target,
-            start: None,
+            kind: SheetKind::Logon,
         });
         self.edit_shortcuts(true);
     }
@@ -473,7 +496,7 @@ impl NativeUi {
         *self.sheet.borrow_mut() = Some(OpenSheet {
             window: s.window,
             _target: s.target,
-            start: Some(s.ctl),
+            kind: SheetKind::Start(s.ctl),
         });
         self.edit_shortcuts(true);
     }
@@ -483,13 +506,64 @@ impl NativeUi {
         // find the RefCell still borrowed.
         let open = self.sheet.borrow_mut().take();
         if let Some(open) = open {
-            if let Some(ctl) = &open.start {
+            if let SheetKind::Start(ctl) = &open.kind {
                 ctl.close_subs();
             }
             self.window.endSheet(&open.window);
             open.window.orderOut(None);
         }
         self.edit_shortcuts(false);
+    }
+
+    /// Show the update sheet (replacing any open sheet). Clicks arrive as
+    /// `NativeEvent::Update`; the App closes it with [`close_sheet`](Self::close_sheet).
+    pub fn show_update(&self, what: &UpdateSheet) {
+        self.close_sheet();
+        let Some(mtm) = MainThreadMarker::new() else {
+            return;
+        };
+        let s = update::build(mtm, what, self.emit.clone());
+        self.window.beginSheet_completionHandler(&s.window, None);
+        *self.sheet.borrow_mut() = Some(OpenSheet {
+            window: s.window,
+            _target: s.target,
+            kind: SheetKind::Update(s.ctl),
+        });
+    }
+
+    fn update_ctl(&self) -> Option<Rc<update::Ctl>> {
+        match self.sheet.borrow().as_ref().map(|s| &s.kind) {
+            Some(SheetKind::Update(ctl)) => Some(ctl.clone()),
+            _ => None,
+        }
+    }
+
+    /// The update sheet is the open sheet.
+    pub fn update_open(&self) -> bool {
+        self.update_ctl().is_some()
+    }
+
+    /// Update sheet: download running, buttons off.
+    pub fn update_busy(&self, msg: &str) {
+        if let Some(ctl) = self.update_ctl() {
+            ctl.busy(msg);
+        }
+    }
+
+    /// Update sheet: download or checks failed, buttons back on.
+    pub fn update_failed(&self, msg: &str) {
+        if let Some(ctl) = self.update_ctl() {
+            ctl.failed(msg);
+        }
+    }
+
+    /// Checkmark of App menu › Check Automatically.
+    pub fn set_auto_update(&self, on: bool) {
+        self.auto_update_item.setState(if on {
+            NSControlStateValueOn
+        } else {
+            NSControlStateValueOff
+        });
     }
 
     /// Edit-menu shortcuts on (a sheet's text fields need them) or off (the
@@ -509,7 +583,7 @@ impl NativeUi {
         self.sheet
             .borrow()
             .as_ref()
-            .is_some_and(|s| s.start.is_some())
+            .is_some_and(|s| matches!(s.kind, SheetKind::Start(_)))
     }
 
     /// The logon sheet is the open sheet.
@@ -517,7 +591,7 @@ impl NativeUi {
         self.sheet
             .borrow()
             .as_ref()
-            .is_some_and(|s| s.start.is_none())
+            .is_some_and(|s| matches!(s.kind, SheetKind::Logon))
     }
 
     /// Push the current state into subtitle, toolbar and menus.
@@ -594,6 +668,7 @@ const EDIT_ITEMS: [(&str, &str, &str); 6] = [
 type MenuItems = (
     Vec<(ToolbarAction, Retained<NSMenuItem>)>,
     Vec<(Retained<NSMenuItem>, &'static str)>,
+    Retained<NSMenuItem>,
 );
 
 /// Build and install the main menu; returns the action items for `update`
@@ -621,6 +696,24 @@ fn install_menu(mtm: MainThreadMarker, target: &ActionTarget) -> MenuItems {
         Some(sel!(orderFrontStandardAboutPanel:)),
         "",
     ));
+    let check = menu_item(
+        mtm,
+        &t!("update.menu_check"),
+        Some(sel!(checkForUpdates:)),
+        "",
+    );
+    // SAFETY: the target outlives the menu (NativeUi keeps both).
+    unsafe { check.setTarget(Some(target)) };
+    app_menu.addItem(&check);
+    let auto_update = menu_item(
+        mtm,
+        &t!("update.menu_auto"),
+        Some(sel!(toggleAutoUpdate:)),
+        "",
+    );
+    // SAFETY: as above.
+    unsafe { auto_update.setTarget(Some(target)) };
+    app_menu.addItem(&auto_update);
     app_menu.addItem(&NSMenuItem::separatorItem(mtm));
     app_menu.addItem(&menu_item(mtm, &t!("menu.hide"), Some(sel!(hide:)), "h"));
     let others = menu_item(
@@ -756,7 +849,7 @@ fn install_menu(mtm: MainThreadMarker, target: &ActionTarget) -> MenuItems {
     app.setHelpMenu(Some(&help));
 
     app.setMainMenu(Some(&bar));
-    (actions, edit_items)
+    (actions, edit_items, auto_update)
 }
 
 #[cfg(test)]

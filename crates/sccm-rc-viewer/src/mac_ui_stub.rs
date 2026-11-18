@@ -1,7 +1,7 @@
 //! Non-macOS stand-in for `mac_ui`: there is no native chrome, so `install`
 //! returns `None` and the self-drawn toolbar (`toolbar.rs`) stays in use.
 
-use crate::{Chrome, NativeEvent};
+use crate::{Chrome, NativeEvent, UpdateSheet};
 
 pub struct NativeUi;
 
@@ -40,4 +40,16 @@ impl NativeUi {
     pub fn logon_open(&self) -> bool {
         false
     }
+
+    pub fn show_update(&self, _what: &UpdateSheet) {}
+
+    pub fn update_open(&self) -> bool {
+        false
+    }
+
+    pub fn update_busy(&self, _msg: &str) {}
+
+    pub fn update_failed(&self, _msg: &str) {}
+
+    pub fn set_auto_update(&self, _on: bool) {}
 }

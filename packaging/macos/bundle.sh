@@ -95,7 +95,8 @@ else
   cp "${MCP_PATHS[0]}" "$APP/Contents/MacOS/$MCP_BIN"
 fi
 
-sed -e "s/@VERSION@/$VERSION/g" -e "s/@BUILD@/$BUILD/g" -e "s/@BUNDLE_ID@/$BUNDLE_ID/g" \
+sed -e "s/@VERSION@/$VERSION/g" -e "s/@BUILD@/$BUILD/g" -e "s/@LABEL@/$DMG_LABEL/g" \
+  -e "s/@BUNDLE_ID@/$BUNDLE_ID/g" \
   packaging/macos/Info.plist > "$APP/Contents/Info.plist"
 plutil -lint "$APP/Contents/Info.plist" >/dev/null
 printf 'APPL????' > "$APP/Contents/PkgInfo"
@@ -158,6 +159,10 @@ if [ "$DMG" = 1 ]; then
       echo "==> not notarized (MACOS_NOTARY_* not set)"
     fi
   fi
+  # Facts the release feed needs (publish-ghcr.yml): label, build, checksum.
+  DMG_SHA="$(shasum -a 256 "$DMG_PATH" | cut -d' ' -f1)"
+  printf '{"label":"%s","build":"%s","file":"%s","sha256":"%s"}\n' \
+    "$DMG_LABEL" "$BUILD" "$(basename "$DMG_PATH")" "$DMG_SHA" > "$DIST/release.json"
   echo "==> $DMG_PATH"
 fi
 

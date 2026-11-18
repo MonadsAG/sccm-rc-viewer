@@ -117,7 +117,9 @@ jobs:
       - uses: actions/upload-artifact@v6
         with:
           name: sccm-rc-macos
-          path: dist/*.dmg
+          path: |
+            dist/*.dmg
+            dist/release.json
           if-no-files-found: error
 
       - name: Attach to the GitHub release
@@ -130,7 +132,7 @@ jobs:
           gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 \
             || gh release create "$GITHUB_REF_NAME" --draft $PRE \
                  --title "$GITHUB_REF_NAME" --generate-notes --verify-tag
-          gh release upload "$GITHUB_REF_NAME" dist/*.dmg --clobber
+          gh release upload "$GITHUB_REF_NAME" dist/*.dmg dist/release.json --clobber
 
       - name: Remove keychain and keys
         if: always()
