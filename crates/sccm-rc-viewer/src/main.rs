@@ -46,6 +46,7 @@ mod servers;
 mod text;
 mod toolbar;
 mod type_text;
+mod update;
 #[cfg(windows)]
 mod winhook;
 mod wol;
@@ -411,6 +412,10 @@ enum UserEvent {
     /// The control ticker (run the next due piece of a Claude command), or
     /// the socket: a client left while its command runs.
     ControlTick,
+    /// Result of an update check or install (background thread).
+    Update(update::UpdateEvent),
+    /// Time for the next automatic update check.
+    UpdateTick,
 }
 
 /// What the native macOS UI (`mac_ui`) asks the App to do. Built on the main
@@ -427,6 +432,53 @@ pub(crate) enum NativeEvent {
     /// Quit from the app menu, the Dock or the system (logout): close any
     /// sheet, release the session, exit.
     Quit,
+    /// App menu update items and the update sheet's buttons.
+    Update(UpdateCmd),
+}
+
+/// Clicks in the update UI.
+#[derive(Debug, Clone)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // sent by mac_ui only
+pub(crate) enum UpdateCmd {
+    /// App menu › Check for Updates…
+    Check,
+    /// App menu › Check Automatically.
+    ToggleAuto,
+    Install,
+    Later,
+    Skip,
+    /// Open the release notes in the browser.
+    Notes,
+    /// OK on an information sheet.
+    Dismiss,
+}
+
+/// What the update sheet shows.
+#[derive(Debug, Clone)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // read by mac_ui only
+pub(crate) enum UpdateSheet {
+    /// A newer build: Install / Later / Skip.
+    Offer {
+        label: String,
+        installed: String,
+        /// A session is open; installing ends it.
+        session: bool,
+        notes: Option<String>,
+    },
+    /// The answer to a manual check (OK only).
+    Info { title: String, body: String },
+}
+
+/// Auto-update state (macOS app bundle with the native chrome only).
+struct Updater {
+    installed: update::Installed,
+    state: update::State,
+    /// The newer build found by the last check.
+    offer: Option<update::Release>,
+    /// Build whose offer was already shown unasked in this run.
+    offered: Option<u64>,
+    checking: bool,
+    installing: bool,
 }
 
 /// Session state the App pushes into the native chrome (`mac_ui`); the
@@ -888,6 +940,7 @@ fn main() -> anyhow::Result<()> {
         last_paint: std::time::Instant::now(),
         redraw_pending: false,
         last_heartbeat: std::time::Instant::now(),
+        updater: None,
         host_prompt: if cli_target.is_none() && !cli.demo {
             Some(host_prompt::HostPromptOverlay::new())
         } else {
@@ -1462,6 +1515,9 @@ struct App {
     /// the panic/Watson timestamp tells you whether the UI thread was the one
     /// stuck. Bumped from `about_to_wait` every ~5 s.
     last_heartbeat: std::time::Instant,
+    /// Auto-update; `None` = off (no app bundle, no native chrome, or
+    /// `SCCM_RC_UPDATE=0`).
+    updater: Option<Updater>,
     /// In-window host-picker overlay. Some = the overlay is visible and
     /// consumes keyboard input; no session is running yet. Set at startup
     /// when no CLI target was given, and by Disconnect to pick another host.
@@ -1785,6 +1841,8 @@ impl App {
         if let Some(native) = self.native.as_ref() {
             self.host_prompt = None;
             native.show_start();
+            // A pending update is offered on the start screen, once.
+            self.offer_update(false);
         } else {
             self.host_prompt = Some(host_prompt::HostPromptOverlay::new());
         }
@@ -1821,6 +1879,245 @@ impl App {
         self.window
             .as_ref()
             .map_or(self.fullscreen, |w| w.fullscreen().is_some())
+    }
+
+    /// Set up auto-update once the native chrome exists: menu checkmark,
+    /// the periodic timer and the first check.
+    fn init_updater(&mut self) {
+        let Some(installed) = update::installed() else {
+            info!("auto-update off (no app bundle, or SCCM_RC_UPDATE=0)");
+            return;
+        };
+        let state = update::State::load();
+        if let Some(native) = self.native.as_ref() {
+            native.set_auto_update(state.auto_check);
+        }
+        info!(build = installed.build, label = %installed.label, auto = state.auto_check, "auto-update on");
+        let auto = state.auto_check;
+        self.updater = Some(Updater {
+            installed,
+            state,
+            offer: None,
+            offered: None,
+            checking: false,
+            installing: false,
+        });
+        let proxy = self.proxy.clone();
+        update::spawn_timer(move || {
+            let _ = proxy.send_event(UserEvent::UpdateTick);
+        });
+        if auto {
+            self.start_update_check(false);
+        }
+    }
+
+    fn start_update_check(&mut self, manual: bool) {
+        let Some(u) = self.updater.as_mut() else {
+            return;
+        };
+        if u.checking || u.installing {
+            return;
+        }
+        u.checking = true;
+        let proxy = self.proxy.clone();
+        update::spawn_check(u.installed.clone(), manual, move |ev| {
+            let _ = proxy.send_event(UserEvent::Update(ev));
+        });
+    }
+
+    /// A session is set up or running.
+    fn session_open(&self) -> bool {
+        self.input_tx.is_some() && self.running.load(Ordering::Relaxed)
+    }
+
+    /// Show the pending offer. Unasked (`asked` false) only where it
+    /// interrupts nothing (no session, start sheet or no sheet) and once per
+    /// build; asked, anywhere but over the logon sheet.
+    fn offer_update(&mut self, asked: bool) {
+        let session = self.session_open();
+        let (Some(native), Some(u)) = (self.native.as_ref(), self.updater.as_mut()) else {
+            return;
+        };
+        let Some(r) = u.offer.clone() else {
+            return;
+        };
+        if native.logon_open() || native.update_open() {
+            return;
+        }
+        if !asked {
+            let calm = !session && (!native.sheet_open() || native.start_open());
+            if !calm || u.offered == Some(r.build) {
+                return;
+            }
+        }
+        u.offered = Some(r.build);
+        native.show_update(&UpdateSheet::Offer {
+            label: r.label,
+            installed: u.installed.label.clone(),
+            session,
+            notes: r.notes_url,
+        });
+    }
+
+    /// Answer a manual check on a sheet (not over the logon sheet).
+    fn update_info(&self, title: String, body: String) {
+        if let Some(native) = self.native.as_ref() {
+            if !native.logon_open() {
+                native.show_update(&UpdateSheet::Info { title, body });
+            }
+        }
+    }
+
+    /// Close the update sheet; without a session, back to the start sheet.
+    fn close_update_sheet(&mut self) {
+        let Some(native) = self.native.as_ref().filter(|n| n.update_open()) else {
+            return;
+        };
+        native.close_sheet();
+        if !self.session_open() {
+            self.open_start();
+        }
+    }
+
+    fn update_command(&mut self, cmd: UpdateCmd) {
+        match cmd {
+            UpdateCmd::Check => {
+                if self.updater.is_none() {
+                    self.update_info(
+                        t!("update.unavailable_title").to_string(),
+                        t!("update.unavailable_body").to_string(),
+                    );
+                } else {
+                    self.start_update_check(true);
+                }
+            }
+            UpdateCmd::ToggleAuto => {
+                let Some(u) = self.updater.as_mut() else {
+                    return;
+                };
+                u.state.auto_check = !u.state.auto_check;
+                u.state.save();
+                let on = u.state.auto_check;
+                if let Some(native) = self.native.as_ref() {
+                    native.set_auto_update(on);
+                }
+                if on {
+                    self.start_update_check(false);
+                }
+            }
+            UpdateCmd::Install => {
+                let (Some(native), Some(u)) = (self.native.as_ref(), self.updater.as_mut()) else {
+                    return;
+                };
+                let Some(r) = u
+                    .offer
+                    .clone()
+                    .filter(|_| native.update_open() && !u.installing)
+                else {
+                    return;
+                };
+                u.installing = true;
+                native.update_busy(&t!("update.downloading"));
+                let proxy = self.proxy.clone();
+                update::spawn_install(u.installed.clone(), r, move |ev| {
+                    let _ = proxy.send_event(UserEvent::Update(ev));
+                });
+            }
+            UpdateCmd::Skip => {
+                if let Some(u) = self.updater.as_mut() {
+                    if let Some(r) = &u.offer {
+                        u.state.skipped_build = Some(r.build);
+                        u.state.save();
+                    }
+                    u.offer = None;
+                }
+                self.close_update_sheet();
+            }
+            UpdateCmd::Notes => {
+                let url = self
+                    .updater
+                    .as_ref()
+                    .and_then(|u| u.offer.as_ref())
+                    .and_then(|r| r.notes_url.clone());
+                if let Some(url) = url {
+                    let _ = std::process::Command::new("/usr/bin/open").arg(url).spawn();
+                }
+            }
+            UpdateCmd::Later | UpdateCmd::Dismiss => self.close_update_sheet(),
+        }
+    }
+
+    fn update_event(&mut self, ev: update::UpdateEvent, event_loop: &ActiveEventLoop) {
+        use update::UpdateEvent as E;
+        match ev {
+            E::Checked { manual, result } => {
+                let Some(u) = self.updater.as_mut() else {
+                    return;
+                };
+                u.checking = false;
+                match result {
+                    Ok(Some(r)) => {
+                        info!(label = %r.label, build = r.build, "update available");
+                        u.offer = Some(r);
+                        self.offer_update(manual);
+                    }
+                    Ok(None) => {
+                        u.offer = None;
+                        if manual {
+                            let label = u.installed.label.clone();
+                            self.update_info(
+                                t!("update.current_title").to_string(),
+                                t!("update.current_body", label => label).to_string(),
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        if manual {
+                            self.update_info(
+                                t!("update.check_failed_title").to_string(),
+                                t!("update.failed", reason => e).to_string(),
+                            );
+                        }
+                    }
+                }
+            }
+            E::Staged(script) => {
+                if let Err(e) = update::finish(&script) {
+                    if let Some(u) = self.updater.as_mut() {
+                        u.installing = false;
+                    }
+                    if let Some(native) = self.native.as_ref() {
+                        native.update_failed(&t!("update.failed", reason => format!("{e:#}")));
+                    }
+                    return;
+                }
+                info!("update staged; quitting so it can be installed");
+                if let Some(native) = self.native.as_ref() {
+                    native.close_sheet();
+                }
+                // Same graceful teardown as Quit; the script waits for exit.
+                self.begin_shutdown();
+                let _ = self.done_rx.recv_timeout(std::time::Duration::from_secs(3));
+                event_loop.exit();
+            }
+            E::OpenedImage => {
+                if let Some(u) = self.updater.as_mut() {
+                    u.installing = false;
+                }
+                self.update_info(
+                    t!("update.manual_title").to_string(),
+                    t!("update.manual_body").to_string(),
+                );
+            }
+            E::InstallFailed(e) => {
+                if let Some(u) = self.updater.as_mut() {
+                    u.installing = false;
+                }
+                if let Some(native) = self.native.as_ref() {
+                    native.update_failed(&t!("update.failed", reason => e));
+                }
+            }
+        }
     }
 
     /// A native sheet covers the window (macOS): draw a calm background only.
@@ -2507,6 +2804,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.window = Some(window.clone());
                 self.open_start();
             }
+            self.init_updater();
         }
         let context = softbuffer::Context::new(window.clone()).expect("softbuffer context");
         let surface =
@@ -2642,6 +2940,13 @@ impl ApplicationHandler<UserEvent> for App {
                 self.run_toolbar_action(action, event_loop);
                 if let Some(w) = &self.window {
                     w.request_redraw();
+                }
+            }
+            UserEvent::Native(NativeEvent::Update(cmd)) => self.update_command(cmd),
+            UserEvent::Update(ev) => self.update_event(ev, event_loop),
+            UserEvent::UpdateTick => {
+                if self.updater.as_ref().is_some_and(|u| u.state.auto_check) {
+                    self.start_update_check(false);
                 }
             }
             UserEvent::Control(cmd, reply, gone) => self.control_command(cmd, reply, gone),

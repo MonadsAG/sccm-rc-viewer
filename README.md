@@ -194,6 +194,16 @@ does the same for tagged releases when the maintainers provide those secrets in
 the protected `release` environment. CI builds for pull requests are never
 signed. Tags, setup and checks: [`packaging/macos/RELEASING.md`](packaging/macos/RELEASING.md).
 
+**Updates.** The installed app checks for a newer build at start and every six
+hours (*SCCM RC → Check for Updates…* checks now). A newer build is offered on
+the start screen, never in the middle of a session. *Install and Restart*
+downloads it, checks that it is signed by Monads AG's Developer ID and
+notarized, replaces the app and starts it again; a user who may not write to
+the app's folder gets the checked disk image opened instead. Turn the
+automatic check off in the same menu, or for managed Macs with
+`SCCM_RC_UPDATE=0`. The feed is `ghcr.io/monadsag/sccm-rc-viewer`
+(see [`packaging/macos/RELEASING.md`](packaging/macos/RELEASING.md)).
+
 ## Letting Claude operate a till
 
 `sccm-rc-mcp` is an [MCP](https://modelcontextprotocol.io) server. It gives

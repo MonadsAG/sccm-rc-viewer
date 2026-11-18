@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  Template for SCCM RC.app. bundle.sh replaces @VERSION@, @BUILD@ and @BUNDLE_ID@.
+  Template for SCCM RC.app. bundle.sh replaces @VERSION@, @BUILD@, @LABEL@ and @BUNDLE_ID@.
 -->
 <plist version="1.0">
 <dict>
@@ -23,6 +23,9 @@
 	<string>@VERSION@</string>
 	<key>CFBundleVersion</key>
 	<string>@BUILD@</string>
+	<!-- Release label shown by the updater (e.g. 0.9.13-m1); see src/update. -->
+	<key>SCCMRCReleaseLabel</key>
+	<string>@LABEL@</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>LSMinimumSystemVersion</key>
