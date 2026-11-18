@@ -1,0 +1,104 @@
+name: Tag on version bump
+
+# Raising `version` under [workspace.package] in Cargo.toml and merging that
+# to main releases it: once CI is green for the merge commit, this workflow
+# tags it v<version> and starts "Release (macOS)" for the tag, which builds
+# the signed, notarized .dmg into a draft release (after the `release`
+# environment's reviewers approve).
+#
+# Merges that leave the version alone do nothing. If v<version> exists
+# already (for instance an upstream tag), nothing is tagged either; for a
+# downstream rebuild of the same version tag v<version>-m<n> by hand
+# (see packaging/macos/RELEASING.md).
+#
+# Why the explicit dispatch: a tag pushed with GITHUB_TOKEN does not trigger
+# `on: push` workflows, but workflow_dispatch is exempt from that rule.
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: write # push the tag
+  actions: write # dispatch the release workflow
+
+concurrency:
+  group: tag-on-version-bump
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    # Only a green CI run for a push to main (not a PR whose head is "main").
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0 # tags, and the history to check main's tip
+
+      - name: Read the workspace version
+        id: version
+        run: |
+          VERSION="$(awk '
+            /^\[workspace\.package\]/ { in_ws = 1; next }
+            /^\[/                     { in_ws = 0 }
+            in_ws && /^version[ \t]*=/ { gsub(/.*=[ \t]*"|".*/, ""); print; exit }
+          ' Cargo.toml)"
+          case "$VERSION" in
+            [0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::no usable version under [workspace.package] in Cargo.toml: '$VERSION'"; exit 1 ;;
+          esac
+          case "$VERSION" in
+            *[!0-9A-Za-z.-]*) echo "::error::version may only contain letters, digits, dots and dashes: $VERSION"; exit 1 ;;
+          esac
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Decide whether to tag
+        id: decide
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "$TAG exists already ($(git rev-list -n1 "$TAG")); nothing to do."
+            echo "create=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # A later push may have moved main on while CI ran; tagging an older
+          # commit is still correct (it is the one CI tested), but only if it
+          # is on main.
+          git fetch -q origin main
+          if ! git merge-base --is-ancestor "$SHA" origin/main; then
+            echo "::error::$SHA is not on main; not tagging"
+            exit 1
+          fi
+          echo "create=true" >> "$GITHUB_OUTPUT"
+
+      - name: Create and push the tag
+        if: steps.decide.outputs.create == 'true'
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" "$SHA" -m "Release $TAG"
+          git push origin "refs/tags/$TAG"
+          echo "Tagged $SHA as $TAG" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Start the macOS release for the tag
+        if: steps.decide.outputs.create == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          gh workflow run release-macos.yml --repo "$GITHUB_REPOSITORY" --ref "$TAG"
+          echo "Started Release (macOS) for $TAG; approve the \`release\` deployment in that run." >> "$GITHUB_STEP_SUMMARY"
