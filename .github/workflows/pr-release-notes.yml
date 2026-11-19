@@ -1,0 +1,38 @@
+name: Release notes
+
+# Every pull request must say what changes for users, in a "## Release notes"
+# section of its description (or "None" for internal-only changes). The
+# release workflow collects these sections into the release, and the viewer
+# shows them in its update sheet. See CLAUDE.md.
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  pr-release-notes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          sparse-checkout: .github/scripts
+          sparse-checkout-cone-mode: false
+
+      - name: Check the "## Release notes" section
+        env:
+          BODY: ${{ github.event.pull_request.body }}
+        run: |
+          SECTION="$(printf '%s' "$BODY" | .github/scripts/release-notes-section.sh)"
+          if [ -z "$(printf '%s' "$SECTION" | tr -d '[:space:]')" ]; then
+            echo "::error::Add a '## Release notes' section to the PR description: 1-5 bullets for users (English), or 'None' for internal-only changes."
+            exit 1
+          fi
+          {
+            echo "### Release notes"
+            echo
+            printf '%s\n' "$SECTION"
+          } >> "$GITHUB_STEP_SUMMARY"

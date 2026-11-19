@@ -129,9 +129,15 @@ jobs:
         run: |
           PRE=""
           case "$GITHUB_REF_NAME" in *-*) PRE="--prerelease" ;; esac
-          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 \
-            || gh release create "$GITHUB_REF_NAME" --draft $PRE \
-                 --title "$GITHUB_REF_NAME" --generate-notes --verify-tag
+          # Notes: the "## Release notes" sections of the PRs since the
+          # previous tag. Edit them in the draft if needed; publish-ghcr.yml
+          # ships the published text to the viewer's update sheet.
+          if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            .github/scripts/collect-release-notes.sh "$GITHUB_REF_NAME" "$GITHUB_REPOSITORY" \
+              > "$RUNNER_TEMP/release-notes.md"
+            gh release create "$GITHUB_REF_NAME" --draft $PRE \
+              --title "$GITHUB_REF_NAME" --notes-file "$RUNNER_TEMP/release-notes.md" --verify-tag
+          fi
           gh release upload "$GITHUB_REF_NAME" dist/*.dmg dist/release.json --clobber
 
       - name: Remove keychain and keys

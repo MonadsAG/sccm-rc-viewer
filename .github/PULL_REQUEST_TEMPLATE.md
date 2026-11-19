@@ -4,6 +4,13 @@
 
 <!-- What does this PR change, and why? -->
 
+## Release notes
+
+<!-- Required (checked in CI). 1-5 bullets for users of the app, in English:
+     what changes for them. They are shown in the app's update sheet.
+     Write "None" for changes users don't see (CI, refactoring, tests).
+     See CLAUDE.md. -->
+
 ## Related issues
 
 <!-- e.g. Closes #123 -->

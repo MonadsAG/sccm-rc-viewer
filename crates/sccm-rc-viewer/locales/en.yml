@@ -129,7 +129,7 @@ update:
   install: "Install and Restart"
   later: "Later"
   skip: "Skip This Version"
-  notes: "Release Notes…"
+  notes_label: "What's new"
   ok: "OK"
   downloading: "Downloading and checking the update…"
   failed: "The update failed: %{reason}"

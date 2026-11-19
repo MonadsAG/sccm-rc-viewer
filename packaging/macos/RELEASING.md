@@ -62,7 +62,8 @@ its draft release.
 2. Download the `.dmg` from the draft release and open it on a Mac that has
    never seen the app. Signed builds must open without a Gatekeeper warning
    (`spctl -a -vv -t install SCCM-RC-*.dmg` says "Notarized Developer ID").
-3. Edit the generated notes and publish the draft.
+3. Read the notes in the draft and edit them if needed, then publish it.
+   They are what users see in the app's update sheet (next section).
 
 A dry run on a branch (Actions → Release (macOS) → Run workflow, branch
 `main`) builds the `.dmg` as a workflow artifact and creates no release. macOS runner
@@ -110,3 +111,17 @@ publishing the draft is the gate.
   `.dmg` matches the manifest's SHA-256. A new Developer ID certificate of
   the same team needs no change; a different team needs a viewer update
   first (`TEAM_ID` in `src/update/install.rs`).
+
+## Release notes
+
+Every PR carries user-facing notes in a `## Release notes` section of its
+description (or `None`); the `pr-release-notes` check enforces it (see
+`CLAUDE.md`). The release workflow collects the sections of all PRs merged
+since the previous tag (`.github/scripts/collect-release-notes.sh`) into the
+draft release. Edit the draft as needed: when it is published,
+`publish-ghcr.yml` takes the release text as it is then (without the
+"Full Changelog" line, at most 8000 bytes) into the manifest annotation
+`ch.monads.sccm-rc.notes`, and the viewer shows it in its update sheet. To
+change the notes of a release already in the feed, edit the release and run
+Actions → Publish to ghcr.io with its tag.
+

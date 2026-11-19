@@ -447,8 +447,6 @@ pub(crate) enum UpdateCmd {
     Install,
     Later,
     Skip,
-    /// Open the release notes in the browser.
-    Notes,
     /// OK on an information sheet.
     Dismiss,
 }
@@ -463,6 +461,7 @@ pub(crate) enum UpdateSheet {
         installed: String,
         /// A session is open; installing ends it.
         session: bool,
+        /// Release notes from the feed, shown in the sheet.
         notes: Option<String>,
     },
     /// The answer to a manual check (OK only).
@@ -1964,7 +1963,7 @@ impl App {
             label: r.label,
             installed: u.installed.label.clone(),
             session,
-            notes: r.notes_url,
+            notes: r.notes,
         });
     }
 
@@ -2041,16 +2040,6 @@ impl App {
                     u.offer = None;
                 }
                 self.close_update_sheet();
-            }
-            UpdateCmd::Notes => {
-                let url = self
-                    .updater
-                    .as_ref()
-                    .and_then(|u| u.offer.as_ref())
-                    .and_then(|r| r.notes_url.clone());
-                if let Some(url) = url {
-                    let _ = std::process::Command::new("/usr/bin/open").arg(url).spawn();
-                }
             }
             UpdateCmd::Later | UpdateCmd::Dismiss => self.close_update_sheet(),
         }

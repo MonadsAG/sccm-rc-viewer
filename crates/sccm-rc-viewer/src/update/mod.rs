@@ -11,6 +11,8 @@
 //! (`cargo run`, Windows, Linux) or with `SCCM_RC_UPDATE=0` it is off.
 
 pub mod install;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // rendered by mac_ui only
+pub mod notes;
 pub mod registry;
 pub mod state;
 
