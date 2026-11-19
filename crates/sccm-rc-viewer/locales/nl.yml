@@ -129,7 +129,7 @@ update:
   install: "Installeer en herstart"
   later: "Later"
   skip: "Sla deze versie over"
-  notes: "Release-opmerkingen…"
+  notes_label: "Wat is er nieuw"
   ok: "OK"
   downloading: "Update wordt gedownload en gecontroleerd…"
   failed: "De update is mislukt: %{reason}"

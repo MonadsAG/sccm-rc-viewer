@@ -129,7 +129,7 @@ update:
   install: "Installieren und neu starten"
   later: "Später"
   skip: "Version überspringen"
-  notes: "Versionshinweise…"
+  notes_label: "Neuerungen"
   ok: "OK"
   downloading: "Update wird geladen und geprüft…"
   failed: "Das Update ist fehlgeschlagen: %{reason}"

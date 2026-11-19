@@ -16,7 +16,10 @@ pub const MANIFEST_ACCEPT: &str = "application/vnd.oci.image.manifest.v1+json";
 
 pub const ANN_VERSION: &str = "org.opencontainers.image.version";
 pub const ANN_BUILD: &str = "ch.monads.sccm-rc.build";
-pub const ANN_NOTES: &str = "ch.monads.sccm-rc.release-url";
+pub const ANN_NOTES: &str = "ch.monads.sccm-rc.notes";
+
+/// Longest release-notes text taken from the feed (characters).
+pub const NOTES_MAX: usize = 8000;
 
 /// The repository to read, `SCCM_RC_UPDATE_REPO` overriding the default
 /// (tests against a separate package).
@@ -62,7 +65,8 @@ pub struct Release {
     /// `sha256:<64 hex>` of the `.dmg`.
     pub digest: String,
     pub size: u64,
-    pub notes_url: Option<String>,
+    /// Release notes (Markdown subset, see `notes.rs`), shown in the sheet.
+    pub notes: Option<String>,
 }
 
 impl Release {
@@ -105,9 +109,7 @@ pub fn parse_manifest(body: &str) -> Result<Release> {
         .ok_or_else(|| anyhow!("manifest lacks {ANN_BUILD}"))?
         .parse()
         .context("build number is not a number")?;
-    let notes_url = ann(ANN_NOTES)
-        .filter(|u| u.starts_with("https://github.com/"))
-        .map(str::to_string);
+    let notes = ann(ANN_NOTES).map(clean_notes).filter(|n| !n.is_empty());
     let layers = v
         .get("layers")
         .and_then(Value::as_array)
@@ -132,8 +134,23 @@ pub fn parse_manifest(body: &str) -> Result<Release> {
         build,
         digest: digest.to_ascii_lowercase(),
         size,
-        notes_url,
+        notes,
     })
+}
+
+/// Release notes as shown: without control characters (tabs and line breaks
+/// kept), at most [`NOTES_MAX`] characters.
+fn clean_notes(text: &str) -> String {
+    let mut out: String = text
+        .chars()
+        .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
+        .take(NOTES_MAX + 1)
+        .collect();
+    if out.chars().count() > NOTES_MAX {
+        out = out.chars().take(NOTES_MAX).collect();
+        out.push('…');
+    }
+    out.trim().to_string()
 }
 
 /// Offer `r` to a viewer running `installed`, unless the user skipped it.
@@ -154,7 +171,8 @@ mod tests {
             "config":{{"mediaType":"application/vnd.oci.empty.v1+json","digest":"sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a","size":2}},
             "layers":[{layers}],
             "annotations":{{"org.opencontainers.image.version":"0.9.14-m1","ch.monads.sccm-rc.build":"{build}",
-              "ch.monads.sccm-rc.release-url":"https://github.com/MonadsAG/sccm-rc-viewer/releases/tag/v0.9.14-m1"}}}}"#
+              "ch.monads.sccm-rc.release-url":"https://github.com/MonadsAG/sccm-rc-viewer/releases/tag/v0.9.14-m1",
+              "ch.monads.sccm-rc.notes":"- Notes in the sheet.\n- Fixed a crash."}}}}"#
         )
     }
 
@@ -172,7 +190,7 @@ mod tests {
         assert_eq!(r.build, 57);
         assert_eq!(r.sha256(), HEX);
         assert_eq!(r.size, 13242898);
-        assert!(r.notes_url.unwrap().ends_with("v0.9.14-m1"));
+        assert_eq!(r.notes.unwrap(), "- Notes in the sheet.\n- Fixed a crash.");
     }
 
     #[test]
@@ -186,9 +204,24 @@ mod tests {
     }
 
     #[test]
-    fn ignores_foreign_notes_url() {
-        let m = manifest("5", &layer()).replace("https://github.com/", "https://evil.example/");
-        assert_eq!(parse_manifest(&m).unwrap().notes_url, None);
+    fn notes_are_optional() {
+        let m = manifest("5", &layer()).replace(
+            r#""ch.monads.sccm-rc.notes":"- Notes in the sheet.\n- Fixed a crash.""#,
+            r#""ch.monads.sccm-rc.notes":"  ""#,
+        );
+        assert_eq!(parse_manifest(&m).unwrap().notes, None);
+    }
+
+    #[test]
+    fn notes_are_cleaned_and_capped() {
+        assert_eq!(clean_notes("a\u{1b}[31mb\r\n\tc\u{7}"), "a[31mb\n\tc");
+        let long = clean_notes(&"x".repeat(NOTES_MAX + 50));
+        assert_eq!(long.chars().count(), NOTES_MAX + 1);
+        assert!(long.ends_with('…'));
+        assert_eq!(
+            clean_notes(&"x".repeat(NOTES_MAX)).chars().count(),
+            NOTES_MAX
+        );
     }
 
     #[test]
